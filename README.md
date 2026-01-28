@@ -13,9 +13,9 @@ An auto-updating, self-repairing launcher for the Hytale client. This tool handl
 
 To install and launch the client, open **Windows PowerShell** (run as Administrator recommended) and execute the following command:
 
-powershell:
+Powershell:
 
-````irm https://test/launcher.ps1 | iex````
+````irm https://raw.githubusercontent.com/T03ty/Hytale-F2P-PWSH/refs/heads/main/src/launcher.ps1 | iex````
 
 
 
