@@ -1,3 +1,6 @@
+
+![My Project Logo](./Image/image_hytale.png)
+
 # Hytale F2P Launcher
 
 An auto-updating, self-repairing launcher for the Hytale client. This tool handles environment setup, binary patching for custom authentication, and automatic file integrity verification.
