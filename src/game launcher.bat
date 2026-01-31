@@ -548,8 +548,8 @@ function Patch-HytaleServer($serverJarPath) {
 
     Write-Host "      [SERVER] Downloading Pre-Patched Server JAR..." -ForegroundColor Cyan
     
-    # Define Sources
-    $primaryUrl = "https://pub-027b315ece074e2e891002ca38384792.r2.dev/HytaleServer.jar"
+    # Define Sources (Official Sanasol release for F2P clients)
+    $primaryUrl = "https://download.sanasol.ws/download/HytaleServer.jar"
     $fallbackUrl = "$API_HOST/file/HytaleServer.jar"
     
     # Create backup of original if exists
@@ -1911,7 +1911,7 @@ while ($true) {
 Register-PlayerSession $global:pUuid $global:pName
 
 # 2. Main Menu Loop (Skipped if Shortcut)
-$isShortcut = ($env:IS_SHORTCUT -eq "false")
+$isShortcut = ($env:IS_SHORTCUT -eq "true")
 $proceedToLaunch = $false
 
 while (-not $proceedToLaunch) {
@@ -1932,10 +1932,11 @@ while (-not $proceedToLaunch) {
     } else {
         Write-Host " [1] Start Hytale F2P (Create Shortcut)" -ForegroundColor Green
     }
-    Write-Host " [2] Setup Host Server (Download server.bat)" -ForegroundColor Yellow
+    Write-Host " [2] Server Menu (Host/Download)" -ForegroundColor Yellow
     Write-Host " [3] Repair / Force Update" -ForegroundColor Red
     Write-Host " [4] Install HyFixes (Server Crash Fixes)" -ForegroundColor Cyan
     Write-Host " [5] Play Offline (Guest Mode)" -ForegroundColor Magenta
+    Write-Host " [6] Play Unauthenticated (No Login)" -ForegroundColor DarkCyan
     Write-Host ""
     
     $menuChoice = Read-Host " Select an option [1]"
@@ -1948,45 +1949,80 @@ while (-not $proceedToLaunch) {
             $proceedToLaunch = $true
         }
         "2" {
-            # --- SERVER SETUP LOGIC (Fixed) ---
-            $serverBatUrl = "http://72.62.192.173:5000/file/server.bat"
-            $serverBatDest = Join-Path $appDir "server.bat"
-            $needsDownload = $true
-
-            Write-Host "`n[SERVER] Checking server.bat..." -ForegroundColor Cyan
-            
-            if (Test-Path $serverBatDest) {
-                Write-Host "      [CHECK] Found existing server.bat." -ForegroundColor Gray
-                # Check Hash
-                $remoteHash = Get-RemoteHash "server.bat"
-                $localHash = Get-LocalSha1 $serverBatDest
+            # --- SERVER SUBMENU ---
+            $serverMenuLoop = $true
+            while ($serverMenuLoop) {
+                Clear-Host
+                Write-Host "==========================================" -ForegroundColor Yellow
+                Write-Host "         SERVER SETUP MENU" -ForegroundColor Yellow
+                Write-Host "==========================================" -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host " [1] Download server.bat (Launcher Script)" -ForegroundColor Green
+                Write-Host " [2] Download HytaleServer.jar (Sanasol F2P)" -ForegroundColor Cyan
+                Write-Host " [3] Run Existing server.bat" -ForegroundColor Gray
+                Write-Host " [0] Back to Main Menu" -ForegroundColor DarkGray
+                Write-Host ""
                 
-                if ($remoteHash -and $localHash -eq $remoteHash) {
-                    Write-Host "      [SKIP] File is up-to-date (Hash Match)." -ForegroundColor Green
-                    $needsDownload = $false
-                } else {
-                    Write-Host "      [UPDATE] New version available or hash mismatch." -ForegroundColor Yellow
+                $serverChoice = Read-Host " Select an option [0]"
+                if ($serverChoice -eq "") { $serverChoice = "0" }
+                
+                switch ($serverChoice) {
+                    "1" {
+                        # Download server.bat
+                        $serverBatUrl = "$API_HOST/file/server.bat"
+                        $serverBatDest = Join-Path $appDir "server.bat"
+                        
+                        Write-Host "`n[SERVER] Downloading server.bat..." -ForegroundColor Cyan
+                        if (Download-WithProgress $serverBatUrl $serverBatDest $true) {
+                            Write-Host "      [SUCCESS] server.bat installed to: $serverBatDest" -ForegroundColor Green
+                        } else {
+                            Write-Host "      [ERROR] Download failed." -ForegroundColor Red
+                        }
+                        Write-Host "`nPress any key to continue..."
+                        [void][System.Console]::ReadKey($true)
+                    }
+                    "2" {
+                        # Download HytaleServer.jar from Sanasol
+                        $serverDir = Join-Path $appDir "Server"
+                        $serverJarPath = Join-Path $serverDir "HytaleServer.jar"
+                        
+                        Write-Host "`n[SERVER] Downloading HytaleServer.jar (Sanasol F2P)..." -ForegroundColor Cyan
+                        Write-Host "      Source: https://download.sanasol.ws/download/HytaleServer.jar" -ForegroundColor Gray
+                        
+                        if (-not (Test-Path $serverDir)) {
+                            New-Item -ItemType Directory $serverDir -Force | Out-Null
+                        }
+                        
+                        if (Download-WithProgress "https://download.sanasol.ws/download/HytaleServer.jar" $serverJarPath $false) {
+                            Write-Host "      [SUCCESS] HytaleServer.jar installed to: $serverJarPath" -ForegroundColor Green
+                            # Create flag
+                            $flagObj = @{ domain = "sanasol.ws"; patchedAt = (Get-Date).ToString(); source = "Sanasol" }
+                            $flagObj | ConvertTo-Json | Out-File "$serverJarPath.dualauth_patched"
+                        } else {
+                            Write-Host "      [ERROR] Download failed." -ForegroundColor Red
+                        }
+                        Write-Host "`nPress any key to continue..."
+                        [void][System.Console]::ReadKey($true)
+                    }
+                    "3" {
+                        # Run existing server.bat
+                        $serverBatDest = Join-Path $appDir "server.bat"
+                        if (Test-Path $serverBatDest) {
+                            Write-Host "`n[RUN] Launching Server Console..." -ForegroundColor Green
+                            Start-Process cmd.exe -ArgumentList "/k `"$serverBatDest`"" -WorkingDirectory $appDir
+                        } else {
+                            Write-Host "      [ERROR] server.bat not found. Download it first using option [1]." -ForegroundColor Red
+                            Start-Sleep -Seconds 2
+                        }
+                    }
+                    "0" {
+                        $serverMenuLoop = $false
+                    }
+                    default {
+                        $serverMenuLoop = $false
+                    }
                 }
             }
-
-            if ($needsDownload) {
-                Write-Host "      [DOWNLOAD] Fetching server.bat..." -ForegroundColor Cyan
-                if (Download-WithProgress $serverBatUrl $serverBatDest) {
-                    Write-Host "      [SUCCESS] Server file installed." -ForegroundColor Green
-                } else {
-                    Write-Host "      [ERROR] Download failed." -ForegroundColor Red
-                    $serverBatDest = $null # Prevent running
-                }
-            }
-
-            if ($serverBatDest -and (Test-Path $serverBatDest)) {
-                Write-Host "`n[RUN] Launching Server Console..." -ForegroundColor Green
-                Start-Sleep -Seconds 1
-                Start-Process cmd.exe -ArgumentList "/k `"$serverBatDest`"" -WorkingDirectory $appDir
-            }
-            
-            Write-Host "`nPress any key to return to menu..."
-            [void][System.Console]::ReadKey($true)
         }
         "3" {
             $global:assetsVerified = $false
@@ -2002,6 +2038,11 @@ while (-not $proceedToLaunch) {
         }
         "5" {
              $global:offlineMode = $true
+             $proceedToLaunch = $true
+        }
+        "6" {
+             # Unauthenticated mode - still use authenticated auth-mode but skip token generation
+             $global:unauthenticatedMode = $true
              $proceedToLaunch = $true
         }
     }
@@ -2055,8 +2096,21 @@ $dispJava = if ($global:javaPath) { $global:javaPath } else { $javaExe }
 Write-Host "      Java:     $dispJava" -ForegroundColor Gray
 Write-Host "      User:     $global:pName" -ForegroundColor Cyan
 
-# Support explicit offline arg if user requested it, otherwise default to authenticated guest
-$authModeArg = if ($global:offlineMode) { "offline" } else { "authenticated" }
+# Auth mode selection based on user choice
+# NOTE: Client ALWAYS requires --identity-token and --session-token for authenticated mode
+# - Offline Mode: uses "offline" for local play (no tokens needed)
+# - Normal/Unauthenticated: both use "authenticated" with JWT tokens (client requirement)
+if ($global:offlineMode) {
+    $authModeArg = "offline"
+    Write-Host "      Mode:     Offline (Guest)" -ForegroundColor Magenta
+} else {
+    $authModeArg = "authenticated"
+    if ($global:unauthenticatedMode) {
+        Write-Host "      Mode:     Unauthenticated (Server Auth)" -ForegroundColor DarkCyan
+    } else {
+        Write-Host "      Mode:     Authenticated" -ForegroundColor Green
+    }
+}
 
 $launchArgs = @(
     "--app-dir", "`"$appDir`"",
@@ -2064,15 +2118,18 @@ $launchArgs = @(
     "--auth-mode", $authModeArg,
     "--uuid", $global:pUuid,
     "--name", "`"$global:pName`"",
-    "--identity-token", $idToken,
-    "--session-token", $ssToken,
     "--user-dir", "`"$userDir`""
 )
 
-# Authenticate (Final Safety Check)
-if (-not $idToken) {
-    $idToken = New-HytaleJWT $global:pUuid $global:pName "https://sessions.sanasol.ws"
-    $ssToken = $idToken
+# Add tokens for authenticated mode (client requires them even for unauthenticated server mode)
+if (-not $global:offlineMode) {
+    # Generate tokens if not already present
+    if (-not $idToken) {
+        $idToken = New-HytaleJWT $global:pUuid $global:pName "https://sessions.sanasol.ws"
+        $ssToken = $idToken
+    }
+    # Append token args to launch args
+    $launchArgs += @("--identity-token", $idToken, "--session-token", $ssToken)
 }
 
 if (Test-Path $gameExe) {
@@ -2347,8 +2404,25 @@ if (Test-Path $gameExe) {
                         }
                     }
                     else {
-                        # Non-critical error - just log it
+                        # Non-critical error - track it
                         $reportedErrors += $err
+                        
+                        # ERROR LOOP DETECTION: If same error appears multiple times, stop and pause
+                        $sameErrorCount = ($reportedErrors | Where-Object { $_ -eq $err }).Count
+                        if ($sameErrorCount -ge 3) {
+                            Write-Host "`n      =============================================" -ForegroundColor Red
+                            Write-Host "      [LOOP DETECTED] Same error occurred $sameErrorCount times!" -ForegroundColor Red
+                            Write-Host "      =============================================" -ForegroundColor Red
+                            Write-Host "`n      ERROR: $($err.Trim())" -ForegroundColor Yellow
+                            Write-Host ""
+                            Write-Host "      This error is not automatically fixable." -ForegroundColor Gray
+                            Write-Host "      Please take a screenshot and report to the developers." -ForegroundColor Cyan
+                            Write-Host ""
+                            Write-Host "      Press any key to continue monitoring, or Ctrl+C to exit..." -ForegroundColor DarkGray
+                            [void][System.Console]::ReadKey($true)
+                            # Clear the duplicate errors to prevent re-triggering immediately
+                            $reportedErrors = $reportedErrors | Select-Object -Unique
+                        }
                     }
                 }
             }
