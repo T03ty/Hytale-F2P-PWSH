@@ -21,6 +21,55 @@ If your game is crashing, failing to download, or showing "Permission Denied," f
 
 ---
 
+## ✨ New Features (v2.0)
+
+### Server Menu System
+A dedicated submenu for server-related tasks:
+- **[1] Download server.bat** - Fetches the launcher script for hosting
+- **[2] Download HytaleServer.jar** - Downloads the official Sanasol F2P server JAR directly from `https://download.sanasol.ws/download/HytaleServer.jar`
+- **[3] Run Existing server.bat** - Quickly launch your existing server
+
+### Multiple Launch Modes
+- **Authenticated** - Standard login with JWT tokens
+- **Unauthenticated (Server Auth)** - For F2P servers that handle authentication internally
+- **Offline (Guest Mode)** - Play without any network authentication
+
+### Smart wget Integration
+- Auto-detects `wget.exe` in PATH and Chocolatey bin folder
+- Falls back to built-in HTTP client if wget unavailable
+- Admin check before attempting Chocolatey installation
+
+### Error Loop Detection
+When the same error appears 3+ times, the launcher:
+- Pauses execution with a clear "LOOP DETECTED" message
+- Displays the problematic error for screenshot/reporting
+- Prevents infinite restart loops
+
+---
+
+## 🐛 Bug Fixes (v2.0)
+
+### Server JAR Patching
+- **Fixed:** Server JAR download validation now checks file existence AND size (minimum 1MB)
+- **Fixed:** Stale patch flags are now cleared if JAR is missing or corrupted
+- **Fixed:** Uses official Sanasol download URL for F2P client compatibility
+
+### Download System
+- **Fixed:** wget detection no longer conflicts with PowerShell's `wget` alias
+- **Fixed:** Authentication headers now applied BEFORE URL verification for API downloads
+- **Fixed:** HTTP fallback properly handles 403 Forbidden errors
+
+### Error Handling
+- **Fixed:** NullReferenceException from AppMainMenu now triggers server download
+- **Fixed:** JWT token validation errors properly trigger server patching
+- **Fixed:** Repeated errors no longer cause infinite restart loops
+
+### Launch System
+- **Fixed:** Launcher self-update hash check filename typo
+- **Fixed:** Shortcut detection logic corrected (`IS_SHORTCUT` comparison)
+
+---
+
 ## 🔧 What this PowerShell Script Fixes
 
 This script doesn't just "open" the game; it actively repairs the following problems:
@@ -53,6 +102,57 @@ This script doesn't just "open" the game; it actively repairs the following prob
 * **The Problem:** Your client version is newer than the server, preventing connection.
 * **The Fix:** Performs a **Update server.jar** to align your binaries with the server's requirements.
 
+---
+
+## ⚙️ Auto-Recovery Error Types
+
+The launcher monitors game logs in real-time and automatically handles these specific errors:
+
+| Priority | Error Pattern | Auto-Fix Action |
+|----------|--------------|-----------------|
+| **0** | `AppMainMenu.*NullReferenceException` | Checks for missing Server directory/JAR, downloads `HytaleServer.jar` from Sanasol |
+| **1** | `Token validation failed` / `signature verification failed` / `No Ed25519 key found` | Downloads pre-patched server with correct authentication keys |
+| **2** | `VM Initialization Error` / `Failed setting boot class path` | Clears AOT cache, prefab cache, purges corrupted JRE, forces re-download |
+| **3** | `Identity token has invalid issuer: expected <URL>` | Auto-updates AUTH_URL config to match game client, restarts with corrected settings |
+| **4** | `Server failed to boot` (generic) | Attempts HyFixes installation if not already applied for this version |
+| **∞** | Any error repeated 3+ times | **LOOP DETECTED** - Pauses and prompts user to screenshot for dev reporting |
+
+### Error Detection Examples
+
+```
+[LOG ERROR] System.NullReferenceException: Object reference not set...
+      → [FIX] AppMainMenu NullReferenceException Detected!
+      → [ACTION] Triggering Patch-HytaleServer to download...
+
+[LOG ERROR] Token validation failed...
+      → [FIX] Server Token Validation Error Detected (Root Cause)!
+      → [ACTION] Downloading pre-patched server with correct keys...
+
+[LOG ERROR] VM Initialization Error...
+      → [AUTO-RECOVERY] Critical boot failure detected!
+      → [FIX] JRE Corruption detected. Switching to API Host JRE & purging...
+
+[LOG ERROR] Identity token has invalid issuer: expected https://sessions.sanasol.ws
+      → [FIX] Issuer Mismatch Detected!
+      → [ACTION] Updating configuration to match Game Client...
+```
+
+---
+
+## 📋 Menu Options
+
+```
+==========================================
+       HYTALE F2P - LAUNCHER MENU
+==========================================
+
+ [1] Start Hytale F2P (Create Shortcut)
+ [2] Server Menu (Host/Download)
+ [3] Repair / Force Update
+ [4] Install HyFixes (Server Crash Fixes)
+ [5] Play Offline (Guest Mode)
+ [6] Play Unauthenticated (No Login)
+```
 
 ---
 
@@ -69,3 +169,7 @@ This is the PowerShell interface. It allows the script to perform "Low-Level" re
 **How do I know it's finished?**
 
 The script will show a real-time log of what it is fixing. Once it finishes the "Binary Modification," the game will launch automatically.
+
+**What does "LOOP DETECTED" mean?**
+
+If you see this message, an error is occurring repeatedly and cannot be auto-fixed. Take a screenshot and report it to the developers.
