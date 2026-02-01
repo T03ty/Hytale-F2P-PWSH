@@ -143,9 +143,8 @@ $global:HEADERS = @{
     'User-Agent'    = 'HytaleF2P-Client-v2.0.11';
     'X-Auth-Token'  = 'YourSuperSecretLaunchToken12345';
 }
-$API_HOST = "http://72.62.192.173:5000"
+$API_HOST = "https://hytaleapi.online"
 $AUTH_URL_SESSIONS = "https://auth.sanasol.ws"
-$AUTH_URL_AUTH = "https://sessions.sanasol.ws"
 $global:AUTH_URL_CURRENT = $AUTH_URL_SESSIONS
 
 # Patching Defaults
@@ -154,11 +153,87 @@ $DEFAULT_NEW_DOMAIN = "auth.sanasol.ws"
 
 $OFFICIAL_BASE = "https://game-patches.hytale.com/patches"
 $ZIP_FILENAME = "latest.zip"
-$ASSET_ZIP_FILENAME = "Assets.zip"
 
 $localAppData = "$env:LOCALAPPDATA\HytaleF2P"
 $PublicConfig = "C:\Users\Public\HytaleF2P"
 $pathConfigFile = Join-Path $localAppData "path_config.json"
+
+function Invoke-PathDialog {
+    # Show folder browser dialog to select Hytale installation
+    Add-Type -AssemblyName System.Windows.Forms
+    
+    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dialog.Description = "Select your 'Hytale F2P Launcher' installation folder (or the 'Client' folder)"
+    $dialog.ShowNewFolderButton = $true  # Allow creating new folders
+    
+    # Try to bring to front
+    $owner = New-Object System.Windows.Forms.NativeWindow
+    $owner.AssignHandle([System.Diagnostics.Process]::GetCurrentProcess().MainWindowHandle)
+    
+    $result = $dialog.ShowDialog($owner)
+    
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+        $userInput = $dialog.SelectedPath
+        
+        # Special case: If user selected drive root (e.g., C:\), create HytaleF2P folder
+        if ($userInput -match "^[A-Z]:\\$") {
+            $userInput = Join-Path $userInput "HytaleF2P"
+            Write-Host "`n      [INFO] Drive root selected. Using: $userInput" -ForegroundColor Cyan
+        }
+        
+        # Smart Check: Direct selection OR Root selection
+        $pRoot = Join-Path $userInput "release\package\game\latest\Client\HytaleClient.exe"
+        $pDirect = Join-Path $userInput "HytaleClient.exe"
+        
+        $potential = if (Test-Path $pRoot) { 
+            $pRoot 
+        } elseif (Test-Path $pDirect) { 
+            $pDirect 
+        } else { 
+            # Game doesn't exist - assume user wants to install here
+            Write-Host "`n      [INFO] Game not found at selected location." -ForegroundColor Cyan
+            Write-Host "              Will use this folder for fresh installation." -ForegroundColor Gray
+            
+            # Determine if they selected a root folder or client folder
+            # If path ends with "Client", assume it's the Client folder
+            if ($userInput -match "\\Client$") {
+                $clientPath = Join-Path $userInput "HytaleClient.exe"
+            } else {
+                # Use standard structure
+                $clientPath = Join-Path $userInput "release\package\game\latest\Client\HytaleClient.exe"
+            }
+            
+            # Create directory structure if it doesn't exist
+            $clientDir = Split-Path $clientPath
+            if (-not (Test-Path $clientDir)) {
+                try {
+                    New-Item -ItemType Directory -Path $clientDir -Force | Out-Null
+                    Write-Host "              Created directory structure." -ForegroundColor Green
+                } catch {
+                    Write-Host "`n      [ERROR] Failed to create directory: $($_.Exception.Message)" -ForegroundColor Red
+                    Start-Sleep -Seconds 3
+                    return $null
+                }
+            }
+            
+            $clientPath
+        }
+        
+        if ($potential) {
+            # Save for next time
+            if (-not (Test-Path $localAppData)) { New-Item -ItemType Directory $localAppData -Force | Out-Null }
+            $obj = @{ gamePath = $potential }
+            $obj | ConvertTo-Json | Out-File $pathConfigFile
+            return $potential
+        } else {
+            Write-Host "`n      [ERROR] Could not determine valid installation path." -ForegroundColor Red
+            Start-Sleep -Seconds 3
+            return $null
+        }
+    }
+    
+    return $null
+}
 
 function Resolve-GamePath {
     # 1. Check Script Folder FIRST (Project Aware)
@@ -199,8 +274,8 @@ function Resolve-GamePath {
     Write-Host "    Launching Folder Selection Dialog... (Tip: Close it to use the default path)" -ForegroundColor Gray
     
     $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dialog.Description = "Select your 'Hytale F2P Launcher' installation folder"
-    $dialog.ShowNewFolderButton = $false
+    $dialog.Description = "Select installation folder (can be empty for fresh install)"
+    $dialog.ShowNewFolderButton = $true
     
     # Try to bring to front
     $owner = New-Object System.Windows.Forms.NativeWindow
@@ -211,11 +286,48 @@ function Resolve-GamePath {
     if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
         $userInput = $dialog.SelectedPath
         
+        # Special case: If user selected drive root (e.g., C:\), create HytaleF2P folder
+        if ($userInput -match "^[A-Z]:\\$") {
+            $userInput = Join-Path $userInput "HytaleF2P"
+            Write-Host "[INFO] Drive root selected. Using: $userInput" -ForegroundColor Cyan
+        }
+        
         # Smart Check: Direct selection OR Root selection
         $pRoot = Join-Path $userInput "release\package\game\latest\Client\HytaleClient.exe"
         $pDirect = Join-Path $userInput "HytaleClient.exe"
         
-        $potential = if (Test-Path $pRoot) { $pRoot } elseif (Test-Path $pDirect) { $pDirect } else { $null }
+        $potential = if (Test-Path $pRoot) { 
+            $pRoot 
+        } elseif (Test-Path $pDirect) { 
+            $pDirect 
+        } else { 
+            # Game doesn't exist - assume user wants to install here
+            Write-Host "[INFO] Game not found at selected location." -ForegroundColor Cyan
+            Write-Host "       Will use this folder for fresh installation." -ForegroundColor Gray
+            
+            # Determine if they selected a root folder or client folder
+            if ($userInput -match "\\Client$") {
+                $clientPath = Join-Path $userInput "HytaleClient.exe"
+            } else {
+                # Use standard structure
+                $clientPath = Join-Path $userInput "release\package\game\latest\Client\HytaleClient.exe"
+            }
+            
+            # Create directory structure if it doesn't exist
+            $clientDir = Split-Path $clientPath
+            if (-not (Test-Path $clientDir)) {
+                try {
+                    New-Item -ItemType Directory -Path $clientDir -Force | Out-Null
+                    Write-Host "       Created directory structure." -ForegroundColor Green
+                } catch {
+                    Write-Host "[ERROR] Failed to create directory: $($_.Exception.Message)" -ForegroundColor Red
+                    Start-Sleep -Seconds 3
+                    return $null
+                }
+            }
+            
+            $clientPath
+        }
         
         if ($potential) {
             # Save for next time
@@ -224,9 +336,7 @@ function Resolve-GamePath {
             $obj | ConvertTo-Json | Out-File $pathConfigFile
             return $potential
         } else {
-            Write-Host "[ERROR] Could not find HytaleClient.exe in the selected folder." -ForegroundColor Red
-            Write-Host "        Please select either the main 'Hytale F2P Launcher' folder" -ForegroundColor Gray
-            Write-Host "        or the deep 'Client' folder." -ForegroundColor Gray
+            Write-Host "[ERROR] Could not determine valid installation path." -ForegroundColor Red
             Start-Sleep -Seconds 3
         }
     }
@@ -408,6 +518,157 @@ function Ensure-ModDirs($userDataPath) {
     }
 }
 
+function Backup-WorldSaves($userDataPath) {
+    # Smart backup: Only backs up new or modified worlds to avoid duplicates
+    $savesDir = Join-Path $userDataPath "Saves"
+    $backupRoot = Join-Path $PublicConfig "WorldBackups"
+    
+    if (-not (Test-Path $savesDir)) {
+        Write-Host "      [BACKUP] No Saves folder found. Skipping backup." -ForegroundColor Gray
+        return $null
+    }
+    
+    # Get all world folders (non-empty directories)
+    $worldFolders = Get-ChildItem -Path $savesDir -Directory | Where-Object {
+        (Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0
+    }
+    
+    if ($worldFolders.Count -eq 0) {
+        Write-Host "      [BACKUP] No world saves found. Nothing to backup." -ForegroundColor Gray
+        return $null
+    }
+    
+    # Check if backupRoot exists and find most recent backup
+    $latestBackup = $null
+    $needsNewBackup = $false
+    
+    if (Test-Path $backupRoot) {
+        $existingBackups = Get-ChildItem -Path $backupRoot -Directory | Sort-Object Name -Descending
+        if ($existingBackups.Count -gt 0) {
+            $latestBackup = $existingBackups[0].FullName
+        }
+    }
+    
+    # Determine which worlds need backing up
+    $worldsToBackup = @()
+    
+    foreach ($world in $worldFolders) {
+        $needsBackup = $true
+        
+        if ($latestBackup) {
+            $existingBackupPath = Join-Path $latestBackup $world.Name
+            
+            if (Test-Path $existingBackupPath) {
+                # Compare modification times of the most recently modified file in each
+                $sourceNewest = Get-ChildItem -Path $world.FullName -Recurse -File -ErrorAction SilentlyContinue | 
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                
+                $backupNewest = Get-ChildItem -Path $existingBackupPath -Recurse -File -ErrorAction SilentlyContinue | 
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                
+                if ($sourceNewest -and $backupNewest) {
+                    # Only backup if source is newer than backup
+                    if ($sourceNewest.LastWriteTime -le $backupNewest.LastWriteTime) {
+                        $needsBackup = $false
+                    }
+                }
+            }
+        }
+        
+        if ($needsBackup) {
+            $worldsToBackup += $world
+        }
+    }
+    
+    # If no worlds need backing up, return the latest backup
+    if ($worldsToBackup.Count -eq 0) {
+        Write-Host "      [BACKUP] All worlds already backed up (no changes detected)." -ForegroundColor Green
+        Write-Host "      [REUSE] Using existing backup: $(Split-Path $latestBackup -Leaf)" -ForegroundColor Cyan
+        return $latestBackup
+    }
+    
+    # Create new timestamped backup directory
+    Write-Host "`n      [BACKUP] $($worldsToBackup.Count) world(s) need backup:" -ForegroundColor Cyan
+    foreach ($world in $worldsToBackup) {
+        Write-Host "               - $($world.Name)" -ForegroundColor Gray
+    }
+    
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $backupDir = Join-Path $backupRoot $timestamp
+    
+    if (-not (Test-Path $backupRoot)) {
+        New-Item -ItemType Directory $backupRoot -Force | Out-Null
+    }
+    New-Item -ItemType Directory $backupDir -Force | Out-Null
+    
+    # Copy each world that needs backup
+    $copiedCount = 0
+    foreach ($world in $worldsToBackup) {
+        try {
+            $destPath = Join-Path $backupDir $world.Name
+            Copy-Item -Path $world.FullName -Destination $destPath -Recurse -Force -ErrorAction Stop
+            $copiedCount++
+        } catch {
+            Write-Host "      [WARN] Failed to backup world: $($world.Name)" -ForegroundColor Yellow
+        }
+    }
+    
+    if ($copiedCount -gt 0) {
+        Write-Host "      [SUCCESS] $copiedCount world(s) backed up to:" -ForegroundColor Green
+        Write-Host "                $backupDir" -ForegroundColor Gray
+        return $backupDir
+    }
+    
+    return $null
+}
+
+function Restore-WorldSaves($userDataPath, $backupDir) {
+    # Restore world saves from backup directory
+    if (-not $backupDir -or -not (Test-Path $backupDir)) {
+        Write-Host "      [RESTORE] No backup to restore." -ForegroundColor Gray
+        return
+    }
+    
+    $savesDir = Join-Path $userDataPath "Saves"
+    
+    # Ensure Saves directory exists
+    if (-not (Test-Path $savesDir)) {
+        New-Item -ItemType Directory $savesDir -Force | Out-Null
+    }
+    
+    $worldBackups = Get-ChildItem -Path $backupDir -Directory
+    
+    if ($worldBackups.Count -eq 0) {
+        Write-Host "      [RESTORE] No worlds in backup. Skipping restore." -ForegroundColor Gray
+        return
+    }
+    
+    Write-Host "`n      [RESTORE] Restoring $($worldBackups.Count) world(s)..." -ForegroundColor Cyan
+    $restoredCount = 0
+    
+    foreach ($world in $worldBackups) {
+        try {
+            $destPath = Join-Path $savesDir $world.Name
+            
+            # Don't overwrite if already exists and not empty
+            if ((Test-Path $destPath) -and ((Get-ChildItem $destPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0)) {
+                Write-Host "      [SKIP] World already exists: $($world.Name)" -ForegroundColor Gray
+                continue
+            }
+            
+            Copy-Item -Path $world.FullName -Destination $destPath -Recurse -Force -ErrorAction Stop
+            Write-Host "      [RESTORED] $($world.Name)" -ForegroundColor Green
+            $restoredCount++
+        } catch {
+            Write-Host "      [WARN] Failed to restore world: $($world.Name)" -ForegroundColor Yellow
+        }
+    }
+    
+    if ($restoredCount -gt 0) {
+        Write-Host "      [SUCCESS] $restoredCount world(s) restored successfully!" -ForegroundColor Green
+    }
+}
+
 # --- CLIENT PATCHING LOGIC (Node.js Port) ---
 function String-ToLengthPrefixed($str) {
     # Port of stringToLengthPrefixed
@@ -450,6 +711,12 @@ function Patch-Bytes($dataRef, $oldBytes, $newBytes, $desc) {
 }
 
 function Patch-HytaleClient($clientPath) {
+    # Check if client exists first
+    if (-not (Test-Path $clientPath)) {
+        Write-Host "      [SKIP] Client not found. Skipping patch." -ForegroundColor Yellow
+        return $false
+    }
+    
     # Check flag file
     $patchFlag = "$clientPath.patched_custom"
     $targetDomain = "auth.sanasol.ws" # Fixed target based on provided code
@@ -860,27 +1127,17 @@ function Download-WithProgress($url, $destination, $useHeaders=$true) {
         $wgetArgs += @("-O", "`"$destination`"", "`"$url`"")
 
         try {
-            # Capture stderr to temp file for debugging
-            $stderrFile = Join-Path $env:TEMP "wget_stderr_$(Get-Random).log"
-            $proc = Start-Process $wgetExe.Source -ArgumentList $wgetArgs -Wait -NoNewWindow -PassThru -RedirectStandardError $stderrFile
+            # Don't redirect stderr - let progress bar show
+            $proc = Start-Process $wgetExe.Source -ArgumentList $wgetArgs -Wait -NoNewWindow -PassThru
             
             if ($proc.ExitCode -eq 0) {
-                if (Test-Path $stderrFile) { Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue }
-                Write-Host "      [SUCCESS] Turbo download complete." -ForegroundColor Green
+                Write-Host "      [SUCCESS] Turbo download complete.`n" -ForegroundColor Green
                 return $true
             }
             
-            # Show stderr on failure
-            if (Test-Path $stderrFile) {
-                $stderrContent = Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue
-                if ($stderrContent) {
-                    Write-Host "      [WGET STDERR] $($stderrContent.Trim())" -ForegroundColor Red
-                }
-                Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue
-            }
-            Write-Host "      [WARN] Turbo transfer interrupted (Code: $($proc.ExitCode))." -ForegroundColor Yellow
+            Write-Host "      [WARN] Turbo transfer interrupted (Code: $($proc.ExitCode)).`n" -ForegroundColor Yellow
         } catch {
-            Write-Host "      [WARN] wget failed to start: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "      [WARN] wget failed to start: $($_.Exception.Message)`n" -ForegroundColor Yellow
         }
     }
 
@@ -1646,7 +1903,7 @@ while ($true) {
     }
 
     # 3. Decision Tree
-    if ((Test-Path $gameExe) -and -not $forceShowMenu) {
+    if ((Test-Path $gameExe) -and -not $global:forceShowMenu) {
         # AUTO-LAUNCH (Both F2P and PWR)
         if ($f2pMatch) {
             Write-Host "[2/2] Auto-Launching Hytale F2P..." -ForegroundColor Cyan
@@ -1711,9 +1968,11 @@ while ($true) {
             Write-Host "[!] Local version does not match F2P server." -ForegroundColor Yellow
         }
         
-        if ($forceShowMenu) {
+        
+        if ($global:forceShowMenu) {
             Write-Host "`n[RECOVERY] You have missing or corrupt files. Please re-download." -ForegroundColor Red
             Write-Host "            (Option [2] is highly recommended based on server hash)" -ForegroundColor Cyan
+            # Don't reset here - let auto-repair logic handle it
         }
 
         $opt2Text = if ($global:javaMissingFlag) { "[2] FIX MISSING JAVA / Update Smart-Patch" } else { "[2] Download/Update to Hytale F2P (Smart-Patch)" }
@@ -1722,8 +1981,17 @@ while ($true) {
         Write-Host " [1] Download Official Hytale Patches (PWR)" -ForegroundColor White
         Write-Host " $opt2Text" -ForegroundColor $opt2Color
         Write-Host " [3] Attempt Force Launch anyway" -ForegroundColor Gray
-        $choice = Read-Host "`n Select an option [1]"
-        if ($choice -eq "") { $choice = "1" }
+        
+        # Auto-select option [2] if triggered by Assets error
+        if ($global:autoRepairTriggered) {
+            Write-Host "`n[AUTO-REPAIR] Automatically selecting option [2] to fix Assets..." -ForegroundColor Magenta
+            $choice = "2"
+            $global:autoRepairTriggered = $false  # Reset flag
+            Start-Sleep -Seconds 2
+        } else {
+            $choice = Read-Host "`n Select an option [1]"
+            if ($choice -eq "") { $choice = "1" }
+        }
 
         if ($choice -eq "1") {
             # Discover latest version
@@ -1746,6 +2014,10 @@ while ($true) {
                     Write-Host "      [INFO] Replacing Official PWR version with F2P Core..." -ForegroundColor Cyan
                 }
                 
+                # Backup world saves before installation
+                Write-Host "`n      [SAFETY] Protecting your world saves..." -ForegroundColor Cyan
+                $worldBackup = Backup-WorldSaves $userDir
+                
                 # Check disk space (Zip + Extraction room)
                 if (-not (Assert-DiskSpace $appDir ($REQ_CORE_SPACE * 2))) { pause; continue }
                 
@@ -1763,6 +2035,12 @@ while ($true) {
                 Write-Host "      [EXTRACT] Installing core files..." -ForegroundColor Cyan
                 if (Expand-WithProgress $localZip $appDir) {
                     Write-Host "      [SUCCESS] Core package verified and installed." -ForegroundColor Green
+                    
+                    # Restore world saves after successful installation
+                    if ($worldBackup) {
+                        Write-Host "`n      [SAFETY] Restoring your protected worlds..." -ForegroundColor Cyan
+                        Restore-WorldSaves $userDir $worldBackup
+                    }
                 } else {
                     Write-Host "      [ERROR] Extraction failed. The zip might be corrupt or files are in use." -ForegroundColor Red
                     if ($localZip) { Remove-Item $localZip -Force }
@@ -1775,11 +2053,19 @@ while ($true) {
                 Write-Host "`n[INFO] Core and Engine look healthy. Refreshing assets..." -ForegroundColor Cyan
             }
             
+            
             # Always verify assets and deps after any repair
             if (-not (Ensure-UserData $appDir $cacheDir $userDir)) { pause; continue }
 
             $global:javaMissingFlag = $false
             Write-Host "`n[COMPLETE] Hytale F2P is now ready!" -ForegroundColor Green
+            
+            # Reset flags to allow auto-launch on next iteration
+            $global:forceShowMenu = $false
+            $global:autoRepairTriggered = $false
+            
+            # Continue to restart loop and auto-launch
+            continue
         }
         elseif ($choice -ne "3") { exit }
     }
@@ -1916,6 +2202,14 @@ $proceedToLaunch = $false
 
 while (-not $proceedToLaunch) {
     
+    # [FIX] Check for auto-repair FIRST
+    if ($global:autoRepairTriggered) {
+        $isShortcut = $false
+        Write-Host "`n[AUTO-REPAIR] Assets missing! Bypassing menu and starting repair..." -ForegroundColor Magenta
+        $menuChoice = "3" 
+        Start-Sleep -Seconds 1
+    } 
+    
     if ($isShortcut) {
         Write-Host "      [AUTO] Running via Shortcut. Skipping Menu..." -ForegroundColor Green
         $proceedToLaunch = $true
@@ -1937,10 +2231,20 @@ while (-not $proceedToLaunch) {
     Write-Host " [4] Install HyFixes (Server Crash Fixes)" -ForegroundColor Cyan
     Write-Host " [5] Play Offline (Guest Mode)" -ForegroundColor Magenta
     Write-Host " [6] Play Unauthenticated (No Login)" -ForegroundColor DarkCyan
+    Write-Host " [7] Change Game Installation Path" -ForegroundColor Blue
     Write-Host ""
     
-    $menuChoice = Read-Host " Select an option [1]"
-    if ($menuChoice -eq "") { $menuChoice = "1" }
+    
+    # Auto-select Repair option if triggered by dialog error
+    if ($global:autoRepairTriggered) {
+        Write-Host "`n[AUTO-REPAIR] Assets missing! Automatically selecting [3] Repair..." -ForegroundColor Magenta
+        $menuChoice = "3"
+        $global:autoRepairTriggered = $false  # Reset flag
+        Start-Sleep -Seconds 2
+    } else {
+        $menuChoice = Read-Host " Select an option [1]"
+        if ($menuChoice -eq "") { $menuChoice = "1" }
+    }
 
     switch ($menuChoice) {
         "1" {
@@ -2025,9 +2329,88 @@ while (-not $proceedToLaunch) {
             }
         }
         "3" {
+            # Directly trigger F2P download/repair instead of just showing menu
+            Write-Host "`n[REPAIR] Starting F2P Core Download/Repair..." -ForegroundColor Magenta
+            
+            # Get fresh paths (they're defined at top of outer while loop)
+            $launcherRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $localAppData }
+            $appDir = Join-Path $launcherRoot "release\package\game\latest"
+            $cacheDir = Join-Path $localAppData "cache"
+            $userDir = Find-UserDataPath $appDir
+            
+            # Ensure directories exist
+            @($appDir, $cacheDir, $userDir) | ForEach-Object { 
+                if (-not (Test-Path $_)) { New-Item -ItemType Directory $_ -Force | Out-Null } 
+            }
+            
+            # Reset verification flags
             $global:assetsVerified = $false
-            $forceShowMenu = $true
-            $proceedToLaunch = $true 
+            $global:depsVerified = $false
+            
+            # Backup world saves
+            Write-Host "      [SAFETY] Protecting your world saves..." -ForegroundColor Cyan
+            $worldBackup = Backup-WorldSaves $userDir
+            
+            # Check disk space
+            if (-not (Assert-DiskSpace $appDir ($REQ_CORE_SPACE * 2))) { 
+                Write-Host "`nPress any key to return to menu..."
+                [void][System.Console]::ReadKey($true)
+                continue 
+            }
+            
+            $localZip = Join-Path $cacheDir $ZIP_FILENAME
+            $needsDownload = Test-FileNeedsDownload $localZip $ZIP_FILENAME
+            
+            if ($needsDownload) {
+                Write-Host "      [DOWNLOAD] Fetching $ZIP_FILENAME..." -ForegroundColor Cyan
+                if (-not (Download-WithProgress "$API_HOST/file/$ZIP_FILENAME" $localZip)) {
+                    Write-Host "      [ERROR] Download failed. Check your connection." -ForegroundColor Red
+                    Write-Host "`nPress any key to return to menu..."
+                    [void][System.Console]::ReadKey($true)
+                    continue
+                }
+            }
+            
+            Write-Host "      [EXTRACT] Installing core files..." -ForegroundColor Cyan
+            if (Expand-WithProgress $localZip $appDir) {
+                Write-Host "      [SUCCESS] Core package verified and installed." -ForegroundColor Green
+                
+                # Restore world saves
+                if ($worldBackup) {
+                    Write-Host "`n      [SAFETY] Restoring your protected worlds..." -ForegroundColor Cyan
+                    Restore-WorldSaves $userDir $worldBackup
+                }
+                
+                # Verify assets
+                if (-not (Ensure-UserData $appDir $cacheDir $userDir)) { 
+                    Write-Host "`nPress any key to return to menu..."
+                    [void][System.Console]::ReadKey($true)
+                    continue 
+                }
+                
+                # Ensure JRE is also installed
+                if (-not (Ensure-JRE $launcherRoot $cacheDir)) {
+                    Write-Host "`nPress any key to return to menu..."
+                    [void][System.Console]::ReadKey($true)
+                    continue
+                }
+                
+                Write-Host "`n[COMPLETE] Hytale F2P is now ready!" -ForegroundColor Green
+                
+                # Reset flags and proceed to launch
+                $global:forceShowMenu = $false
+                $global:autoRepairTriggered = $false
+                $proceedToLaunch = $true
+                
+            } else {
+                Write-Host "      [ERROR] Extraction failed. The zip might be corrupt or files are in use." -ForegroundColor Red
+                # Only try to remove if file exists
+                if ($localZip -and (Test-Path $localZip)) { 
+                    Remove-Item $localZip -Force -ErrorAction SilentlyContinue 
+                }
+                Write-Host "`nPress any key to return to menu..."
+                [void][System.Console]::ReadKey($true)
+            }
         }
         "4" {
             if (Install-HyFixes) {
@@ -2044,6 +2427,27 @@ while (-not $proceedToLaunch) {
              # Unauthenticated mode - still use authenticated auth-mode but skip token generation
              $global:unauthenticatedMode = $true
              $proceedToLaunch = $true
+        }
+        "7" {
+            Write-Host "`n[PATH] Changing game installation directory..." -ForegroundColor Cyan
+            
+            # Show current path
+            Write-Host "      Current: $gameExe" -ForegroundColor Gray
+            
+            # Invoke path selection dialog
+            $newPath = Invoke-PathDialog
+            
+            if ($newPath) {
+                $gameExe = $newPath
+                Write-Host "      [SUCCESS] Game path updated to:" -ForegroundColor Green
+                Write-Host "                $newPath" -ForegroundColor Gray
+                Write-Host "`n      [INFO] Restart launcher to apply changes." -ForegroundColor Yellow
+                Write-Host "`nPress any key to return to menu..."
+                [void][System.Console]::ReadKey($true)
+            } else {
+                Write-Host "      [CANCELLED] Path not changed." -ForegroundColor Yellow
+                Start-Sleep -Seconds 2
+            }
         }
     }
 }
@@ -2069,6 +2473,16 @@ if (-not (Ensure-JRE $launcherRoot $cacheDir)) {
     # If Ensure-JRE fails or isn't present, just warn
 }
 
+# Critical Check: Ensure game exists before patching/launching
+if (-not (Test-Path $gameExe)) {
+    Write-Host "`n[ERROR] Game Executable (HytaleClient.exe) is missing!" -ForegroundColor Red
+    Write-Host "        Expected at: $gameExe" -ForegroundColor Yellow
+    Write-Host "        Redirecting to Repair menu..." -ForegroundColor Cyan
+    $global:forceShowMenu = $true
+    $global:autoRepairTriggered = $true
+    continue
+}
+
 # Patch Client
 Patch-HytaleClient $gameExe | Out-Null
 
@@ -2091,6 +2505,150 @@ if ($env:_JAVA_OPTIONS -or $env:CLASSPATH) {
     $env:CLASSPATH = $null
 }
 # ------------------------
+
+# --- DIALOG ERROR DETECTION HELPER ---
+function Get-HytaleErrorDialogs($processName) {
+    """Detect Windows error dialogs spawned by HytaleClient.exe and extract message text"""
+    try {
+        # Add P/Invoke for Window enumeration
+        if (-not ([System.Management.Automation.PSTypeName]'Win32.DialogDetector').Type) {
+            Add-Type @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Collections.Generic;
+
+public class Win32 {
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    
+    [DllImport("user32.dll")]
+    public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+    
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+    
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    
+    // Storage for found dialogs
+    public static List<DialogInfo> FoundDialogs = new List<DialogInfo>();
+    
+    public class DialogInfo {
+        public string Title;
+        public string Message;
+        public uint ProcessId;
+        public IntPtr Handle;
+    }
+    
+    // Helper to get all child window texts
+    public static List<string> GetChildWindowTexts(IntPtr parentHandle) {
+        List<string> texts = new List<string>();
+        
+        EnumChildWindows(parentHandle, (hWnd, lParam) => {
+            StringBuilder className = new StringBuilder(256);
+            GetClassName(hWnd, className, className.Capacity);
+            
+            // Get text from Static controls and Edit controls
+            string classStr = className.ToString();
+            if (classStr == "Static" || classStr == "Edit") {
+                StringBuilder text = new StringBuilder(1024);
+                int length = GetWindowText(hWnd, text, text.Capacity);
+                if (length > 0) {
+                    texts.Add(text.ToString());
+                }
+            }
+            return true; // Continue enumeration
+        }, IntPtr.Zero);
+        
+        return texts;
+    }
+    
+    // Enumerate all windows and find dialogs
+    public static List<DialogInfo> FindDialogs(uint targetProcessId) {
+        FoundDialogs.Clear();
+        
+        EnumWindows((hWnd, lParam) => {
+            // Check if window is visible
+            if (!IsWindowVisible(hWnd)) return true;
+            
+            // Get window class
+            StringBuilder className = new StringBuilder(256);
+            GetClassName(hWnd, className, className.Capacity);
+            string classStr = className.ToString();
+            
+            // Check if it's a dialog class
+            if (classStr == "#32770" || classStr.Contains("Dialog") || classStr.Contains("Error")) {
+                // Get process ID
+                uint windowPid = 0;
+                GetWindowThreadProcessId(hWnd, out windowPid);
+                
+                // Check if it belongs to our target process
+                if (windowPid == targetProcessId) {
+                    // Get window title
+                    StringBuilder title = new StringBuilder(256);
+                    GetWindowText(hWnd, title, title.Capacity);
+                    
+                    // Get message from child controls
+                    List<string> messages = GetChildWindowTexts(hWnd);
+                    string fullMessage = string.Join(" | ", messages);
+                    
+                    FoundDialogs.Add(new DialogInfo {
+                        Title = title.ToString(),
+                        Message = fullMessage,
+                        ProcessId = windowPid,
+                        Handle = hWnd
+                    });
+                }
+            }
+            
+            return true; // Continue enumeration
+        }, IntPtr.Zero);
+        
+        return FoundDialogs;
+    }
+}
+"@
+        }
+        
+        # Get all processes with this name
+        $procs = Get-Process -Name $processName -ErrorAction SilentlyContinue
+        if (-not $procs) { return @() }
+        
+        $allDialogs = @()
+        
+        foreach ($proc in $procs) {
+            # Use the C# helper to find all dialogs for this process
+            $foundDialogs = [Win32]::FindDialogs($proc.Id)
+            
+            foreach ($dialog in $foundDialogs) {
+                $allDialogs += @{
+                    Title = $dialog.Title
+                    Message = $dialog.Message
+                    ProcessId = $dialog.ProcessId
+                    Handle = $dialog.Handle
+                }
+            }
+        }
+        
+        return $allDialogs
+    } catch {
+        Write-Host "      [DEBUG] Dialog detection error: $($_.Exception.Message)" -ForegroundColor DarkGray
+        return @()
+    }
+}
+# ----------------------------------------
 
 $dispJava = if ($global:javaPath) { $global:javaPath } else { $javaExe }
 Write-Host "      Java:     $dispJava" -ForegroundColor Gray
@@ -2443,7 +3001,17 @@ if (Test-Path $gameExe) {
              Write-Host "`n[INFO] Game Process Exited (Zero Memory). Closing." -ForegroundColor Gray
              $stable = $true
              break 
+            # Force menu to show for repair AND auto-select option [2]
+            Write-Host "      [ACTION] Auto-triggering F2P redownload..." -ForegroundColor Yellow
+            $global:assetsVerified = $false
+            $global:forceRestart = $true
+            $global:autoRepairTriggered = $true  # NEW: Auto-select repair option
+            $global:forceShowMenu = $true  # Make it global so it persists
+            $stable = $false
+            break
         }
+        
+
 
         if (-not $guiDetected) {
             Write-Host "`r      [STATS] Mem: $($memMB)MB | Waiting for GUI...   " -NoNewline -ForegroundColor Gray
@@ -2452,6 +3020,7 @@ if (Test-Path $gameExe) {
             if ($i % 5 -eq 0) {
                  Write-Host "`r      [MONITOR] Listening for server errors... (Mem: $($memMB)MB)   " -NoNewline -ForegroundColor DarkGray
             }
+
         }
         
         if ($cp.MainWindowHandle -ne [IntPtr]::Zero) {
@@ -2464,7 +3033,44 @@ if (Test-Path $gameExe) {
                     [User32]::ShowWindow($consolePtr, 6) | Out-Null
                     $minimized = $true
                 }
+                # Check for Windows error dialogs every 10 seconds
+                if ($i % 10 -eq 0) {
+                    $errorDialogs = Get-HytaleErrorDialogs "HytaleClient"
+                    foreach ($dialog in $errorDialogs) {
+                        if ($dialog.Title) {
+                            Write-Host "$($dialog.Message)" -ForegroundColor Cyan
 
+                            # AUTO-FIX: Assets directory not found
+                            if ($dialog.Message -match "Assets directory not found" -or $dialog.Message -match "Assets") {
+                                Write-Host "`n      [AUTO-FIX] Assets directory missing! Triggering repair..." -ForegroundColor Magenta
+                                
+                                # Kill the game process
+                                Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                                Start-Sleep -Seconds 1
+                                
+                                # Try to close the error dialog too
+                                try {
+                                    $dialogHandle = $dialog.Handle
+                                    if ($dialogHandle -ne [IntPtr]::Zero) {
+                                        # Send WM_CLOSE message to dialog
+                                        [void][System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms")
+                                        [void][Win32]::SendMessage($dialogHandle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+                                    }
+                                } catch {}
+                                
+                                # Force menu to show for repair AND auto-select option [2]
+                                Write-Host "      [ACTION] Auto-triggering F2P redownload..." -ForegroundColor Yellow
+                                $global:assetsVerified = $false
+                                $global:forceRestart = $true
+                                $global:autoRepairTriggered = $true  # NEW: Auto-select repair option
+                                $global:forceShowMenu = $true  # Make it global so it persists
+                                $stable = $false
+                                break
+                            }
+                        }
+                    }
+                    if ($global:forceRestart) { break }
+                }
                 Write-Host "`r      [SUCCESS] Game Window Detected! Listening for errors..." -ForegroundColor Green
                 Write-Host "`r      [SUCCESS] Hytale is running successfully!" -ForegroundColor Green
                 $stable = $true
