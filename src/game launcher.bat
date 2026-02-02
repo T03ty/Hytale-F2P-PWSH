@@ -813,52 +813,52 @@ function Patch-HytaleServer($serverJarPath) {
         Remove-Item $patchFlag -Force -ErrorAction SilentlyContinue
     }
 
-    Write-Host "      [SERVER] Downloading Pre-Patched Server JAR..." -ForegroundColor Cyan
+    Write-Host "      [SERVER] Select Branch" -ForegroundColor Cyan
+    Write-Host "        [1] Release" -ForegroundColor Green
+    Write-Host "        [2] Pre-Release" -ForegroundColor Yellow
+    $branchChoice = Read-Host "      Choice"
     
-    # Define Sources (Official Sanasol release for F2P clients)
-    $primaryUrl = "https://download.sanasol.ws/download/HytaleServer.jar"
+    $primaryUrl = if ($branchChoice -eq "2") {
+        "https://patcher.authbp.xyz/download/patched_prerelease"
+    } else {
+        "https://patcher.authbp.xyz/download/patched_release"
+    }
     $fallbackUrl = "$API_HOST/file/HytaleServer.jar"
     
-    # Create backup of original if exists
     if (Test-Path $serverJarPath) {
         Move-Item $serverJarPath "$serverJarPath.original" -Force -ErrorAction SilentlyContinue
     }
     
-    # Attempt 1: Primary Source (R2)
-    Write-Host "      [TRY] Primary Source (R2)..." -ForegroundColor Gray
+    Write-Host "      [DOWNLOAD] Fetching Server JAR..." -ForegroundColor Gray
     if (Download-WithProgress $primaryUrl $serverJarPath $false) {
-        # Verify download
         if ((Test-Path $serverJarPath) -and ((Get-Item $serverJarPath).Length -ge $minValidSize)) {
-            $flagObj = @{ domain = $targetDomain; patchedAt = (Get-Date).ToString(); source = "R2" }
+            $flagObj = @{ domain = $targetDomain; patchedAt = (Get-Date).ToString(); source = "AuthBP" }
             $flagObj | ConvertTo-Json | Out-File $patchFlag
-            Write-Host "      [SUCCESS] Patched Server JAR installed via R2." -ForegroundColor Green
+            Write-Host "      [SUCCESS] Server JAR installed." -ForegroundColor Green
             return $true
         } else {
-            Write-Host "      [WARN] R2 download incomplete or corrupted." -ForegroundColor Yellow
+            Write-Host "      [WARN] Download incomplete." -ForegroundColor Yellow
             if (Test-Path $serverJarPath) { Remove-Item $serverJarPath -Force -ErrorAction SilentlyContinue }
         }
-    } 
+    }
     
-    # Attempt 2: Fallback Source (API Host)
-    Write-Host "      [FALLBACK] R2 failed. Attempting API Host download..." -ForegroundColor Yellow
+    Write-Host "      [FALLBACK] Attempting backup source..." -ForegroundColor Yellow
     if (Download-WithProgress $fallbackUrl $serverJarPath $true) {
-        # Verify download
         if ((Test-Path $serverJarPath) -and ((Get-Item $serverJarPath).Length -ge $minValidSize)) {
             $flagObj = @{ domain = $targetDomain; patchedAt = (Get-Date).ToString(); source = "API_HOST" }
             $flagObj | ConvertTo-Json | Out-File $patchFlag
-            Write-Host "      [SUCCESS] Patched Server JAR installed via API Host." -ForegroundColor Green
+            Write-Host "      [SUCCESS] Server JAR installed via fallback." -ForegroundColor Green
             return $true
         } else {
-            Write-Host "      [WARN] API Host download incomplete or corrupted." -ForegroundColor Yellow
+            Write-Host "      [WARN] Fallback download incomplete." -ForegroundColor Yellow
             if (Test-Path $serverJarPath) { Remove-Item $serverJarPath -Force -ErrorAction SilentlyContinue }
         }
     }
 
-    # Final Failure: Restore backup if available
-    Write-Host "      [ERROR] All server patch sources failed." -ForegroundColor Red
+    Write-Host "      [ERROR] All sources failed." -ForegroundColor Red
     if (Test-Path "$serverJarPath.original") {
         Move-Item "$serverJarPath.original" $serverJarPath -Force
-        Write-Host "      [INFO] Original server JAR restored." -ForegroundColor Gray
+        Write-Host "      [INFO] Original restored." -ForegroundColor Gray
     }
     return $false
 }
@@ -2262,8 +2262,9 @@ while (-not $proceedToLaunch) {
                 Write-Host "==========================================" -ForegroundColor Yellow
                 Write-Host ""
                 Write-Host " [1] Download server.bat (Launcher Script)" -ForegroundColor Green
-                Write-Host " [2] Download HytaleServer.jar (Sanasol F2P)" -ForegroundColor Cyan
-                Write-Host " [3] Run Existing server.bat" -ForegroundColor Gray
+                Write-Host " [2] Download HytaleServer.jar (Release)" -ForegroundColor Cyan
+                Write-Host " [3] Download HytaleServer.jar (Pre-Release)" -ForegroundColor Yellow
+                Write-Host " [4] Run Existing server.bat" -ForegroundColor Gray
                 Write-Host " [0] Back to Main Menu" -ForegroundColor DarkGray
                 Write-Host ""
                 
@@ -2272,13 +2273,12 @@ while (-not $proceedToLaunch) {
                 
                 switch ($serverChoice) {
                     "1" {
-                        # Download server.bat
                         $serverBatUrl = "$API_HOST/file/server.bat"
                         $serverBatDest = Join-Path $appDir "server.bat"
                         
                         Write-Host "`n[SERVER] Downloading server.bat..." -ForegroundColor Cyan
                         if (Download-WithProgress $serverBatUrl $serverBatDest $true) {
-                            Write-Host "      [SUCCESS] server.bat installed to: $serverBatDest" -ForegroundColor Green
+                            Write-Host "      [SUCCESS] server.bat installed." -ForegroundColor Green
                         } else {
                             Write-Host "      [ERROR] Download failed." -ForegroundColor Red
                         }
@@ -2286,21 +2286,18 @@ while (-not $proceedToLaunch) {
                         [void][System.Console]::ReadKey($true)
                     }
                     "2" {
-                        # Download HytaleServer.jar from Sanasol
                         $serverDir = Join-Path $appDir "Server"
                         $serverJarPath = Join-Path $serverDir "HytaleServer.jar"
                         
-                        Write-Host "`n[SERVER] Downloading HytaleServer.jar (Sanasol F2P)..." -ForegroundColor Cyan
-                        Write-Host "      Source: https://download.sanasol.ws/download/HytaleServer.jar" -ForegroundColor Gray
+                        Write-Host "`n[SERVER] Downloading HytaleServer.jar (Release)..." -ForegroundColor Cyan
                         
                         if (-not (Test-Path $serverDir)) {
                             New-Item -ItemType Directory $serverDir -Force | Out-Null
                         }
                         
-                        if (Download-WithProgress "https://download.sanasol.ws/download/HytaleServer.jar" $serverJarPath $false) {
-                            Write-Host "      [SUCCESS] HytaleServer.jar installed to: $serverJarPath" -ForegroundColor Green
-                            # Create flag
-                            $flagObj = @{ domain = "sanasol.ws"; patchedAt = (Get-Date).ToString(); source = "Sanasol" }
+                        if (Download-WithProgress "https://patcher.authbp.xyz/download/patched_release" $serverJarPath $false) {
+                            Write-Host "      [SUCCESS] HytaleServer.jar installed." -ForegroundColor Green
+                            $flagObj = @{ domain = "authbp.xyz"; patchedAt = (Get-Date).ToString(); source = "Release" }
                             $flagObj | ConvertTo-Json | Out-File "$serverJarPath.dualauth_patched"
                         } else {
                             Write-Host "      [ERROR] Download failed." -ForegroundColor Red
@@ -2309,13 +2306,32 @@ while (-not $proceedToLaunch) {
                         [void][System.Console]::ReadKey($true)
                     }
                     "3" {
-                        # Run existing server.bat
+                        $serverDir = Join-Path $appDir "Server"
+                        $serverJarPath = Join-Path $serverDir "HytaleServer.jar"
+                        
+                        Write-Host "`n[SERVER] Downloading HytaleServer.jar (Pre-Release)..." -ForegroundColor Yellow
+                        
+                        if (-not (Test-Path $serverDir)) {
+                            New-Item -ItemType Directory $serverDir -Force | Out-Null
+                        }
+                        
+                        if (Download-WithProgress "https://patcher.authbp.xyz/download/patched_prerelease" $serverJarPath $false) {
+                            Write-Host "      [SUCCESS] HytaleServer.jar installed." -ForegroundColor Green
+                            $flagObj = @{ domain = "authbp.xyz"; patchedAt = (Get-Date).ToString(); source = "PreRelease" }
+                            $flagObj | ConvertTo-Json | Out-File "$serverJarPath.dualauth_patched"
+                        } else {
+                            Write-Host "      [ERROR] Download failed." -ForegroundColor Red
+                        }
+                        Write-Host "`nPress any key to continue..."
+                        [void][System.Console]::ReadKey($true)
+                    }
+                    "4" {
                         $serverBatDest = Join-Path $appDir "server.bat"
                         if (Test-Path $serverBatDest) {
                             Write-Host "`n[RUN] Launching Server Console..." -ForegroundColor Green
                             Start-Process cmd.exe -ArgumentList "/k `"$serverBatDest`"" -WorkingDirectory $appDir
                         } else {
-                            Write-Host "      [ERROR] server.bat not found. Download it first using option [1]." -ForegroundColor Red
+                            Write-Host "      [ERROR] server.bat not found." -ForegroundColor Red
                             Start-Sleep -Seconds 2
                         }
                     }
