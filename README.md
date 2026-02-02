@@ -128,6 +128,18 @@ This script doesn't just "open" the game; it actively repairs the following prob
 * **The Problem:** Your client version is newer than the server, preventing connection.
 * **The Fix:** Performs a **Update server.jar** to align your binaries with the server's requirements.
 
+### 8. World State Corruption / "World already exists on disk"
+* **The Problem:** Singleplayer servers crash because world files (like `Caves.json`) are null or corrupted, but the existing folder prevents the game from trying to generate it again.
+* **The Fix:** The script performs a **Deep World-State Purge**. It detects generation failures and automatically clears the corrupted `Saves` and `Internal/Worlds` folders to allow a clean world generation.
+
+### 9. Asset Decoding Failures / "Failed to find enum value"
+* **The Problem:** The server crashes during boot because it cannot parse certain models (e.g., `Snake_Marsh`) due to unrecognized tags like `Ophidiophobia`.
+* **The Fix:** Executes an **Asset Integrity Sync**. It identifies version conflicts between your `Assets.zip` and `HytaleServer.jar`, re-aligning them so the server can parse game data without crashing.
+
+### 10. Protocol Version Mismatch / "ALPN mismatch"
+* **The Problem:** The game client and server are speaking different network languages (e.g., `hytale/1` vs `hytale/2`), causing immediate disconnection.
+* **The Fix:** Triggers a **Protocol Handshake Alignment**. It detects the required ALPN version and updates your server binaries to ensure they match your client's protocol version.
+  
 ---
 
 ## 📂 Auto-Recovery Error Types
@@ -136,12 +148,15 @@ The launcher monitors game logs in real-time and automatically handles these spe
 
 | Priority | Error Pattern | Auto-Fix Action |
 |----------|--------------|-----------------|
-| **0** | `AppMainMenu.*NullReferenceException` | Checks for missing Server directory/JAR, downloads `HytaleServer.jar` from Sanasol |
-| **1** | `Token validation failed` / `signature verification failed` / `No Ed25519 key found` | Downloads pre-patched server with correct authentication keys |
-| **2** | `VM Initialization Error` / `Failed setting boot class path` | Clears AOT cache, prefab cache, purges corrupted JRE, forces re-download |
-| **3** | `Identity token has invalid issuer: expected <URL>` | Auto-updates AUTH_URL config to match game client, restarts with corrected settings |
-| **4** | `Server failed to boot` (generic) | Attempts HyFixes installation if not already applied for this version |
-| **∞** | Any error repeated 3+ times | **LOOP DETECTED** - Pauses and prompts user to screenshot for dev reporting |
+| **0** | `AppMainMenu.*NullReferenceException` | Checks for missing Server directory/JAR, downloads `HytaleServer.jar` |
+| **1** | `Token validation failed` / `signature verification failed` | Downloads pre-patched server with correct authentication keys |
+| **2** | `VM Initialization Error` / `Failed setting boot class path` | Clears AOT/Prefab cache and purges corrupted JRE |
+| **3** | `Identity token has invalid issuer` | Auto-updates AUTH_URL config to match game client |
+| **4** | `IllegalArgumentException: World default already exists` | Purges corrupted singleplayer world data and cache |
+| **5** | `Failed to decode asset` / `Failed to find enum value` | Repairs conflicting model assets in the `Assets.zip` |
+| **6** | `client outdated (ALPN mismatch)` | Updates Server JAR to match Client network protocol |
+| **7** | `Server failed to boot` (generic) | Attempts HyFixes installation |
+| **∞** | Any error repeated 3+ times | **LOOP DETECTED** - Pauses for manual reporting |
 
 ### Error Detection Examples
 
@@ -161,6 +176,18 @@ The launcher monitors game logs in real-time and automatically handles these spe
 [LOG ERROR] Identity token has invalid issuer: expected https://sessions.sanasol.ws
       → [FIX] Issuer Mismatch Detected!
       → [ACTION] Updating configuration to match Game Client...
+
+[LOG ERROR] java.lang.IllegalArgumentException: World default already exists on disk!
+      → [FIX] World Corruption Detected!
+      → [ACTION] Purging corrupted save data and internal world cache...
+
+[LOG ERROR] Failed to find enum value for Ophidiophobia
+      → [FIX] Asset Mismatch Detected!
+      → [ACTION] Synchronizing Assets.zip with Server JAR...
+
+[LOG ERROR] client outdated (ALPN mismatch): ALPN hytale/1 < required 2
+      → [FIX] Protocol Mismatch Detected!
+      → [ACTION] Aligning Server Protocol Version to match Client...
 ```
 
 ---
