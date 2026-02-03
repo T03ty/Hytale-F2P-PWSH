@@ -51,10 +51,10 @@ if not "%~1"=="am_wt" (
 )
 
 :: 3. CRASH-PROOF LOADER
-set "PS_CMD=$f=[System.IO.Path]::GetFullPath('%~f0'); iex ((Get-Content -LiteralPath $f) | Where-Object {$found -or $_ -match '^#PS_START'} | ForEach-Object {$found=$true; $_} | Out-String)"
+:: Use -Raw for speed and robustness. Wrap in try/catch to keep window open on crash.
+set "loader=$p='%~f0'; $p=[System.IO.Path]::GetFullPath($p); $t=Get-Content -LiteralPath $p -Raw; $m='#PS_S'+'TART'; $i=$t.IndexOf($m); if($i -ge 0){ $s=$t.Substring($i); try { iex $s } catch { Write-Host 'CRITICAL LAUNCHER ERROR:'; Write-Host $_.Exception.ToString() -Fg Red; Read-Host 'Press Enter to exit...' } } else { Write-Error 'Script marker not found'; Read-Host }"
 
-:: Inject shortcut status
-powershell -NoProfile -ExecutionPolicy Bypass -Command "%PS_CMD%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "%loader%"
 exit /b
 #>
 
@@ -63,17 +63,6 @@ $ProgressPreference = 'SilentlyContinue'
 
 # --- SECURITY PROTOCOL (Fix for GitHub Downloads) ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
-
-# --- Filename Restoration (Fix GAMELA~2.BAT Bug) ---
-if ($f -match "GAMELA~") {
-    $correctName = Join-Path (Split-Path $f) "game launcher.bat"
-    if (-not (Test-Path $correctName)) {
-        try {
-            Rename-Item $f "game launcher.bat" -ErrorAction SilentlyContinue
-            $f = $correctName
-        } catch {}
-    }
-}
 
 # --- Admin Detection ---
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
@@ -152,8 +141,6 @@ $ORIGINAL_DOMAIN = "hytale.com"
 $DEFAULT_NEW_DOMAIN = "auth.sanasol.ws"
 
 $OFFICIAL_BASE = "https://game-patches.hytale.com/patches"
-$ZIP_FILENAME = "latest.zip"
-
 $localAppData = "$env:LOCALAPPDATA\HytaleF2P"
 $PublicConfig = "C:\Users\Public\HytaleF2P"
 $pathConfigFile = Join-Path $localAppData "path_config.json"
@@ -475,27 +462,21 @@ function Get-OrCreate-PlayerId($ignored) {
 }
 
 function Find-UserDataPath($gameLatest) {
-    # Replicates logic from backend/core/paths.js
     $candidates = @()
-    
-    # Priority order from Node.js
+    # Priority order
     $candidates += Join-Path $gameLatest "Client\UserData"
     $candidates += Join-Path $gameLatest "Client\Hytale.app\Contents\UserData"
     $candidates += Join-Path $gameLatest "Hytale.app\Contents\UserData"
     $candidates += Join-Path $gameLatest "UserData"
-    
-    # Explicit Windows fallback
-    $candidates += Join-Path $gameLatest "Client\UserData"
+    $candidates += Join-Path $gameLatest "Client\UserData" # Win fallback
     
     foreach ($cand in $candidates) {
         if (Test-Path $cand) { return $cand }
     }
     
-    # Default fallback: create Client\UserData
+    # Default fallback
     $defaultPath = Join-Path $gameLatest "Client\UserData"
-    if (-not (Test-Path $defaultPath)) {
-        New-Item -ItemType Directory $defaultPath -Force | Out-Null
-    }
+    if (-not (Test-Path $defaultPath)) { New-Item -ItemType Directory $defaultPath -Force | Out-Null }
     return $defaultPath
 }
 
@@ -722,6 +703,93 @@ function Restore-WorldSaves($userDataPath) {
         Write-Host "      [INFO] All maps are already up to date." -ForegroundColor Gray
     }
 }
+
+function Find-UserDataPath($gameLatest) {
+    $candidates = @()
+    # Priority order
+    $candidates += Join-Path $gameLatest "Client\UserData"
+    $candidates += Join-Path $gameLatest "Client\Hytale.app\Contents\UserData"
+    $candidates += Join-Path $gameLatest "Hytale.app\Contents\UserData"
+    $candidates += Join-Path $gameLatest "UserData"
+    $candidates += Join-Path $gameLatest "Client\UserData" # Win fallback
+    
+    foreach ($cand in $candidates) {
+        if (Test-Path $cand) { return $cand }
+    }
+    
+    # Default fallback
+    $defaultPath = Join-Path $gameLatest "Client\UserData"
+    if (-not (Test-Path $defaultPath)) { New-Item -ItemType Directory $defaultPath -Force | Out-Null }
+    return $defaultPath
+}
+
+function Sync-PlayerIdentityFromSaves($userDataPath) {
+    if (-not $userDataPath) { return $false }
+    $savesDir = Join-Path $userDataPath "Saves"
+    $backupRoot = Join-Path $global:PublicConfig "WorldBackups"
+    
+    $processSavesRecursive = { param($monitorDir)
+        if (-not (Test-Path $monitorDir)) { return $false }
+        # Recursive search for 'players' folder inside 'universe'
+        $playerDirs = Get-ChildItem -Path $monitorDir -Directory -Recurse -Filter "players" -ErrorAction SilentlyContinue | Where-Object { $_.Parent.Name -eq "universe" }
+        
+        foreach ($pDir in $playerDirs) {
+             # Look for ANY json files (single player world usually has 1)
+             $jsonFiles = Get-ChildItem -Path $pDir.FullName -Filter "*.json"
+             if ($jsonFiles.Count -eq 1) {
+                  try {
+                        $pDat = Get-Content $jsonFiles[0].FullName -Raw | ConvertFrom-Json
+                        $extractedName = $null
+                        if ($pDat.Components.Nameplate.Text) { 
+                            $extractedName = $pDat.Components.Nameplate.Text 
+                        } elseif ($pDat.Components.DisplayName.DisplayName.RawText) { 
+                            $extractedName = $pDat.Components.DisplayName.DisplayName.RawText 
+                        }
+                        
+                        $extractedUuid = $jsonFiles[0].BaseName
+                        
+                        if ($extractedName -and $extractedUuid) {
+                            Write-Host "      [IDENTITY] Found Identity: $extractedName ($extractedUuid)" -ForegroundColor Cyan
+                            $global:pName = $extractedName
+                            $global:pUuid = $extractedUuid
+                            
+                            # Sync persistence
+                            $idFile = Join-Path $global:PublicConfig "player_id.json"
+                            if (-not (Test-Path $global:PublicConfig)) { New-Item -ItemType Directory $global:PublicConfig -Force | Out-Null }
+                            
+                            @{ playerId = $extractedUuid; createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") } | ConvertTo-Json | Out-File $idFile -Encoding UTF8 -Force
+                            
+                            $cfgFile = Join-Path $global:PublicConfig "config_data.json"
+                            if (Test-Path $cfgFile) {
+                                try {
+                                    $json = Get-Content $cfgFile -Raw | ConvertFrom-Json
+                                    $json.username = $extractedName
+                                    $json | ConvertTo-Json -Depth 4 | Out-File $cfgFile -Encoding UTF8 -Force
+                                    Write-Host "      [IDENTITY] Synced to launcher config." -ForegroundColor Green
+                                } catch {}
+                            }
+                            return $true
+                        }
+                  } catch {}
+             }
+        }
+        return $false
+    }
+    
+    # 1. Try Local Saves
+    if (&$processSavesRecursive -monitorDir $savesDir) { return $true }
+    
+    # 2. Try Backups
+    if (Test-Path $backupRoot) {
+        $latestBackup = Get-ChildItem -Path $backupRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+        if ($latestBackup) {
+             Write-Host "      [IDENTITY] Checking backup: $($latestBackup.Name)" -ForegroundColor Gray
+             if (&$processSavesRecursive -monitorDir $latestBackup.FullName) { return $true }
+        }
+    }
+    return $false
+}
+
 
 # --- CLIENT PATCHING LOGIC (Node.js Port) ---
 function String-ToLengthPrefixed($str) {
@@ -1408,7 +1476,6 @@ function Get-LatestPatchVersion {
     $api_url = "https://files.hytalef2p.com/api/version_client"
     
     # --- Try API First (Instant) ---
-    # --- Try API First (Instant) ---
     try {
         Write-Host "      [API] Fetching latest client version..." -ForegroundColor Gray
         $api_res = Invoke-RestMethod -Uri $api_url -Headers @{ 'User-Agent' = 'Hytale-F2P-Launcher' } -TimeoutSec 5
@@ -1837,74 +1904,96 @@ function Show-NetworkFixMenu {
             "4" { Install-CloudflareWarp; Pause }
             "0" { $netMenuLoop = $false }
             default { $netMenuLoop = $false }
-        }
     }
 }
-
-function Ensure-UserData($appDir, $cacheDir, $userDir) {
-    if ($global:userDataVerified) { return $true }
-    return $true
-    
-    $clientDir = Split-Path $userDir
-    $localZip = Join-Path $clientDir "UserData.zip"
-    $manifestFile = Join-Path $userDir "UserData_manifest.json"
-    $savesDir = Join-Path $userDir "Saves"
-    
-    Write-Host "`n[SYNC] Checking UserData (UserData.zip)..." -ForegroundColor Cyan
-    
-    # 1. Fast-Path Check
-    $needsSync = Test-FileNeedsDownload $localZip "UserData.zip"
-    if (-not $needsSync -and (Test-Path $localZip) -and (Test-ZipValid $localZip) -and (Test-Path $manifestFile)) {
-        try {
-            $manifest = Get-Content $manifestFile -Raw | ConvertFrom-Json
-            if ($manifest.zipHash -eq (Get-LocalSha1 $localZip)) {
-                Write-Host "      [SKIP] UserData verified via manifest (Instant). Skipping extraction." -ForegroundColor Green
-                $global:userDataVerified = $true; return $true
-            }
-        } catch {}
-    }
-
-    if ($needsSync) {
-        Write-Host "      [DOWNLOAD] Fetching latest UserData..." -ForegroundColor Cyan
-        if (-not (Download-WithProgress "$API_HOST/file/UserData.zip" $localZip)) { return $false }
-    }
-    
-    # 2. Backup Detection (Saves)
-    $backupPath = $null
-    if (Test-Path $savesDir) {
-        $worlds = Get-ChildItem -Path $savesDir -Directory
-        if ($worlds.Count -gt 0) {
-            Write-Host "`n      [DETECT] Existing world saves found in: $savesDir" -ForegroundColor Yellow
-            $bChoice = Read-Host "      Do you want to backup your world data before updating game files? (y/n)"
-            if ($bChoice -eq "y") {
-                $backupPath = Join-Path $cacheDir "saves_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-                New-Item -ItemType Directory $backupPath -Force | Out-Null
-                Write-Host "      [BACKUP] Safely moving worlds to: $backupPath" -ForegroundColor Cyan
-                Get-ChildItem -Path $savesDir | ForEach-Object { Move-Item $_.FullName $backupPath -Force }
-            }
-        }
-    }
-
-    # 3. Extract and Update Manifest
-    Write-Host "      [EXTRACT] Applying UserData overwrites..." -ForegroundColor Cyan
-    if (Expand-WithProgress $localZip $clientDir) {
-        # Restore Backups
-        if ($backupPath -and (Test-Path $backupPath)) {
-            Write-Host "      [RESTORE] Putting your world data back..." -ForegroundColor Green
-            if (-not (Test-Path $savesDir)) { New-Item -ItemType Directory $savesDir -Force | Out-Null }
-            Get-ChildItem -Path $backupPath | ForEach-Object { Move-Item $_.FullName $savesDir -Force }
-            Remove-Item $backupPath -Recurse -Force
-        }
-
-        try {
-            $manifestObj = @{ zipHash = (Get-LocalSha1 $localZip); timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
-            $manifestObj | ConvertTo-Json | Out-File $manifestFile
-        } catch {}
+}
+function Show-ProfileMenu {
+    $pMenuLoop = $true
+    while ($pMenuLoop) {
+        Clear-Host
+        Write-Host "==========================================" -ForegroundColor Magenta
+        Write-Host "         PROFILE MANAGER" -ForegroundColor Magenta
+        Write-Host "==========================================" -ForegroundColor Magenta
+        Write-Host ""
+        Write-Host "      Current Profile:" -ForegroundColor Gray
+        Write-Host "      Name: $global:pName" -ForegroundColor Cyan
+        Write-Host "      UUID: $global:pUuid" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host " [1] Change Username" -ForegroundColor Green
+        Write-Host " [2] Change UUID (Manual)" -ForegroundColor Yellow
+        Write-Host " [3] Regenerate UUID (Random)" -ForegroundColor Cyan
+        Write-Host " [4] Sync from Save URL (Force 'Sync-PlayerIdentityFromSaves')" -ForegroundColor White
+        Write-Host " [0] Back to Main Menu" -ForegroundColor DarkGray
+        Write-Host ""
         
-        Write-Host "      [SUCCESS] UserData patches applied." -ForegroundColor Green
-        $global:userDataVerified = $true; return $true
+        $pChoice = Read-Host " Select an option [0]"
+        if ($pChoice -eq "") { $pChoice = "0" }
+        
+        switch ($pChoice) {
+            "1" {
+                $newName = Read-Host "`n      Enter new Username"
+                if ($newName -and $newName.Trim().Length -gt 0) {
+                    $global:pName = $newName
+                    # Persist
+                    $cfgFile = Join-Path $PublicConfig "config_data.json"
+                    try {
+                        $json = Get-Content $cfgFile -Raw | ConvertFrom-Json
+                        $json.username = $global:pName
+                        $json | ConvertTo-Json -Depth 4 | Out-File $cfgFile -Encoding UTF8 -Force
+                        Write-Host "      [SUCCESS] Username updated!" -ForegroundColor Green
+                    } catch {}
+                    
+                    # Update ID File too
+                    $idFile = Join-Path $PublicConfig "player_id.json"
+                    $idPayload = @{ playerId = $global:pUuid; createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
+                    $idPayload | ConvertTo-Json | Out-File $idFile -Encoding UTF8 -Force
+                }
+                Start-Sleep -Seconds 1
+            }
+            "2" {
+                $newUuid = Read-Host "`n      Enter new UUID"
+                if ($newUuid -match "^[0-9a-fA-F\-]{36}$") {
+                    $global:pUuid = $newUuid
+                    Write-Host "      [SUCCESS] UUID updated!" -ForegroundColor Green
+                    
+                    # Persist
+                    $idFile = Join-Path $PublicConfig "player_id.json"
+                    $idPayload = @{ playerId = $global:pUuid; createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
+                    $idPayload | ConvertTo-Json | Out-File $idFile -Encoding UTF8 -Force
+                } else {
+                    Write-Host "      [ERROR] Invalid UUID format." -ForegroundColor Red
+                }
+                Start-Sleep -Seconds 1
+            }
+            "3" {
+                $global:pUuid = [guid]::NewGuid().ToString()
+                Write-Host "`n      [SUCCESS] New Random UUID generated: $global:pUuid" -ForegroundColor Green
+                
+                # Persist
+                $idFile = Join-Path $PublicConfig "player_id.json"
+                $idPayload = @{ playerId = $global:pUuid; createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
+                $idPayload | ConvertTo-Json | Out-File $idFile -Encoding UTF8 -Force
+                Start-Sleep -Seconds 2
+            }
+            "4" {
+                Write-Host "`n[SYNC] Scanning saves..." -ForegroundColor Cyan
+                # Need userDir here. Re-resolve it or pass it? 
+                # resolving locally for safety
+                $lRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $localAppData }
+                $aDir = Join-Path $lRoot "release\package\game\latest"
+                $uDir = Find-UserDataPath $aDir
+                
+                if (Sync-PlayerIdentityFromSaves $uDir) {
+                    Write-Host "      [SUCCESS] Identity synced from save!" -ForegroundColor Green
+                } else {
+                    Write-Host "      [INFO] No suitable single-player save found." -ForegroundColor Yellow
+                }
+                Start-Sleep -Seconds 2
+            }
+            "0" { $pMenuLoop = $false }
+            default { $pMenuLoop = $false }
+        }
     }
-    return $false
 }
 
 function Show-LatestLogs($logDir, $lineCount=15, $filterErrors=$false) {
@@ -2021,8 +2110,8 @@ function Invoke-OfficialUpdate($latestVer) {
     Save-Config
     
     # IMMEDIATE POST-PATCH SYNC
-    Write-Host "[SYNC] Converting Official Install to F2P Core..." -ForegroundColor Cyan
-    if (-not (Ensure-UserData $appDir $cacheDir $userDir)) { return $false }
+    Write-Host "[SYNC] Syncing Player Identity..." -ForegroundColor Cyan
+    Sync-PlayerIdentityFromSaves $userDir
     
     # [SYNC] Ensure Server JAR is also patched/updated
     Write-Host "[SYNC] Verifying Server JAR..." -ForegroundColor Cyan
@@ -2143,6 +2232,9 @@ while ($true) {
     # -- NEW LOGIC: Advanced UserDir Resolution --
     $userDir = Find-UserDataPath $appDir
     Ensure-ModDirs $userDir
+    
+    # [IDENTITY] Sync Identity from Single-Player Saves
+    Sync-PlayerIdentityFromSaves $userDir
     # --------------------------------------------
     
     # Ensure local directory health
@@ -2235,7 +2327,7 @@ while ($true) {
         }
         
         # Always verify assets and deps after any repair
-        if (-not (Ensure-UserData $appDir $cacheDir $userDir)) { pause; continue }
+        Sync-PlayerIdentityFromSaves $userDir
         if (-not (Ensure-JRE $launcherRoot $cacheDir)) { pause; continue }
         
     } else {
@@ -2249,21 +2341,18 @@ while ($true) {
         
         if ($global:forceShowMenu) {
             Write-Host "`n[RECOVERY] You have missing or corrupt files. Please re-download." -ForegroundColor Red
-            Write-Host "            (Option [2] is highly recommended based on server hash)" -ForegroundColor Cyan
+            Write-Host "            (Option [1] is highly recommended based on server hash)" -ForegroundColor Cyan
             # Don't reset here - let auto-repair logic handle it
         }
 
-        $opt2Text = if ($global:javaMissingFlag) { "[2] FIX MISSING JAVA / Update Smart-Patch" } else { "[2] Download/Update to Hytale F2P (Smart-Patch)" }
-        $opt2Color = if ($global:javaMissingFlag) { "Yellow" } else { "White" }
         Write-Host "`nAvailable Actions:" -ForegroundColor White
         Write-Host " [1] Download Official Hytale Patches (PWR)" -ForegroundColor White
-        Write-Host " $opt2Text" -ForegroundColor $opt2Color
-        Write-Host " [3] Attempt Force Launch anyway" -ForegroundColor Gray
+        Write-Host " [2] Attempt Force Launch anyway" -ForegroundColor Gray
         
-        # Auto-select option [2] if triggered by Assets error
+        # Auto-select option [1] if triggered by Assets error
         if ($global:autoRepairTriggered) {
-            Write-Host "`n[AUTO-REPAIR] Automatically selecting option [2] to fix Assets..." -ForegroundColor Magenta
-            $choice = "2"
+            Write-Host "`n[AUTO-REPAIR] Automatically selecting option [1] to fix Assets..." -ForegroundColor Magenta
+            $choice = "1"
             $global:autoRepairTriggered = $false  # Reset flag
             Start-Sleep -Seconds 2
         } else {
@@ -2276,469 +2365,348 @@ while ($true) {
             $latestVer = Get-LatestPatchVersion
             if (Invoke-OfficialUpdate $latestVer) { continue }
         } 
-        elseif ($choice -eq "2") {
-            # Reset verification flags to force full check after repair
-            $global:assetsVerified = $false
-            $global:depsVerified = $false
-
-            # F2P DOWNLOAD LOGIC WITH PERSISTENT CACHE
-            # Use the f2pMatch result from earlier
-            $coreNeedsRepair = -not $f2pMatch
-            $javaMissing = -not (Test-Path (Join-Path $launcherRoot "release\package\jre\latest\bin\java.exe"))
-            
-            if ($coreNeedsRepair) {
-                Write-Host "`n[ACTION] Repairing/Updating F2P Core..." -ForegroundColor Magenta
-                if ($f2pMatch -eq $false -and (Test-Path $gameExe)) {
-                    Write-Host "      [INFO] Replacing Official PWR version with F2P Core..." -ForegroundColor Cyan
-                }
-                
-                # Backup world saves before installation
-                Write-Host "`n      [SAFETY] Protecting your world saves..." -ForegroundColor Cyan
-                $worldBackup = Backup-WorldSaves $userDir
-                
-                # Check disk space (Zip + Extraction room)
-                if (-not (Assert-DiskSpace $appDir ($REQ_CORE_SPACE * 2))) { pause; continue }
-                
-                $localZip = Join-Path $cacheDir $ZIP_FILENAME
-                $needsDownload = Test-FileNeedsDownload $localZip $ZIP_FILENAME
-                
-                if ($needsDownload) {
-                    Write-Host "      [DOWNLOAD] Fetching $ZIP_FILENAME..." -ForegroundColor Cyan
-                    if (-not (Download-WithProgress "$API_HOST/file/$ZIP_FILENAME" $localZip)) {
-                        Write-Host "      [ERROR] Download failed. Check your connection." -ForegroundColor Red
-                        pause; continue
-                    }
-                }
-                
-                Write-Host "      [EXTRACT] Installing core files..." -ForegroundColor Cyan
-                if (Expand-WithProgress $localZip $appDir) {
-                    Write-Host "      [SUCCESS] Core package verified and installed." -ForegroundColor Green
-                    
-                    # Restore world saves after successful installation
-                    if ($worldBackup) {
-                        Write-Host "`n      [SAFETY] Restoring your protected worlds..." -ForegroundColor Cyan
-                        Restore-WorldSaves $userDir $worldBackup
-                    }
-                } else {
-                    Write-Host "      [ERROR] Extraction failed. The zip might be corrupt or files are in use." -ForegroundColor Red
-                    if ($localZip) { Remove-Item $localZip -Force }
-                    pause; continue
-                }
-            } elseif ($javaMissing) {
-                Write-Host "`n[ACTION] Targeted Java Repair..." -ForegroundColor Magenta
-                if (-not (Ensure-JRE $launcherRoot $cacheDir)) { pause; continue }
-            } else {
-                Write-Host "`n[INFO] Core and Engine look healthy. Refreshing assets..." -ForegroundColor Cyan
-            }
-            
-            
-            # Always verify assets and deps after any repair
-            if (-not (Ensure-UserData $appDir $cacheDir $userDir)) { pause; continue }
-
-            $global:javaMissingFlag = $false
-            Write-Host "`n[COMPLETE] Hytale F2P is now ready!" -ForegroundColor Green
-            
-            # Reset flags to allow auto-launch on next iteration
-            $global:forceShowMenu = $false
-            $global:autoRepairTriggered = $false
-            
-            # Continue to restart loop and auto-launch
-            continue
-        }
-        elseif ($choice -ne "3") { exit }
+        elseif ($choice -ne "2") { exit }
     }
 
 # --- LAUNCH SEQUENCE ---
 
-# Final Readiness Guard: Verify all critical files exist right before launch
-if (-not (Test-Path $gameExe)) {
-    Write-Host "`n[ERROR] Game Executable (HytaleClient.exe) is missing!" -ForegroundColor Red
-    Write-Host "        Redirecting to Repair menu..." -ForegroundColor Cyan
-    $forceShowMenu = $true; continue
-}
-
-if (-not (Ensure-JRE $launcherRoot $cacheDir)) {
-    Write-Host "`n[ERROR] Java Runtime could not be recovered." -ForegroundColor Red
-    $forceShowMenu = $true; $global:javaMissingFlag = $true; continue
-}
-
-# --- APPLY DOMAIN PATCHING ---
-Patch-HytaleClient $gameExe | Out-Null
-# -----------------------------
-
-# --- HELPER: Create Desktop Shortcut ---
-function Create-Shortcut($targetBat, $iconPath) {
-    try {
-        $shortcutPath = "$env:USERPROFILE\Desktop\Hytale F2P.lnk"
-        if (-not (Test-Path $shortcutPath)) {
-            Write-Host "      [SETUP] Creating Desktop Shortcut..." -ForegroundColor Yellow
-            $wShell = New-Object -ComObject WScript.Shell
-            $shortcut = $wShell.CreateShortcut($shortcutPath)
-            $shortcut.TargetPath = $targetBat
-            $shortcut.Arguments = "am_shortcut" # This flag tells the script to skip the menu next time
-            $shortcut.IconLocation = $iconPath
-            $shortcut.WindowStyle = 1
-            $shortcut.Save()
-            Write-Host "      [SUCCESS] Shortcut created on Desktop." -ForegroundColor Green
-        }
-    } catch {
-        Write-Host "      [WARN] Could not create shortcut: $($_.Exception.Message)" -ForegroundColor DarkGray
+    # Final Readiness Guard: Verify all critical files exist right before launch
+    if (-not (Test-Path $gameExe)) {
+        Write-Host "`n[ERROR] Game Executable (HytaleClient.exe) is missing!" -ForegroundColor Red
+        Write-Host "        Redirecting to Repair menu..." -ForegroundColor Cyan
+        $forceShowMenu = $true; continue
     }
-}
 
-# --- MAIN LOGIC ---
+    if (-not (Ensure-JRE $launcherRoot $cacheDir)) {
+        Write-Host "`n[ERROR] Java Runtime could not be recovered." -ForegroundColor Red
+        $forceShowMenu = $true; $global:javaMissingFlag = $true; continue
+    }
 
-$adminBadge = if ($isAdmin) { " [ADMIN MODE]" } else { "" }
+    # --- APPLY DOMAIN PATCHING ---
+    Patch-HytaleClient $gameExe | Out-Null
+    # -----------------------------
 
-# 1. Load Player Info
-$global:pName = "Player"; $global:pUuid = [guid]::NewGuid().ToString()
-$storedPlayerId = Get-OrCreate-PlayerId $localAppData
-if ($storedPlayerId) { $global:pUuid = $storedPlayerId }
-
-$cfgFile = Join-Path $PublicConfig "config_data.json"
-if (Test-Path $cfgFile) {
-    try {
-        $json = Get-Content $cfgFile -Raw | ConvertFrom-Json
-        if ($null -ne $json.username) { $global:pName = $json.username }
-        if ($null -ne $json.authUrl) { $global:AUTH_URL_CURRENT = $json.authUrl }
-        if ($null -ne $json.autoUpdate) { $global:autoUpdate = $json.autoUpdate }
-        if ($null -ne $json.pwrVersion) { $global:pwrVersion = $json.pwrVersion }
-        if ($null -ne $json.pwrHash) { $global:pwrHash = $json.pwrHash }
-        if ($null -ne $json.autoFixedVersions) { $global:autoFixedVersions = $json.autoFixedVersions } else { $global:autoFixedVersions = @() }
-    } catch {}
-}
-
-# Define appDir early
-$launcherRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $localAppData }
-$appDir = Join-Path $launcherRoot "release\package\game\latest"
-$userDir = Find-UserDataPath $appDir
-# --- SMART PROFILE RECOGNITION (Auto-Sync Save Data) ---
-$savesDir = Join-Path $userDir "Saves"
-if (Test-Path $savesDir) {
-    $playerFiles = Get-ChildItem -Path $savesDir -Filter "*.json" -Recurse | Where-Object { $_.FullName -match "\\universe\\players\\" }
-    if ($playerFiles.Count -ge 1) {
+    # --- HELPER: Create Desktop Shortcut ---
+    function Create-Shortcut($targetBat, $iconPath) {
         try {
-            # Sort by newest if there are multiple worlds
-            $targetProfile = $playerFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            $saveData = Get-Content $targetProfile.FullName -Raw | ConvertFrom-Json
-            
-            $foundName = $saveData.Components.Nameplate.Text
-            if (-not $foundName) { $foundName = $saveData.Components.DisplayName.DisplayName.RawText }
-            $foundUuid = $targetProfile.BaseName
-            
-            if ($foundName -and $foundUuid -and ($global:pName -ne $foundName -or $global:pUuid -ne $foundUuid)) {
-                Write-Host "`n      [DETECT] Character Detected: $foundName ($foundUuid)" -ForegroundColor Cyan
-                $global:pName = $foundName
-                $global:pUuid = $foundUuid
-                
-                # Sync back to persistence trackers
-                Save-Config
-                
-                $idFile = Join-Path $PublicConfig "player_id.json"
-                $idPayload = @{ playerId = $foundUuid; createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
-                $idPayload | ConvertTo-Json | Out-File $idFile -Encoding UTF8
+            $shortcutPath = "$env:USERPROFILE\Desktop\Hytale F2P.lnk"
+            if (-not (Test-Path $shortcutPath)) {
+                Write-Host "      [SETUP] Creating Desktop Shortcut..." -ForegroundColor Yellow
+                $wShell = New-Object -ComObject WScript.Shell
+                $shortcut = $wShell.CreateShortcut($shortcutPath)
+                $shortcut.TargetPath = $targetBat
+                $shortcut.Arguments = "am_shortcut" # This flag tells the script to skip the menu next time
+                $shortcut.IconLocation = $iconPath
+                $shortcut.WindowStyle = 1
+                $shortcut.Save()
+                Write-Host "      [SUCCESS] Shortcut created on Desktop." -ForegroundColor Green
             }
+        } catch {
+            Write-Host "      [WARN] Could not create shortcut: $($_.Exception.Message)" -ForegroundColor DarkGray
+        }
+    }
+
+    # --- MAIN LOGIC ---
+
+    $adminBadge = if ($isAdmin) { " [ADMIN MODE]" } else { "" }
+
+    # 1. Load Player Info
+    $global:pName = "Player"; $global:pUuid = [guid]::NewGuid().ToString()
+    $storedPlayerId = Get-OrCreate-PlayerId $localAppData
+    if ($storedPlayerId) { $global:pUuid = $storedPlayerId }
+
+    $cfgFile = Join-Path $PublicConfig "config_data.json"
+    if (Test-Path $cfgFile) {
+        try {
+            $json = Get-Content $cfgFile -Raw | ConvertFrom-Json
+            if ($null -ne $json.username) { $global:pName = $json.username }
+            if ($null -ne $json.authUrl) { $global:AUTH_URL_CURRENT = $json.authUrl }
+            if ($null -ne $json.autoUpdate) { $global:autoUpdate = $json.autoUpdate }
+            if ($null -ne $json.pwrVersion) { $global:pwrVersion = $json.pwrVersion }
+            if ($null -ne $json.pwrHash) { $global:pwrHash = $json.pwrHash }
+            if ($null -ne $json.autoFixedVersions) { $global:autoFixedVersions = $json.autoFixedVersions } else { $global:autoFixedVersions = @() }
         } catch {}
     }
-}
-# ------------------------------------------------------
 
-# --- LAUNCH RESTART LOOP ---
+    # Define appDir early
+    $launcherRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $localAppData }
+    $appDir = Join-Path $launcherRoot "release\package\game\latest"
+    $userDir = Find-UserDataPath $appDir
+    # --- SMART PROFILE RECOGNITION (Auto-Sync Save Data) ---
+    $savesDir = Join-Path $userDir "Saves"
+    if (Test-Path $savesDir) {
+        $playerFiles = Get-ChildItem -Path $savesDir -Filter "*.json" -Recurse | Where-Object { $_.FullName -match "\\universe\\players\\" }
+        if ($playerFiles.Count -ge 1) {
+            try {
+                # Sort by newest if there are multiple worlds
+                $targetProfile = $playerFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                $saveData = Get-Content $targetProfile.FullName -Raw | ConvertFrom-Json
+                
+                $foundName = $saveData.Components.Nameplate.Text
+                if (-not $foundName) { $foundName = $saveData.Components.DisplayName.DisplayName.RawText }
+                $foundUuid = $targetProfile.BaseName
+                
+                if ($foundName -and $foundUuid -and ($global:pName -ne $foundName -or $global:pUuid -ne $foundUuid)) {
+                    Write-Host "`n      [DETECT] Character Detected: $foundName ($foundUuid)" -ForegroundColor Cyan
+                    $global:pName = $foundName
+                    $global:pUuid = $foundUuid
+                    
+                    # Sync back to persistence trackers
+                    Save-Config
+                    
+                    $idFile = Join-Path $PublicConfig "player_id.json"
+                    $idPayload = @{ playerId = $foundUuid; createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
+                    $idPayload | ConvertTo-Json | Out-File $idFile -Encoding UTF8
+                }
+            } catch {}
+        }
+    }
+    # ------------------------------------------------------
+
+    # --- LAUNCH RESTART LOOP ---
 while ($true) {
 
-    if (-not $global:offlineMode) {
-        Write-Host "`n[3/4] Authenticating..." -ForegroundColor Cyan
-        Write-Host "      Endpoint: $global:AUTH_URL_CURRENT" -ForegroundColor Gray
-        $authUrl = "$global:AUTH_URL_CURRENT/game-session/child" 
-        $body = @{ uuid=$global:pUuid; name=$global:pName; scopes=@("hytale:server", "hytale:client") } | ConvertTo-Json
-        try {
-            $res = Invoke-RestMethod -Uri $authUrl -Method Post -Body $body -ContentType "application/json" -TimeoutSec 5
-            $idToken = $res.identityToken; $ssToken = $res.sessionToken
-            Write-Host "      [SUCCESS] Token Acquired." -ForegroundColor Green
-            Save-Config # Persist successful auth endpoint
-        } catch {
-            $issuer = if ($global:AUTH_URL_CURRENT) { $global:AUTH_URL_CURRENT } else { "https://sessions.sanasol.ws" }
-            $idToken = New-HytaleJWT $global:pUuid $global:pName $issuer
+        if (-not $global:offlineMode) {
+            Write-Host "`n[3/4] Authenticating..." -ForegroundColor Cyan
+            Write-Host "      Endpoint: $global:AUTH_URL_CURRENT" -ForegroundColor Gray
+            $authUrl = "$global:AUTH_URL_CURRENT/game-session/child" 
+            $body = @{ uuid=$global:pUuid; name=$global:pName; scopes=@("hytale:server", "hytale:client") } | ConvertTo-Json
+            try {
+                $res = Invoke-RestMethod -Uri $authUrl -Method Post -Body $body -ContentType "application/json" -TimeoutSec 5
+                $idToken = $res.identityToken; $ssToken = $res.sessionToken
+                Write-Host "      [SUCCESS] Token Acquired." -ForegroundColor Green
+                Save-Config # Persist successful auth endpoint
+            } catch {
+                $issuer = if ($global:AUTH_URL_CURRENT) { $global:AUTH_URL_CURRENT } else { "https://sessions.sanasol.ws" }
+                $idToken = New-HytaleJWT $global:pUuid $global:pName $issuer
+                $ssToken = $idToken
+                Write-Host "      [OFFLINE] Guest mode (Generated Corrected JWT)." -ForegroundColor Yellow
+                Write-Host "      [DEBUG] Reason: $($_.Exception.Message)" -ForegroundColor Gray
+            }
+        } else {
+            Write-Host "`n[3/4] Skipped Authentication (Offline Mode)" -ForegroundColor Magenta
+            $idToken = New-HytaleJWT $global:pUuid $global:pName "https://sessions.sanasol.ws"
             $ssToken = $idToken
-            Write-Host "      [OFFLINE] Guest mode (Generated Corrected JWT)." -ForegroundColor Yellow
-            Write-Host "      [DEBUG] Reason: $($_.Exception.Message)" -ForegroundColor Gray
         }
-    } else {
-        Write-Host "`n[3/4] Skipped Authentication (Offline Mode)" -ForegroundColor Magenta
-        $idToken = New-HytaleJWT $global:pUuid $global:pName "https://sessions.sanasol.ws"
-        $ssToken = $idToken
-    }
 
 
 
-# Support Registering Session before Menu
-Register-PlayerSession $global:pUuid $global:pName
+    # Support Registering Session before Menu
+    Register-PlayerSession $global:pUuid $global:pName
 
-# 2. Main Menu Loop (Skipped if Shortcut)
-$isShortcut = ($env:IS_SHORTCUT -eq "true")
-$proceedToLaunch = $false
+    # 2. Main Menu Loop (Skipped if Shortcut)
+    $isShortcut = ($env:IS_SHORTCUT -eq "true")
+    $proceedToLaunch = $false
 
-while (-not $proceedToLaunch) {
+    while (-not $proceedToLaunch) {
         if ($global:forceApiJre) {
         Write-Host "      [SMART-SWITCH] Critical Error previously detected. Using API Host JRE..." -ForegroundColor Yellow
         $useOfficial = $false
-    }
+        }
 
-    
-    # [FIX] Check for auto-repair FIRST and bypass UI
-    if ($global:autoRepairTriggered) {
-        $isShortcut = $false
-        Write-Host "`n[AUTO-REPAIR] Assets missing! Bypassing menu and starting repair..." -ForegroundColor Magenta
-        $menuChoice = "3" 
-        Start-Sleep -Seconds 1
-    } else {
-        if ($isShortcut) {
-            Write-Host "      [AUTO] Running via Shortcut. Skipping Menu..." -ForegroundColor Green
-            $proceedToLaunch = $true
-            break
-        }
-    
-        Clear-Host
-        Write-Host "==========================================" -ForegroundColor Cyan
-        Write-Host "       HYTALE F2P - LAUNCHER MENU" -ForegroundColor Cyan
-        Write-Host "==========================================" -ForegroundColor Cyan
-        Write-Host ""
-        if ($global:ispBlocked) {
-            Write-Host " [1] Start Hytale F2P (Create Shortcut) [BLOCKED]" -ForegroundColor DarkGray
-        } else {
-            Write-Host " [1] Start Hytale F2P (Create Shortcut)" -ForegroundColor Green
-        }
-        Write-Host " [2] Server Menu (Host/Download)" -ForegroundColor Yellow
-        Write-Host " [3] Repair / Force Update" -ForegroundColor Red
-        Write-Host " [4] Install HyFixes (Server Crash Fixes)" -ForegroundColor Cyan
-        Write-Host " [5] Play Offline (Guest Mode)" -ForegroundColor Magenta
-        Write-Host " [6] Play Unauthenticated (No Login)" -ForegroundColor DarkCyan
-        Write-Host " [7] Change Game Installation Path" -ForegroundColor Blue
-        Write-Host ""
         
-        $menuChoice = Read-Host " Select an option [1]"
-        if ($menuChoice -eq "") { $menuChoice = "1" }
-    }
-    
-    # Auto-Repair: Reset flag after selection is made
-    if ($global:autoRepairTriggered) { $global:autoRepairTriggered = $false }
+        # [FIX] Check for auto-repair FIRST and bypass UI
+        if ($global:autoRepairTriggered) {
+            $isShortcut = $false
+            Write-Host "`n[AUTO-REPAIR] Assets missing! Bypassing menu and starting repair..." -ForegroundColor Magenta
+            $menuChoice = "3" 
+            Start-Sleep -Seconds 1
+        } else {
+            if ($isShortcut) {
+                Write-Host "      [AUTO] Running via Shortcut. Skipping Menu..." -ForegroundColor Green
+                $proceedToLaunch = $true
+                break
+            }
+        
+            Clear-Host
+            Write-Host "==========================================" -ForegroundColor Cyan
+            Write-Host "       HYTALE F2P - LAUNCHER MENU" -ForegroundColor Cyan
+            Write-Host "==========================================" -ForegroundColor Cyan
+            Write-Host ""
+            if ($global:ispBlocked) {
+                Write-Host " [1] Start Hytale F2P (Create Shortcut) [BLOCKED]" -ForegroundColor DarkGray
+            } else {
+                Write-Host " [1] Start Hytale F2P (Create Shortcut)" -ForegroundColor Green
+            }
+            Write-Host " [2] Server Menu (Host/Download)" -ForegroundColor Yellow
+            Write-Host " [3] Repair / Force Update" -ForegroundColor Red
+            Write-Host " [4] Install HyFixes (Server Crash Fixes)" -ForegroundColor Cyan
+            Write-Host " [5] Play Offline (Guest Mode)" -ForegroundColor Magenta
+            Write-Host " [6] Play Unauthenticated (No Login)" -ForegroundColor DarkCyan
+            Write-Host " [7] Change Game Installation Path" -ForegroundColor Blue
+            Write-Host " [8] Profile Manager (Change Name/UUID)" -ForegroundColor White
+            Write-Host ""
+            
+            $menuChoice = Read-Host " Select an option [1]"
+            if ($menuChoice -eq "") { $menuChoice = "1" }
+        }
+        
+        # Auto-Repair: Reset flag after selection is made
+        if ($global:autoRepairTriggered) { $global:autoRepairTriggered = $false }
 
-    switch ($menuChoice) {
-        "1" {
-            if ($global:ispBlocked) { Write-Host "      [BLOCK] API Access Required. Use Offline Mode [5] or fix connection." -ForegroundColor Red; Start-Sleep 2; continue }
-            Create-Shortcut $f $gameExe 
-            $proceedToLaunch = $true
-        }
-        "2" {
-            # --- SERVER SUBMENU ---
-            $serverMenuLoop = $true
-            while ($serverMenuLoop) {
-                Clear-Host
-                Write-Host "==========================================" -ForegroundColor Yellow
-                Write-Host "         SERVER SETUP MENU" -ForegroundColor Yellow
-                Write-Host "==========================================" -ForegroundColor Yellow
-                Write-Host ""
-                Write-Host " [1] Download server.bat (Launcher Script)" -ForegroundColor Green
-                Write-Host " [2] Download HytaleServer.jar (Sanasol F2P)" -ForegroundColor Cyan
-                Write-Host " [3] Run Existing server.bat" -ForegroundColor Gray
-                Write-Host " [0] Back to Main Menu" -ForegroundColor DarkGray
-                Write-Host ""
-                
-                $serverChoice = Read-Host " Select an option [0]"
-                if ($serverChoice -eq "") { $serverChoice = "0" }
-                
-                switch ($serverChoice) {
-                    "1" {
-                        # Download server.bat
-                        $serverBatUrl = "$API_HOST/file/server.bat"
-                        $serverBatDest = Join-Path $appDir "server.bat"
-                        
-                        Write-Host "`n[SERVER] Downloading server.bat..." -ForegroundColor Cyan
-                        if (Download-WithProgress $serverBatUrl $serverBatDest $true) {
-                            Write-Host "      [SUCCESS] server.bat installed to: $serverBatDest" -ForegroundColor Green
-                        } else {
-                            Write-Host "      [ERROR] Download failed." -ForegroundColor Red
-                            $retryNet = Read-Host "      Open Network Unblocker? (y/n) [n]"
-                            if ($retryNet -eq "y") { Show-NetworkFixMenu }
-                        }
-                        Write-Host "`nPress any key to continue..."
-                        [void][System.Console]::ReadKey($true)
-                    }
-                    "2" {
-                        # Download HytaleServer.jar
-                        $serverDir = Join-Path $appDir "Server"
-                        $serverJarPath = Join-Path $serverDir "HytaleServer.jar"
-                        
-                        Write-Host "`n[SERVER] Server Version Selection" -ForegroundColor Cyan
-                        Write-Host " [1] Release (Stable)" -ForegroundColor Green
-                        Write-Host " [2] Pre-release (Experimental)" -ForegroundColor Yellow
-                        
-                        $branchChoice = Read-Host " Select a version [1]"
-                        $branch = "release"
-                        if ($branchChoice -eq "2") { $branch = "pre-release" }
-                        
-                        if (-not (Test-Path $serverDir)) {
-                            New-Item -ItemType Directory $serverDir -Force | Out-Null
-                        }
-                        
-                        # Use the new Patch-HytaleServer function
-                        if (-not (Patch-HytaleServer $serverJarPath $branch)) {
-                            $retryNet = Read-Host "      [ERROR] Server patch failed. Open Network Unblocker? (y/n) [n]"
-                            if ($retryNet -eq "y") { Show-NetworkFixMenu }
-                        }
-                        
-                        Write-Host "`nPress any key to continue..."
-                        [void][System.Console]::ReadKey($true)
-                    }
-                    "3" {
-                        # Run existing server.bat
-                        $serverBatDest = Join-Path $appDir "server.bat"
-                        if (Test-Path $serverBatDest) {
-                            Write-Host "`n[RUN] Launching Server Console..." -ForegroundColor Green
-                            Start-Process cmd.exe -ArgumentList "/k `"$serverBatDest`"" -WorkingDirectory $appDir
-                        } else {
-                            Write-Host "      [ERROR] server.bat not found. Download it first using option [1]." -ForegroundColor Red
-                            Start-Sleep -Seconds 2
-                        }
-                    }
-                    "0" {
-                        $serverMenuLoop = $false
-                    }
-                    default {
-                        $serverMenuLoop = $false
-                    }
-                }
+        switch ($menuChoice) {
+            "1" {
+                if ($global:ispBlocked) { Write-Host "      [BLOCK] API Access Required. Use Offline Mode [5] or fix connection." -ForegroundColor Red; Start-Sleep 2; continue }
+                Create-Shortcut $f $gameExe 
+                $proceedToLaunch = $true
             }
-        }
-        "3" {
-            # Directly trigger F2P download/repair instead of just showing menu
-            Write-Host "`n[REPAIR] Starting F2P Core Download/Repair..." -ForegroundColor Magenta
-            
-            # Get fresh paths (they're defined at top of outer while loop)
-            $launcherRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $localAppData }
-            $appDir = Join-Path $launcherRoot "release\package\game\latest"
-            $cacheDir = Join-Path $localAppData "cache"
-            $userDir = Find-UserDataPath $appDir
-            
-            # Ensure directories exist
-            @($appDir, $cacheDir, $userDir) | ForEach-Object { 
-                if (-not (Test-Path $_)) { New-Item -ItemType Directory $_ -Force | Out-Null } 
-            }
-            
-            # Reset verification flags
-            $global:assetsVerified = $false
-            $global:depsVerified = $false
-            
-            # Backup world saves
-            Write-Host "      [SAFETY] Protecting your world saves..." -ForegroundColor Cyan
-            $worldBackup = Backup-WorldSaves $userDir
-            
-            # Check disk space
-            if (-not (Assert-DiskSpace $appDir ($REQ_CORE_SPACE * 2))) { 
-                Write-Host "`nPress any key to return to menu..."
-                [void][System.Console]::ReadKey($true)
-                continue 
-            }
-            
-            $localZip = Join-Path $cacheDir $ZIP_FILENAME
-            $needsDownload = Test-FileNeedsDownload $localZip $ZIP_FILENAME
-            
-            if ($needsDownload) {
-                Write-Host "      [DOWNLOAD] Fetching $ZIP_FILENAME..." -ForegroundColor Cyan
-                if (-not (Download-WithProgress "$API_HOST/file/$ZIP_FILENAME" $localZip)) {
-                    Write-Host "      [ERROR] Download failed. Check your connection." -ForegroundColor Red
-                    $retryNet = Read-Host "      Open Network Unblocker? (y/n) [n]"
-                    if ($retryNet -eq "y") { Show-NetworkFixMenu }
+            "2" {
+                # --- SERVER SUBMENU ---
+                $serverMenuLoop = $true
+                while ($serverMenuLoop) {
+                    Clear-Host
+                    Write-Host "==========================================" -ForegroundColor Yellow
+                    Write-Host "         SERVER SETUP MENU" -ForegroundColor Yellow
+                    Write-Host "==========================================" -ForegroundColor Yellow
+                    Write-Host ""
+                    Write-Host " [1] Download server.bat (Launcher Script)" -ForegroundColor Green
+                    Write-Host " [2] Download HytaleServer.jar (Sanasol F2P)" -ForegroundColor Cyan
+                    Write-Host " [3] Run Existing server.bat" -ForegroundColor Gray
+                    Write-Host " [0] Back to Main Menu" -ForegroundColor DarkGray
+                    Write-Host ""
                     
-                    Write-Host "`nPress any key to return to menu..."
-                    [void][System.Console]::ReadKey($true)
-                    continue
+                    $serverChoice = Read-Host " Select an option [0]"
+                    if ($serverChoice -eq "") { $serverChoice = "0" }
+                    
+                    switch ($serverChoice) {
+                        "1" {
+                            # Download server.bat
+                            $serverBatUrl = "$API_HOST/file/server.bat"
+                            $serverBatDest = Join-Path $appDir "server.bat"
+                            
+                            Write-Host "`n[SERVER] Downloading server.bat..." -ForegroundColor Cyan
+                            if (Download-WithProgress $serverBatUrl $serverBatDest $true) {
+                                Write-Host "      [SUCCESS] server.bat installed to: $serverBatDest" -ForegroundColor Green
+                            } else {
+                                Write-Host "      [ERROR] Download failed." -ForegroundColor Red
+                                $retryNet = Read-Host "      Open Network Unblocker? (y/n) [n]"
+                                if ($retryNet -eq "y") { Show-NetworkFixMenu }
+                            }
+                            Write-Host "`nPress any key to continue..."
+                            [void][System.Console]::ReadKey($true)
+                        }
+                        "2" {
+                            # Download HytaleServer.jar
+                            $serverDir = Join-Path $appDir "Server"
+                            $serverJarPath = Join-Path $serverDir "HytaleServer.jar"
+                            
+                            Write-Host "`n[SERVER] Server Version Selection" -ForegroundColor Cyan
+                            Write-Host " [1] Release (Stable)" -ForegroundColor Green
+                            Write-Host " [2] Pre-release (Experimental)" -ForegroundColor Yellow
+                            
+                            $branchChoice = Read-Host " Select a version [1]"
+                            $branch = "release"
+                            if ($branchChoice -eq "2") { $branch = "pre-release" }
+                            
+                            if (-not (Test-Path $serverDir)) {
+                                New-Item -ItemType Directory $serverDir -Force | Out-Null
+                            }
+                            
+                            # Use the new Patch-HytaleServer function
+                            if (-not (Patch-HytaleServer $serverJarPath $branch)) {
+                                $retryNet = Read-Host "      [ERROR] Server patch failed. Open Network Unblocker? (y/n) [n]"
+                                if ($retryNet -eq "y") { Show-NetworkFixMenu }
+                            }
+                            
+                            Write-Host "`nPress any key to continue..."
+                            [void][System.Console]::ReadKey($true)
+                        }
+                        "3" {
+                            # Run existing server.bat
+                            $serverBatDest = Join-Path $appDir "server.bat"
+                            if (Test-Path $serverBatDest) {
+                                Write-Host "`n[RUN] Launching Server Console..." -ForegroundColor Green
+                                Start-Process cmd.exe -ArgumentList "/k `"$serverBatDest`"" -WorkingDirectory $appDir
+                            } else {
+                                Write-Host "      [ERROR] server.bat not found. Download it first using option [1]." -ForegroundColor Red
+                                Start-Sleep -Seconds 2
+                            }
+                        }
+                        "0" {
+                            $serverMenuLoop = $false
+                        }
+                        default {
+                            $serverMenuLoop = $false
+                        }
+                    }
                 }
             }
-            
-            Write-Host "      [EXTRACT] Installing core files..." -ForegroundColor Cyan
-            if (Expand-WithProgress $localZip $appDir) {
-                Write-Host "      [SUCCESS] Core package verified and installed." -ForegroundColor Green
+            "3" {
+                # Directly trigger F2P download/repair instead of just showing menu
+                Write-Host "`n[REPAIR] Starting F2P Core Download/Repair..." -ForegroundColor Magenta
                 
-                # Restore world saves
-                if ($worldBackup) {
-                    Write-Host "`n      [SAFETY] Restoring your protected worlds..." -ForegroundColor Cyan
-                    Restore-WorldSaves $userDir $worldBackup
+                # Get fresh paths (they're defined at top of outer while loop)
+                $launcherRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $localAppData }
+                $appDir = Join-Path $launcherRoot "release\package\game\latest"
+                $cacheDir = Join-Path $localAppData "cache"
+                $userDir = Find-UserDataPath $appDir
+                
+                # Ensure directories exist
+                @($appDir, $cacheDir, $userDir) | ForEach-Object { 
+                    if (-not (Test-Path $_)) { New-Item -ItemType Directory $_ -Force | Out-Null } 
                 }
                 
-                # Verify assets
-                if (-not (Ensure-UserData $appDir $cacheDir $userDir)) { 
+                # Reset verification flags
+                $global:assetsVerified = $false
+                $global:depsVerified = $false
+                
+                # Backup world saves
+                Write-Host "      [SAFETY] Protecting your world saves..." -ForegroundColor Cyan
+                $worldBackup = Backup-WorldSaves $userDir
+                
+                # Check disk space
+                if (-not (Assert-DiskSpace $appDir ($REQ_CORE_SPACE * 2))) { 
                     Write-Host "`nPress any key to return to menu..."
                     [void][System.Console]::ReadKey($true)
                     continue 
                 }
                 
-                # Ensure JRE is also installed
-                if (-not (Ensure-JRE $launcherRoot $cacheDir)) {
+                # Discover latest version
+                $latestVer = Get-LatestPatchVersion
+                if (Invoke-OfficialUpdate $latestVer) { continue }
+            }
+            "4" {
+                if (Install-HyFixes) {
+                    # Success message is handled inside function
+                }
+                Write-Host "`nPress any key to return to menu..."
+                [void][System.Console]::ReadKey($true)
+            }
+            "5" {
+                $global:offlineMode = $true
+                $proceedToLaunch = $true
+            }
+            "6" {
+                # Unauthenticated mode - still use authenticated auth-mode but skip token generation
+                $global:unauthenticatedMode = $true
+                $proceedToLaunch = $true
+            }
+            "7" {
+                Write-Host "`n[PATH] Changing game installation directory..." -ForegroundColor Cyan
+                
+                # Show current path
+                Write-Host "      Current: $gameExe" -ForegroundColor Gray
+                
+                # Invoke path selection dialog
+                $newPath = Invoke-PathDialog
+                
+                if ($newPath) {
+                    $gameExe = $newPath
+                    Write-Host "      [SUCCESS] Game path updated to:" -ForegroundColor Green
+                    Write-Host "                $newPath" -ForegroundColor Gray
+                    Write-Host "`n      [INFO] Restart launcher to apply changes." -ForegroundColor Yellow
                     Write-Host "`nPress any key to return to menu..."
                     [void][System.Console]::ReadKey($true)
-                    continue
+                } else {
+                    Write-Host "      [CANCELLED] Path not changed." -ForegroundColor Yellow
+                    Start-Sleep -Seconds 2
                 }
-                
-                # Check for VC++ Redistributables
-                Install-VCRedist
-                
-                Write-Host "`n[COMPLETE] Hytale F2P is now ready!" -ForegroundColor Green
-                
-                # Reset flags and proceed to launch
-                $global:forceShowMenu = $false
-                $global:autoRepairTriggered = $false
-                $proceedToLaunch = $true
-                
-            } else {
-                Write-Host "      [ERROR] Extraction failed. The zip might be corrupt or files are in use." -ForegroundColor Red
-                # Only try to remove if file exists
-                if ($localZip -and (Test-Path $localZip)) { 
-                    Remove-Item $localZip -Force -ErrorAction SilentlyContinue 
-                }
-                Write-Host "`nPress any key to return to menu..."
-                [void][System.Console]::ReadKey($true)
             }
-        }
-        "4" {
-            if (Install-HyFixes) {
-                # Success message is handled inside function
-            }
-            Write-Host "`nPress any key to return to menu..."
-            [void][System.Console]::ReadKey($true)
-        }
-        "5" {
-             $global:offlineMode = $true
-             $proceedToLaunch = $true
-        }
-        "6" {
-             # Unauthenticated mode - still use authenticated auth-mode but skip token generation
-             $global:unauthenticatedMode = $true
-             $proceedToLaunch = $true
-        }
-        "7" {
-            Write-Host "`n[PATH] Changing game installation directory..." -ForegroundColor Cyan
-            
-            # Show current path
-            Write-Host "      Current: $gameExe" -ForegroundColor Gray
-            
-            # Invoke path selection dialog
-            $newPath = Invoke-PathDialog
-            
-            if ($newPath) {
-                $gameExe = $newPath
-                Write-Host "      [SUCCESS] Game path updated to:" -ForegroundColor Green
-                Write-Host "                $newPath" -ForegroundColor Gray
-                Write-Host "`n      [INFO] Restart launcher to apply changes." -ForegroundColor Yellow
-                Write-Host "`nPress any key to return to menu..."
-                [void][System.Console]::ReadKey($true)
-            } else {
-                Write-Host "      [CANCELLED] Path not changed." -ForegroundColor Yellow
-                Start-Sleep -Seconds 2
+            "8" {
+                Show-ProfileMenu
             }
         }
     }
-}
 
 # --- LAUNCH SEQUENCE ---
 
@@ -3479,7 +3447,7 @@ if (Test-Path $gameExe) {
             Show-LatestLogs $logPath 
         }
         pause
-    }
+        }
 }
 }
 }
