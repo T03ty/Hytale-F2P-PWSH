@@ -52,7 +52,7 @@ if not "%~1"=="am_wt" (
 
 :: 3. CRASH-PROOF LOADER
 :: Use -Raw for speed and robustness. Wrap in try/catch to keep window open on crash.
-set "loader=$p='%~f0'; $p=[System.IO.Path]::GetFullPath($p); $t=Get-Content -LiteralPath $p -Raw; $m='#PS_S'+'TART'; $i=$t.IndexOf($m); if($i -ge 0){ $s=$t.Substring($i); try { iex $s } catch { Write-Host 'CRITICAL LAUNCHER ERROR:'; Write-Host $_.Exception.ToString() -Fg Red; Read-Host 'Press Enter to exit...' } } else { Write-Error 'Script marker not found'; Read-Host }"
+set "loader=$p='%~f0'; $p=[System.IO.Path]::GetFullPath($p); $t=Get-Content -LiteralPath $p -Raw; $m='#PS_S'+'TART'; $i=$t.IndexOf($m); if($i -ge 0){ $s=$t.Substring($i); try { iex $s } catch { Write-Host 'CRITICAL LAUNCHER ERROR:' -Fg Red; Write-Host ('Error: ' + $_.Exception.Message) -Fg Red; Write-Host ('Location: ' + $_.InvocationInfo.PositionMessage) -Fg Yellow; Write-Host ('Trace: ' + $_.ScriptStackTrace) -Fg Cyan; Read-Host 'Press Enter to exit...' } } else { Write-Error 'Script marker not found'; Read-Host }"
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "%loader%"
 exit /b
@@ -80,6 +80,23 @@ try {
         Write-Host "      [AV] Adding Windows Defender exclusions..." -ForegroundColor Gray
         Add-MpPreference -ExclusionPath $localAppData -ErrorAction SilentlyContinue
         Add-MpPreference -ExclusionProcess $gameExe -ErrorAction SilentlyContinue
+        
+        # --- TIME & DNS SYNC ---
+        Write-Host "      [SYNC] Synchronizing System Clock & DNS..." -ForegroundColor Cyan
+        try {
+            # Restart Time Service
+            Stop-Service w32time -ErrorAction SilentlyContinue
+            Start-Service w32time -ErrorAction SilentlyContinue
+            
+            # Force Update
+            w32tm /resync /force | Out-Null
+            
+            # Flush DNS
+            Clear-DnsClientCache
+            Write-Host "      [SUCCESS] Time Synced & DNS Flushed." -ForegroundColor Green
+        } catch {
+            Write-Host "      [WARN] Sync failed (Non-Critical): $($_.Exception.Message)" -ForegroundColor DarkGray
+        }
     }
 } catch {}
 
@@ -2532,9 +2549,8 @@ while ($true) {
             Write-Host " [3] Repair / Force Update" -ForegroundColor Red
             Write-Host " [4] Install HyFixes (Server Crash Fixes)" -ForegroundColor Cyan
             Write-Host " [5] Play Offline (Guest Mode)" -ForegroundColor Magenta
-            Write-Host " [6] Play Unauthenticated (No Login)" -ForegroundColor DarkCyan
-            Write-Host " [7] Change Game Installation Path" -ForegroundColor Blue
-            Write-Host " [8] Profile Manager (Change Name/UUID)" -ForegroundColor White
+            Write-Host " [6] Change Game Installation Path" -ForegroundColor Blue
+            Write-Host " [7] Profile Manager (Change Name/UUID)" -ForegroundColor White
             Write-Host ""
             
             $menuChoice = Read-Host " Select an option [1]"
@@ -2677,11 +2693,6 @@ while ($true) {
                 $proceedToLaunch = $true
             }
             "6" {
-                # Unauthenticated mode - still use authenticated auth-mode but skip token generation
-                $global:unauthenticatedMode = $true
-                $proceedToLaunch = $true
-            }
-            "7" {
                 Write-Host "`n[PATH] Changing game installation directory..." -ForegroundColor Cyan
                 
                 # Show current path
@@ -2702,7 +2713,7 @@ while ($true) {
                     Start-Sleep -Seconds 2
                 }
             }
-            "8" {
+            "7" {
                 Show-ProfileMenu
             }
         }
@@ -2919,11 +2930,8 @@ if ($global:offlineMode) {
     Write-Host "      Mode:     Offline (Guest)" -ForegroundColor Magenta
 } else {
     $authModeArg = "authenticated"
-    if ($global:unauthenticatedMode) {
-        Write-Host "      Mode:     Unauthenticated (Server Auth)" -ForegroundColor DarkCyan
-    } else {
-        Write-Host "      Mode:     Authenticated" -ForegroundColor Green
-    }
+    Write-Host "      Mode:     Authenticated" -ForegroundColor Green
+   
 }
 
 $launchArgs = @(
