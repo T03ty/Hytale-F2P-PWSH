@@ -52,7 +52,7 @@ if not "%~1"=="am_wt" (
 
 :: 3. CRASH-PROOF LOADER
 :: Use -Raw for speed and robustness. Wrap in try/catch to keep window open on crash.
-set "loader=$p='%~f0'; $p=[System.IO.Path]::GetFullPath($p); $t=Get-Content -LiteralPath $p -Raw; $m='#PS_S'+'TART'; $i=$t.IndexOf($m); if($i -ge 0){ $s=$t.Substring($i); try { iex $s } catch { Write-Host 'CRITICAL LAUNCHER ERROR:' -Fg Red; Write-Host ('Error: ' + $_.Exception.Message) -Fg Red; Write-Host ('Location: ' + $_.InvocationInfo.PositionMessage) -Fg Yellow; Write-Host ('Trace: ' + $_.ScriptStackTrace) -Fg Cyan; Read-Host 'Press Enter to exit...' } } else { Write-Error 'Script marker not found'; Read-Host }"
+set "loader=$p='%~f0'; $p=[System.IO.Path]::GetFullPath($p); $f=$p; $t=Get-Content -LiteralPath $p -Raw; $m='#PS_S'+'TART'; $i=$t.IndexOf($m); if($i -ge 0){ $s=$t.Substring($i); try { iex $s } catch { Write-Host 'CRITICAL LAUNCHER ERROR:' -Fg Red; Write-Host ('Error: ' + $_.Exception.Message) -Fg Red; Write-Host ('Location: ' + $_.InvocationInfo.PositionMessage) -Fg Yellow; Write-Host ('Trace: ' + $_.ScriptStackTrace) -Fg Cyan; Read-Host 'Press Enter to exit...' } } else { Write-Error 'Script marker not found'; Read-Host }"
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "%loader%"
 exit /b
