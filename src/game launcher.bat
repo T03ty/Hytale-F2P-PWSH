@@ -67,38 +67,6 @@ $ProgressPreference = 'SilentlyContinue'
 # --- Admin Detection ---
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
 
-# --- UI Enhancement ---
-try {
-    # Set modern window size
-    $width = 120; $height = 35
-    $size = New-Object System.Management.Automation.Host.Size($width, $height)
-    $Host.UI.RawUI.WindowSize = $size
-    $Host.UI.RawUI.BufferSize = $size
-    
-    # Add Antivirus Exclusions (Admin only)
-    if ($isAdmin) {
-        Write-Host "      [AV] Adding Windows Defender exclusions..." -ForegroundColor Gray
-        Add-MpPreference -ExclusionPath $localAppData -ErrorAction SilentlyContinue
-        Add-MpPreference -ExclusionProcess $gameExe -ErrorAction SilentlyContinue
-        
-        # --- TIME & DNS SYNC ---
-        Write-Host "      [SYNC] Synchronizing System Clock & DNS..." -ForegroundColor Cyan
-        try {
-            # Restart Time Service
-            Stop-Service w32time -ErrorAction SilentlyContinue
-            Start-Service w32time -ErrorAction SilentlyContinue
-            
-            # Force Update
-            w32tm /resync /force | Out-Null
-            
-            # Flush DNS
-            Clear-DnsClientCache
-            Write-Host "      [SUCCESS] Time Synced & DNS Flushed." -ForegroundColor Green
-        } catch {
-            Write-Host "      [WARN] Sync failed (Non-Critical): $($_.Exception.Message)" -ForegroundColor DarkGray
-        }
-    }
-} catch {}
 
 try { Add-Type -AssemblyName System.Net.Http, System.IO.Compression.FileSystem, System.Windows.Forms } catch {}
 
@@ -353,6 +321,79 @@ if (-not $gameExe) {
     Write-Host "       Defaulting to standard path for fresh installation." -ForegroundColor Gray
     $gameExe = Join-Path $localAppData "release\package\game\latest\Client\HytaleClient.exe"
     $forceShowMenu = $true
+}
+
+
+# --- UI & Environment Setup ---
+
+try {
+    # Only attempt resize if NOT running in Windows Terminal (which blocks this)
+    if ($env:WT_SESSION -eq $null) {
+        $width = 120; $height = 35
+        $size = New-Object System.Management.Automation.Host.Size($width, $height)
+        $Host.UI.RawUI.WindowSize = $size
+        $Host.UI.RawUI.BufferSize = $size
+    }
+} catch { 
+    # Silently skip resize if terminal doesn't support it
+}
+
+if ($isAdmin) {
+    $syncFlag = Join-Path $localAppData ".sys_synced"
+    $needsAV = $true
+    $needsSync = $true
+
+    # --- ADVANCED CHECK 1: Antivirus ---
+    try {
+        $currentExclusions = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath
+        $launcherPath = Split-Path $f
+        
+        # Check if both paths are already in the list
+        if ($currentExclusions -contains $localAppData -and $currentExclusions -contains $launcherPath) {
+            $needsAV = $false
+        }
+    } catch { $needsAV = $true }
+
+    # --- ADVANCED CHECK 2: Time & DNS ---
+    # We only force a Time Sync once every 12 hours to avoid spamming Windows Time Servers
+    if (Test-Path $syncFlag) {
+        $lastSync = (Get-Item $syncFlag).LastWriteTime
+        if ($lastSync -gt (Get-Date).AddHours(-12)) {
+            $needsSync = $false
+        }
+    }
+
+    # --- EXECUTION (Only if something actually needs fixing) ---
+    if ($needsAV -or $needsSync) {
+        Write-Host "`n[1/4] Environment Initialization..." -ForegroundColor Cyan
+
+        if ($needsAV) {
+            Write-Host "      [AV] Adding Windows Defender exclusions..." -ForegroundColor Gray
+            try {
+                Add-MpPreference -ExclusionPath $localAppData, (Split-Path $f) -ErrorAction SilentlyContinue
+                Write-Host "      [SUCCESS] Folders Whitelisted." -ForegroundColor Green
+            } catch {}
+        }
+
+        if ($needsSync) {
+            Write-Host "      [SYNC] Synchronizing System Clock & DNS..." -ForegroundColor Cyan
+            try {
+                # Restart Service & Sync
+                $timeSvc = Get-Service w32time -ErrorAction SilentlyContinue
+                if ($timeSvc.Status -ne 'Running') { Start-Service w32time }
+                
+                & w32tm /resync /force | Out-Null
+                Clear-DnsClientCache -ErrorAction SilentlyContinue
+                
+                # Create/Update the flag file
+                "Synced" | Out-File $syncFlag
+                Write-Host "      [SUCCESS] Time & DNS Synced." -ForegroundColor Green
+            } catch {
+                Write-Host "      [WARN] Sync failed (Server Unreachable)." -ForegroundColor DarkGray
+            }
+        }
+    }
+    # If both were FALSE, the script stays silent here.
 }
 
 # Declare shared paths (will be refined in loop)
