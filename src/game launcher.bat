@@ -135,25 +135,32 @@ function Invoke-PathDialog {
     Add-Type -AssemblyName System.Windows.Forms
     
     $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dialog.Description = "Select your 'Hytale F2P Launcher' installation folder (or the 'Client' folder)"
-    $dialog.ShowNewFolderButton = $true  # Allow creating new folders
+    $dialog.Description = "Select your 'Hytale F2P Launcher' installation folder (or click 'Cancel' to use the default path)"
+    $dialog.ShowNewFolderButton = $true
     
-    # Try to bring to front
-    $owner = New-Object System.Windows.Forms.NativeWindow
-    $owner.AssignHandle([System.Diagnostics.Process]::GetCurrentProcess().MainWindowHandle)
+    # Robust Focus Fix: Use a hidden TopMost dummy form as owner
+    $dummy = New-Object System.Windows.Forms.Form
+    $dummy.TopMost = $true
+    $dummy.WindowState = "Minimized"
+    $dummy.Opacity = 0
+    $dummy.Show()
+    [User32]::SetForegroundWindow($dummy.Handle)
     
-    $result = $dialog.ShowDialog($owner)
+    $result = $dialog.ShowDialog($dummy)
+    $userInput = $dialog.SelectedPath
     
-    if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-        $userInput = $dialog.SelectedPath
-        
+    # Cleanup dummy form
+    $dummy.Close()
+    $dummy.Dispose()
+    
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK -and -not [string]::IsNullOrWhiteSpace($userInput)) {
         # Special case: If user selected drive root (e.g., C:\), create HytaleF2P folder
         if ($userInput -match "^[A-Z]:\\$") {
             $userInput = Join-Path $userInput "HytaleF2P"
             Write-Host "`n      [INFO] Drive root selected. Using: $userInput" -ForegroundColor Cyan
         }
         
-        # Smart Check: Direct selection OR Root selection
+        # Smart Check: Support both Root selection and Direct Client selection
         $pRoot = Join-Path $userInput "release\package\game\latest\Client\HytaleClient.exe"
         $pDirect = Join-Path $userInput "HytaleClient.exe"
         
@@ -162,20 +169,18 @@ function Invoke-PathDialog {
         } elseif (Test-Path $pDirect) { 
             $pDirect 
         } else { 
-            # Game doesn't exist - assume user wants to install here
+            # Game doesn't exist - prepare for fresh installation
             Write-Host "`n      [INFO] Game not found at selected location." -ForegroundColor Cyan
             Write-Host "              Will use this folder for fresh installation." -ForegroundColor Gray
             
-            # Determine if they selected a root folder or client folder
-            # If path ends with "Client", assume it's the Client folder
+            # Determine structure based on selection
             if ($userInput -match "\\Client$") {
                 $clientPath = Join-Path $userInput "HytaleClient.exe"
             } else {
-                # Use standard structure
                 $clientPath = Join-Path $userInput "release\package\game\latest\Client\HytaleClient.exe"
             }
             
-            # Create directory structure if it doesn't exist
+            # Create directory structure
             $clientDir = Split-Path $clientPath
             if (-not (Test-Path $clientDir)) {
                 try {
@@ -187,23 +192,17 @@ function Invoke-PathDialog {
                     return $null
                 }
             }
-            
             $clientPath
         }
         
         if ($potential) {
-            # Save for next time
+            # Persistent Cache for next run
             if (-not (Test-Path $localAppData)) { New-Item -ItemType Directory $localAppData -Force | Out-Null }
             $obj = @{ gamePath = $potential }
             $obj | ConvertTo-Json | Out-File $pathConfigFile
             return $potential
-        } else {
-            Write-Host "`n      [ERROR] Could not determine valid installation path." -ForegroundColor Red
-            Start-Sleep -Seconds 3
-            return $null
         }
     }
-    
     return $null
 }
 
@@ -245,74 +244,7 @@ function Resolve-GamePath {
     Write-Host "[!] Could not find HytaleClient.exe automatically." -ForegroundColor Yellow
     Write-Host "    Launching Folder Selection Dialog... (Tip: Close it to use the default path)" -ForegroundColor Gray
     
-    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dialog.Description = "Select installation folder (can be empty for fresh install)"
-    $dialog.ShowNewFolderButton = $true
-    
-    # Try to bring to front
-    $owner = New-Object System.Windows.Forms.NativeWindow
-    $owner.AssignHandle([System.Diagnostics.Process]::GetCurrentProcess().MainWindowHandle)
-    
-    $result = $dialog.ShowDialog($owner)
-    
-    if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-        $userInput = $dialog.SelectedPath
-        
-        # Special case: If user selected drive root (e.g., C:\), create HytaleF2P folder
-        if ($userInput -match "^[A-Z]:\\$") {
-            $userInput = Join-Path $userInput "HytaleF2P"
-            Write-Host "[INFO] Drive root selected. Using: $userInput" -ForegroundColor Cyan
-        }
-        
-        # Smart Check: Direct selection OR Root selection
-        $pRoot = Join-Path $userInput "release\package\game\latest\Client\HytaleClient.exe"
-        $pDirect = Join-Path $userInput "HytaleClient.exe"
-        
-        $potential = if (Test-Path $pRoot) { 
-            $pRoot 
-        } elseif (Test-Path $pDirect) { 
-            $pDirect 
-        } else { 
-            # Game doesn't exist - assume user wants to install here
-            Write-Host "[INFO] Game not found at selected location." -ForegroundColor Cyan
-            Write-Host "       Will use this folder for fresh installation." -ForegroundColor Gray
-            
-            # Determine if they selected a root folder or client folder
-            if ($userInput -match "\\Client$") {
-                $clientPath = Join-Path $userInput "HytaleClient.exe"
-            } else {
-                # Use standard structure
-                $clientPath = Join-Path $userInput "release\package\game\latest\Client\HytaleClient.exe"
-            }
-            
-            # Create directory structure if it doesn't exist
-            $clientDir = Split-Path $clientPath
-            if (-not (Test-Path $clientDir)) {
-                try {
-                    New-Item -ItemType Directory -Path $clientDir -Force | Out-Null
-                    Write-Host "       Created directory structure." -ForegroundColor Green
-                } catch {
-                    Write-Host "[ERROR] Failed to create directory: $($_.Exception.Message)" -ForegroundColor Red
-                    Start-Sleep -Seconds 3
-                    return $null
-                }
-            }
-            
-            $clientPath
-        }
-        
-        if ($potential) {
-            # Save for next time
-            if (-not (Test-Path $localAppData)) { New-Item -ItemType Directory $localAppData -Force | Out-Null }
-            $obj = @{ gamePath = $potential }
-            $obj | ConvertTo-Json | Out-File $pathConfigFile
-            return $potential
-        } else {
-            Write-Host "[ERROR] Could not determine valid installation path." -ForegroundColor Red
-            Start-Sleep -Seconds 3
-        }
-    }
-    return $null
+    return Invoke-PathDialog
 }
 
 $gameExe = Resolve-GamePath
@@ -338,33 +270,58 @@ try {
     # Silently skip resize if terminal doesn't support it
 }
 
-if ($isAdmin) {
-    $syncFlag = Join-Path $localAppData ".sys_synced"
-    $needsAV = $true
-    $needsSync = $true
+$syncFlag = Join-Path $localAppData ".sys_synced"
+$needsAV = $true
+$needsSync = $true
 
-    # --- ADVANCED CHECK 1: Antivirus ---
-    try {
+# --- ADVANCED CHECK 1: Antivirus ---
+try {
+    if ($isAdmin) {
         $currentExclusions = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath
         $launcherPath = Split-Path $f
-        
-        # Check if both paths are already in the list
         if ($currentExclusions -contains $localAppData -and $currentExclusions -contains $launcherPath) {
             $needsAV = $false
         }
-    } catch { $needsAV = $true }
-
-    # --- ADVANCED CHECK 2: Time & DNS ---
-    # We only force a Time Sync once every 12 hours to avoid spamming Windows Time Servers
-    if (Test-Path $syncFlag) {
-        $lastSync = (Get-Item $syncFlag).LastWriteTime
-        if ($lastSync -gt (Get-Date).AddHours(-12)) {
-            $needsSync = $false
-        }
+    } else {
+        # Check for whitelist flag to avoid unnecessary prompts
+        if (Test-Path "$localAppData\.whitelisted") { $needsAV = $false }
     }
+} catch { $needsAV = $true }
 
-    # --- EXECUTION (Only if something actually needs fixing) ---
-    if ($needsAV -or $needsSync) {
+# --- ADVANCED CHECK 2: Time & DNS ---
+if (Test-Path $syncFlag) {
+    $lastSync = (Get-Item $syncFlag).LastWriteTime
+    if ($lastSync -gt (Get-Date).AddHours(-12)) {
+        $needsSync = $false
+    }
+}
+
+# --- EXECUTION (Only if something actually needs fixing) ---
+if ($needsAV -or $needsSync) {
+    if (-not $isAdmin) {
+        Write-Host "`n[!] Admin privileges required for environment initialization." -ForegroundColor Yellow
+        Add-Type -AssemblyName System.Windows.Forms
+        $resp = [System.Windows.Forms.MessageBox]::Show(
+            "Environment initialization (Time Sync & Anti-Virus exclusion) requires administrator privileges.`n`nWould you like to elevate now?",
+            "UAC - Elevation Request",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question
+        )
+        if ($resp -eq [System.Windows.Forms.DialogResult]::Yes) {
+            # FIX: Get the path of the actual running EXE/Process instead of the temp script file
+            $currentProcPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+            
+            # Re-launch the EXE with the required arguments and Admin verb
+            try {
+                Start-Process "$currentProcPath" -ArgumentList "am_wt $EXTRA_ARGS" -Verb RunAs -ErrorAction Stop
+                exit
+            } catch {
+                Write-Host "`n      [ERROR] Elevation failed: $($_.Exception.Message)" -ForegroundColor Red
+                Start-Sleep -Seconds 3
+            }
+        }
+        Write-Host "      [SKIP] Continuing without admin initialization." -ForegroundColor Gray
+    } else {
         Write-Host "`n[1/4] Environment Initialization..." -ForegroundColor Cyan
 
         if ($needsAV) {
@@ -378,14 +335,10 @@ if ($isAdmin) {
         if ($needsSync) {
             Write-Host "      [SYNC] Synchronizing System Clock & DNS..." -ForegroundColor Cyan
             try {
-                # Restart Service & Sync
                 $timeSvc = Get-Service w32time -ErrorAction SilentlyContinue
                 if ($timeSvc.Status -ne 'Running') { Start-Service w32time }
-                
                 & w32tm /resync /force | Out-Null
                 Clear-DnsClientCache -ErrorAction SilentlyContinue
-                
-                # Create/Update the flag file
                 "Synced" | Out-File $syncFlag
                 Write-Host "      [SUCCESS] Time & DNS Synced." -ForegroundColor Green
             } catch {
@@ -393,7 +346,6 @@ if ($isAdmin) {
             }
         }
     }
-    # If both were FALSE, the script stays silent here.
 }
 
 # Declare shared paths (will be refined in loop)
@@ -762,24 +714,63 @@ function Restore-WorldSaves($userDataPath) {
     }
 }
 
-function Find-UserDataPath($gameLatest) {
-    $candidates = @()
-    # Priority order
-    $candidates += Join-Path $gameLatest "Client\UserData"
-    $candidates += Join-Path $gameLatest "Client\Hytale.app\Contents\UserData"
-    $candidates += Join-Path $gameLatest "Hytale.app\Contents\UserData"
-    $candidates += Join-Path $gameLatest "UserData"
-    $candidates += Join-Path $gameLatest "Client\UserData" # Win fallback
+
+function Update-PlayerIdentityInSaves($userDataPath, $newUuid, $newName) {
+    if (-not $userDataPath) { return }
+    $savesDir = Join-Path $userDataPath "Saves"
+    $backupRoot = Join-Path $global:PublicConfig "WorldBackups"
     
-    foreach ($cand in $candidates) {
-        if (Test-Path $cand) { return $cand }
+    $updateDir = { param($monitorDir, $targetUuid, $targetName)
+        if (-not (Test-Path $monitorDir)) { return }
+        # Recursive search for 'players' folder inside 'universe'
+        $playerDirs = Get-ChildItem -Path $monitorDir -Directory -Recurse -Filter "players" -ErrorAction SilentlyContinue | Where-Object { $_.Parent.Name -eq "universe" }
+        
+        foreach ($pDir in $playerDirs) {
+            $jsonFiles = Get-ChildItem -Path $pDir.FullName -Filter "*.json"
+            foreach ($file in $jsonFiles) {
+                try {
+                    $pDat = Get-Content $file.FullName -Raw | ConvertFrom-Json
+                    $modified = $false
+                    
+                    # Update name in common components
+                    if ($null -ne $pDat.Components.Nameplate) { 
+                        $pDat.Components.Nameplate.Text = $targetName
+                        $modified = $true 
+                    }
+                    if ($null -ne $pDat.Components.DisplayName.DisplayName) { 
+                        $pDat.Components.DisplayName.DisplayName.RawText = $targetName
+                        $modified = $true
+                    }
+                    
+                    if ($modified) {
+                        $pDat | ConvertTo-Json -Depth 10 | Out-File $file.FullName -Encoding UTF8 -Force
+                    }
+                    
+                    # Rename file to target UUID to ensure ownership in Hytale
+                    $newFilePath = Join-Path $pDir.FullName "$targetUuid.json"
+                    if ($file.FullName -ne $newFilePath) {
+                        if (Test-Path $newFilePath) { Remove-Item $newFilePath -Force }
+                        Rename-Item $file.FullName -NewName "$targetUuid.json" -Force
+                        Write-Host "      [SAVE] Migrated identity in: $(Split-Path (Split-Path (Split-Path $file.FullName) -Parent) -Leaf)" -ForegroundColor Gray
+                    }
+                } catch {
+                    Write-Host "      [WARN] Failed to update save at: $($file.FullName)" -ForegroundColor Yellow
+                }
+            }
+        }
     }
+
+    Write-Host "      [IDENTITY] Pushing profile to worlds..." -ForegroundColor Cyan
+    &$updateDir -monitorDir $savesDir -targetUuid $newUuid -targetName $newName
     
-    # Default fallback
-    $defaultPath = Join-Path $gameLatest "Client\UserData"
-    if (-not (Test-Path $defaultPath)) { New-Item -ItemType Directory $defaultPath -Force | Out-Null }
-    return $defaultPath
+    if (Test-Path $backupRoot) {
+        Get-ChildItem -Path $backupRoot -Directory | ForEach-Object {
+            &$updateDir -monitorDir $_.FullName -targetUuid $newUuid -targetName $newName
+        }
+    }
+    Write-Host "      [SUCCESS] Worlds updated to $newName ($newUuid)" -ForegroundColor Green
 }
+
 
 function Sync-PlayerIdentityFromSaves($userDataPath) {
     if (-not $userDataPath) { return $false }
@@ -1362,12 +1353,23 @@ function Download-WithProgress($url, $destination, $useHeaders=$true) {
                 $check = $client.SendAsync($headRequest).GetAwaiter().GetResult()
                 if (-not $check.IsSuccessStatusCode) {
                     Write-Host "      [ERROR] URL unreachable: $($check.StatusCode)" -ForegroundColor Red
+                    Write-Host "      [FIX] Your ISP might be blocking this node. Try a VPN (WARP) or DNS Change." -ForegroundColor Yellow
                     $client.Dispose()
+                    Show-NetworkFixMenu
                     return $false
                 }
             } catch {
                 Write-Host "      [ERROR] Could not connect to storage node." -ForegroundColor Red
+                Write-Host "      [FIX] Connection timed out. This often means an ISP block. Try VPN/WARP." -ForegroundColor Yellow
+                
+                # Check for Time Desync
+                if (Test-TimeSync) {
+                    Write-Host "      [TIME] Your system clock is desynchronized. This breaks SSL/TLS." -ForegroundColor Yellow
+                    if ($isAdmin) { Sync-SystemTime } else { Write-Host "      [ACTION] Please fix your Date/Time settings in Windows." -ForegroundColor Red }
+                }
+
                 $client.Dispose()
+                Show-NetworkFixMenu
                 return $false
             }
         }
@@ -1430,6 +1432,10 @@ function Download-WithProgress($url, $destination, $useHeaders=$true) {
             Write-Host ""; 
         } catch { 
             Write-Host "`n      [DOWNLOAD EXCEPTION] $($_.Exception.Message)" -ForegroundColor Red
+            if ($_.Exception.Message -match "connected|unreachable|timeout") {
+                Write-Host "      [SUGGESTION] Networking issues detected. Suggesting Fix..." -ForegroundColor Yellow
+                Show-NetworkFixMenu
+            }
             # Loop will retry
             $success = $false
         } finally { 
@@ -1906,6 +1912,63 @@ function Set-GameDNS($provider) {
     }
 }
 
+function Sync-SystemTime {
+    Write-Host "`n[TIME] Synchronizing system clock..." -ForegroundColor Cyan
+    if (-not $isAdmin) {
+        Write-Host "      [!] Admin privileges required to sync time." -ForegroundColor Yellow
+        Add-Type -AssemblyName System.Windows.Forms
+        $resp = [System.Windows.Forms.MessageBox]::Show(
+            "System clock synchronization requires administrator privileges.`n`nWould you like to elevate now?",
+            "UAC - Elevation Request",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question
+        )
+        if ($resp -eq [System.Windows.Forms.DialogResult]::Yes) {
+            Start-Process "$f" -ArgumentList "am_wt $EXTRA_ARGS" -Verb RunAs
+            exit
+        }
+        return $false
+    }
+    
+    try {
+        $timeSvc = Get-Service w32time -ErrorAction SilentlyContinue
+        if ($timeSvc.Status -ne 'Running') { Start-Service w32time }
+        & w32tm /resync /force | Out-Null
+        Write-Host "      [SUCCESS] System clock synchronized." -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host "      [ERROR] Time sync failed: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Test-TimeSync {
+    # Check if system time is desynchronized by comparing with a reliable web source
+    try {
+        $client = New-Object System.Net.Http.HttpClient
+        $client.Timeout = [System.TimeSpan]::FromSeconds(5)
+        # Use a reliable head request to get the 'Date' header
+        $response = $client.SendAsync((New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Head, "https://www.google.com"))).GetAwaiter().GetResult()
+        $serverDateStr = $response.Headers.Date.ToString()
+        $serverDate = [DateTime]::Parse($serverDateStr).ToUniversalTime()
+        $localDate = [DateTime]::UtcNow
+        
+        $diff = [Math]::Abs(($serverDate - $localDate).TotalMinutes)
+        
+        if ($diff -gt 5) {
+            Write-Host "`n[!] Time Desync Detected! (Diff: $([Math]::Round($diff, 2)) mins)" -ForegroundColor Yellow
+            Write-Host "    System Time: $($localDate.ToString()) (UTC)" -ForegroundColor Gray
+            Write-Host "    Server Time: $($serverDate.ToString()) (UTC)" -ForegroundColor Gray
+            return $true
+        }
+    } catch {
+        # If we can't even reach Google, we can't verify time.
+    } finally {
+        if ($client) { $client.Dispose() }
+    }
+    return $false
+}
+
 function Install-CloudflareWarp {
     Write-Host "`n[VPN] Checking Cloudflare WARP..." -ForegroundColor Cyan
     
@@ -1949,6 +2012,7 @@ function Show-NetworkFixMenu {
         Write-Host " [2] Use Google DNS (8.8.8.8)" -ForegroundColor Cyan
         Write-Host " [3] Reset DNS to Automatic" -ForegroundColor Gray
         Write-Host " [4] Install Cloudflare WARP VPN (Best for blocks)" -ForegroundColor Magenta
+        Write-Host " [5] Sync System Time (Fixes SSL/TLS Errors)" -ForegroundColor Yellow
         Write-Host " [0] Back (Resume)" -ForegroundColor DarkGray
         Write-Host ""
         
@@ -1960,6 +2024,7 @@ function Show-NetworkFixMenu {
             "2" { Set-GameDNS "Google"; Pause }
             "3" { Set-GameDNS "Auto"; Pause }
             "4" { Install-CloudflareWarp; Pause }
+            "5" { Sync-SystemTime; Pause }
             "0" { $netMenuLoop = $false }
             default { $netMenuLoop = $false }
     }
@@ -1980,13 +2045,19 @@ function Show-ProfileMenu {
         Write-Host " [1] Change Username" -ForegroundColor Green
         Write-Host " [2] Change UUID (Manual)" -ForegroundColor Yellow
         Write-Host " [3] Regenerate UUID (Random)" -ForegroundColor Cyan
-        Write-Host " [4] Sync from Save URL (Force 'Sync-PlayerIdentityFromSaves')" -ForegroundColor White
+        Write-Host " [4] Sync from Save URL (Import Identity)" -ForegroundColor White
+        Write-Host " [5] Overwrite all Worlds with current Profile" -ForegroundColor Magenta
         Write-Host " [0] Back to Main Menu" -ForegroundColor DarkGray
         Write-Host ""
         
         $pChoice = Read-Host " Select an option [0]"
         if ($pChoice -eq "") { $pChoice = "0" }
         
+        # Pre-resolve UserData path for sync operations
+        $lRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $localAppData }
+        $aDir = Join-Path $lRoot "release\package\game\latest"
+        $uDir = Find-UserDataPath $aDir
+
         switch ($pChoice) {
             "1" {
                 $newName = Read-Host "`n      Enter new Username"
@@ -2005,8 +2076,11 @@ function Show-ProfileMenu {
                     $idFile = Join-Path $PublicConfig "player_id.json"
                     $idPayload = @{ playerId = $global:pUuid; createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
                     $idPayload | ConvertTo-Json | Out-File $idFile -Encoding UTF8 -Force
+                    
+                    # Auto-Sync to worlds
+                    Update-PlayerIdentityInSaves $uDir $global:pUuid $global:pName
                 }
-                Start-Sleep -Seconds 1
+                Start-Sleep -Seconds 2
             }
             "2" {
                 $newUuid = Read-Host "`n      Enter new UUID"
@@ -2018,10 +2092,13 @@ function Show-ProfileMenu {
                     $idFile = Join-Path $PublicConfig "player_id.json"
                     $idPayload = @{ playerId = $global:pUuid; createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
                     $idPayload | ConvertTo-Json | Out-File $idFile -Encoding UTF8 -Force
+                    
+                    # Auto-Sync to worlds
+                    Update-PlayerIdentityInSaves $uDir $global:pUuid $global:pName
                 } else {
                     Write-Host "      [ERROR] Invalid UUID format." -ForegroundColor Red
                 }
-                Start-Sleep -Seconds 1
+                Start-Sleep -Seconds 2
             }
             "3" {
                 $global:pUuid = [guid]::NewGuid().ToString()
@@ -2031,21 +2108,23 @@ function Show-ProfileMenu {
                 $idFile = Join-Path $PublicConfig "player_id.json"
                 $idPayload = @{ playerId = $global:pUuid; createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
                 $idPayload | ConvertTo-Json | Out-File $idFile -Encoding UTF8 -Force
+                
+                # Auto-Sync to worlds
+                Update-PlayerIdentityInSaves $uDir $global:pUuid $global:pName
                 Start-Sleep -Seconds 2
             }
             "4" {
-                Write-Host "`n[SYNC] Scanning saves..." -ForegroundColor Cyan
-                # Need userDir here. Re-resolve it or pass it? 
-                # resolving locally for safety
-                $lRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $localAppData }
-                $aDir = Join-Path $lRoot "release\package\game\latest"
-                $uDir = Find-UserDataPath $aDir
-                
+                Write-Host "`n[SYNC] Scanning saves for identity..." -ForegroundColor Cyan
                 if (Sync-PlayerIdentityFromSaves $uDir) {
                     Write-Host "      [SUCCESS] Identity synced from save!" -ForegroundColor Green
                 } else {
                     Write-Host "      [INFO] No suitable single-player save found." -ForegroundColor Yellow
                 }
+                Start-Sleep -Seconds 2
+            }
+            "5" {
+                Write-Host "`n[PUSH] Forcing identity update on all worlds..." -ForegroundColor Cyan
+                Update-PlayerIdentityInSaves $uDir $global:pUuid $global:pName
                 Start-Sleep -Seconds 2
             }
             "0" { $pMenuLoop = $false }
@@ -2169,7 +2248,7 @@ function Invoke-OfficialUpdate($latestVer) {
     
     # IMMEDIATE POST-PATCH SYNC
     Write-Host "[SYNC] Syncing Player Identity..." -ForegroundColor Cyan
-    Sync-PlayerIdentityFromSaves $userDir
+    Sync-PlayerIdentityFromSaves $userDir | Out-Null
     
     # [SYNC] Ensure Server JAR is also patched/updated
     Write-Host "[SYNC] Verifying Server JAR..." -ForegroundColor Cyan
@@ -2232,8 +2311,7 @@ Write-Host "      UUID:    $global:pUuid" -ForegroundColor Gray
 
 try {
     $remoteLauncherHash = Get-RemoteHash "game launcher.bat"
-}
-catch {
+} catch {
     $remoteLauncherHash = $null
 }
 
@@ -2254,10 +2332,20 @@ else {
             Write-Host "      [SUCCESS] Update downloaded. Restarting launcher..." -ForegroundColor Green
             Start-Sleep -Seconds 1
 
-            # Overwrite and restart using CMD to avoid file locks
-            $cmd = "timeout /t 1 >nul & move /y `"$tempLauncher`" `"$f`" & cmd /c `"$f`""
-            Start-Process cmd.exe -ArgumentList "/c $cmd" -WindowStyle Normal
-            exit
+            # FIX: We use a simplified string without nested parentheses to avoid the "Unexpected token" error.
+            # We use 'start' instead of 'cmd /c' for the final step to ensure the new process detaches properly.
+            $updateCmd = "timeout /t 2 >nul & move /y `"$tempLauncher`" `"$f`" & start `"`" `"$f`""
+
+            try {
+                # Launch a separate CMD window to handle the file swap and restart
+                Start-Process "cmd.exe" -ArgumentList "/c $updateCmd" -WindowStyle Normal
+                exit
+            } catch {
+                Write-Host "      [ERROR] Failed to restart: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "      Please run the launcher manually to apply the update." -ForegroundColor Yellow
+                Read-Host "Press Enter to exit..."
+                exit
+            }
         }
     }
 }
@@ -2292,7 +2380,7 @@ while ($true) {
     Ensure-ModDirs $userDir
     
     # [IDENTITY] Sync Identity from Single-Player Saves
-    Sync-PlayerIdentityFromSaves $userDir
+    Sync-PlayerIdentityFromSaves $userDir | Out-Null
     # --------------------------------------------
     
     # Ensure local directory health
@@ -2385,7 +2473,7 @@ while ($true) {
         }
         
         # Always verify assets and deps after any repair
-        Sync-PlayerIdentityFromSaves $userDir
+        Sync-PlayerIdentityFromSaves $userDir | Out-Null
         if (-not (Ensure-JRE $launcherRoot $cacheDir)) { pause; continue }
         
     } else {
@@ -3067,7 +3155,7 @@ if (Test-Path $gameExe) {
         $newLogs = Get-ChildItem -Path $logPath -Filter "*.log" | Where-Object { $_.LastWriteTime -gt $preLaunchLogDate }
         foreach ($nl in $newLogs) {
             $logContent = Get-Content $nl.FullName -Raw -ErrorAction SilentlyContinue
-            $errors = Get-Content $nl.FullName | Where-Object { $_ -match "\|ERROR\||\|FATAL\|" -or $_ -match "VM Initialization Error" -or $_ -match "Server failed to boot" }
+            $errors = Get-Content $nl.FullName | Where-Object { $_ -match "\|ERROR\||\|FATAL\|" -or $_ -match "VM Initialization Error" -or $_ -match "Server failed to boot" -or $_ -match "World default already exists" -or $_ -match "Failed to decode asset" -or $_ -match "ALPN mismatch" }
             foreach ($err in $errors) {
                 if ($reportedErrors -notcontains $err) {
                     Write-Host "`r      [LOG ERROR] $($err.Trim())" -ForegroundColor Red
@@ -3076,278 +3164,126 @@ if (Test-Path $gameExe) {
                     $isAppMainMenuNullRef = $err -match "AppMainMenu.*NullReferenceException" -or $err -match "HytaleClient\.Application\.AppMainMenu.*NullReferenceException"
                     
                     if ($isAppMainMenuNullRef) {
-                        # Check if Server directory exists
                         $serverDir = Join-Path $appDir "Server"
                         $serverJarPath = Join-Path $serverDir "HytaleServer.jar"
                         
-                        Write-Host "`n      [FIX] AppMainMenu NullReferenceException Detected!"-ForegroundColor Red
-                        Write-Host "      [CHECK] Verifying Server directory exists..." -ForegroundColor Cyan
+                        Write-Host "      → [FIX] AppMainMenu NullReferenceException Detected!" -ForegroundColor Red
                         
                         if (-not (Test-Path $serverDir) -or -not (Test-Path $serverJarPath)) {
-                            Write-Host "      [MISSING] Server directory or JAR not found at: $serverDir" -ForegroundColor Yellow
-                            Write-Host "      [ACTION] Triggering Patch-HytaleServer to download..."-ForegroundColor Yellow
+                            Write-Host "      → [ACTION] Triggering Patch-HytaleServer to download..." -ForegroundColor Yellow
                             
                             $reportedErrors += $err
-                            
-                            # Kill current process before patching
                             Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
                             Start-Sleep -Seconds 1
                             
                             if (Patch-HytaleServer $serverJarPath) {
-                                Write-Host "      [SUCCESS] Server installed! Restarting game..." -ForegroundColor Green
+                                Write-Host "      → [SUCCESS] Server installed! Restarting game..." -ForegroundColor Green
                                 Start-Sleep -Seconds 2
                                 $global:forceRestart = $true
-                                $stable = $false
-                                break
+                                $stable = $false; break
                             } else {
-                                Write-Host "      [ERROR] Failed to install server. Manual intervention required." -ForegroundColor Red
+                                Write-Host "      → [ERROR] Failed to install server. Manual intervention required." -ForegroundColor Red
                             }
                         } else {
-                            Write-Host "      [INFO] Server directory exists. Issue may be something else." -ForegroundColor Gray
+                            Write-Host "      → [INFO] Server directory exists. Passing to other handlers..." -ForegroundColor Gray
                             $reportedErrors += $err
                         }
                     }
-                    # --- PRIORITY 1: JWT/TOKEN VALIDATION ERRORS (Check full log for root cause) ---
-                    # When "Server failed to boot" occurs, first check if it's actually a JWT issue
+                    # --- PRIORITY 1: JWT/TOKEN VALIDATION ERRORS ---
                     $isJwtError = $logContent -match "Token validation failed" -or $logContent -match "signature verification failed" -or $logContent -match "No Ed25519 key found"
                     
                     if ($isJwtError) {
-                        # --- FIX FOR SERVER JWT VALIDATION FAILURE ---
-                        Write-Host "`n      [FIX] Server Token Validation Error Detected (Root Cause)!" -ForegroundColor Red
-                        Write-Host "      [INFO] Server is missing authentication keys. Attempting repair..." -ForegroundColor Cyan
+                        Write-Host "      → [FIX] Server Token Validation Error Detected (Root Cause)!" -ForegroundColor Red
+                        Write-Host "      → [ACTION] Downloading pre-patched server with correct keys..." -ForegroundColor Yellow
                         
                         $reportedErrors += $err
                         $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
                         
-                        # Determine currently installed branch
                         $currentBranch = "release"
                         if (Test-Path "$serverJarPath.dualauth_patched") {
                             try { $currentBranch = (Get-Content "$serverJarPath.dualauth_patched" -Raw | ConvertFrom-Json).branch } catch {}
-                            if (-not $currentBranch) { $currentBranch = "release" }
                         }
                         
-                        # LOGIC:
-                        # 1. If not patched this session: Force re-download current branch.
-                        # 2. If patched "release" and failed again: Switch to "pre-release".
-                        # 3. If patched "pre-release" and failed again: Give up.
-                        
                         $targetBranch = $null
-                        
                         if (-not $global:serverPatched) {
-                            Write-Host "      [ACTION] Force updating current branch ($currentBranch)..." -ForegroundColor Yellow
                             $targetBranch = $currentBranch
                         } elseif ($global:serverPatched -eq "release") {
-                            Write-Host "      [FIX] Release patch failed to resolve issue. Switching to PRE-RELEASE..." -ForegroundColor Magenta
                             $targetBranch = "pre-release"
-                        } else {
-                            Write-Host "      [INFO] Server already patched ($global:serverPatched) but issue persists. Manual fix required." -ForegroundColor Gray
                         }
                         
                         if ($targetBranch) {
                             Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
                             Start-Sleep -Seconds 1
-                            
                             if (Patch-HytaleServer $serverJarPath $targetBranch $true) {
                                 $global:serverPatched = $targetBranch
-                                Write-Host "      [SUCCESS] Server patched ($targetBranch)! Restarting game..." -ForegroundColor Green
-                                
+                                Write-Host "      → [SUCCESS] Server patched ($targetBranch)! Restarting game..." -ForegroundColor Green
                                 Start-Sleep -Seconds 2
                                 $global:forceRestart = $true
-                                $stable = $false
-                                break
-                            } else {
-                                Write-Host "      [ERROR] Failed to patch server. Manual intervention required." -ForegroundColor Red
+                                $stable = $false; break
                             }
                         }
                     }
-                    # --- PRIORITY 2: VM/JRE ERRORS (Only if NOT a JWT error) ---
-                    elseif ($err -match "VM Initialization Error" -or $err -match "Failed setting boot class path" -or $err -match "Server failed to boot") {
+                    # --- PRIORITY 2: BOOT / JAVA / WORLD / VERSION ERRORS ---
+                    elseif ($err -match "VM Initialization Error" -or $err -match "Failed setting boot class path" -or $err -match "Server failed to boot" -or $err -match "World default already exists" -or $err -match "Failed to decode asset" -or $err -match "ALPN mismatch" -or $err -match "client outdated") {
                         
-                        Write-Host "`n      [AUTO-RECOVERY] Critical boot failure detected!" -ForegroundColor Magenta
-                        Write-Host "      [ERROR] $($err.Trim())" -ForegroundColor Red
+                        Write-Host "      → [AUTO-RECOVERY] Critical boot failure detected!" -ForegroundColor Magenta
                         
-                        [System.Windows.Forms.MessageBox]::Show(
-                            "Boot Error Detected!`n$($err.Trim())`n`nAttempting auto-fix...", 
-                            "Hytale Auto-Recovery", 
-                            [System.Windows.Forms.MessageBoxButtons]::OK, 
-                            [System.Windows.Forms.MessageBoxIcon]::Warning, 
-                            [System.Windows.Forms.MessageBoxDefaultButton]::Button1, 
-                            [System.Windows.Forms.MessageBoxOptions]::ServiceNotification
-                        ) | Out-Null
-                        
-                        Write-Host "      [ACTION] Killing process to attempt repairs..." -ForegroundColor Yellow
-                        # Fix: Use $currentProc.Id explicitly as $cp might be unstable if process is mid-crash
-                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                        
-                        $logContent = Get-Content $nl.FullName -Raw -ErrorAction SilentlyContinue
-                        $cacheFixed = $false
-
-                        # --- A. CACHE CLEANING ---
-                        if ($logContent -match "Found AOT cache, enabling for faster startup: (.+)") {
-                            $aotFile = $matches[1].Trim()
-                            if (Test-Path $aotFile) {
-                                Write-Host "      [FIX] Deleting corrupted AOT Cache: $aotFile" -ForegroundColor Yellow
-                                Remove-Item $aotFile -Force -ErrorAction SilentlyContinue
-                                $cacheFixed = $true
-                            }
-                        }
-                        if (-not $cacheFixed -and $logContent -match '--prefab-cache="([^"]+)"') {
-                            $prefabDir = $matches[1].Trim()
-                            if (Test-Path $prefabDir) {
-                                Write-Host "      [FIX] Deleting potential corrupted Prefab Cache: $prefabDir" -ForegroundColor Yellow
-                                Remove-Item $prefabDir -Recurse -Force -ErrorAction SilentlyContinue
-                                $cacheFixed = $true
-                            }
-                        }
-
-                        if ($cacheFixed) {
-                            Write-Host "[SUCCESS] Cache cleanup complete. Restarting..." -ForegroundColor Green
-                            Start-Sleep -Seconds 2
-                            $stable = $false; 
-                            $global:forceRestart = $true
-                            $global:autoRepairTriggered = $true # [FIX] Auto-trigger repair after cache cleanup
-                            break
-                        }
-
-                        # --- B. ADVANCED JAVA REPAIR ---
+                        # A. JAVA REPAIR
                         if ($err -match "Failed setting boot class path" -or $err -match "VM Initialization Error" -or $err -match "Server failed to boot") {
-                            # New Logic: Delete Corrupted JRE to Force Re-download
-                            # SMART-SWITCH: Mark session to use API Host, Delete JRE, Restart Loop
-                            Write-Host "      [FIX] JRE Corruption detected. Switching to API Host JRE & purging..." -ForegroundColor Yellow
-                            
+                            Write-Host "      → [FIX] JRE Corruption detected. Switching to API Host JRE & purging..." -ForegroundColor Yellow
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
                             $global:forceApiJre = $true
-                            
                             $jreDir = Join-Path $launcherRoot "release\package\jre\latest"
+                            if (Test-Path $jreDir) { Remove-Item $jreDir -Recurse -Force -ErrorAction SilentlyContinue }
+                            $jreZip = Join-Path $cacheDir "jre_package.zip"
+                            if (Test-Path $jreZip) { Remove-Item $jreZip -Force -ErrorAction SilentlyContinue }
                             
-                            try {
-                                if (Test-Path $jreDir) {
-                                    Remove-Item $jreDir -Recurse -Force -ErrorAction SilentlyContinue
-                                    Write-Host "[SUCCESS] JRE Purged. Launcher will re-download clean runtime." -ForegroundColor Green
-                                    
-                                    # We also remove the zip cache to force a fresh fetch
-                                    $jreZip = Join-Path $cacheDir "jre_package.zip"
-                                    if (Test-Path $jreZip) { Remove-Item $jreZip -Force -ErrorAction SilentlyContinue }
-
-                                    if (Test-Path $jreZip) { Remove-Item $jreZip -Force -ErrorAction SilentlyContinue }
-
-                                    Start-Sleep -Seconds 2
-                                    $stable = $false; 
-                                    $global:forceRestart = $true
-                                    $global:autoRepairTriggered = $true # [FIX] Ensure menu is bypassed on restart for repair
-                                    break
-                                }
-                            } catch { Write-Host "      [ERROR] Failed to purge JRE: $($_.Exception.Message)" -ForegroundColor Red }
+                            $global:forceRestart = $true
+                            $global:autoRepairTriggered = $true
+                            $stable = $false; break
                         }
-                        # --- C. WORLD CORRUPTION AUTO-FIX ---
+                        # B. WORLD CORRUPTION AUTO-FIX
                         elseif ($err -match "World default already exists on disk") {
-                            Write-Host "      [FIX] World Data Corruption Detected. Resetting 'default' world..." -ForegroundColor Yellow
-                            
+                            Write-Host "      → [FIX] World Corruption Detected!" -ForegroundColor Yellow
+                            Write-Host "      → [ACTION] Purging corrupted save data and internal world cache..." -ForegroundColor Yellow
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
                             $worldDir = Join-Path $appDir "Server\universe\default"
-                            if (-not (Test-Path $worldDir)) {
-                                # Fallback if path is different in some setups
-                                $worldDir = Join-Path $appDir "universe\default"
-                            }
+                            if (Test-Path $worldDir) { Remove-Item $worldDir -Recurse -Force -ErrorAction SilentlyContinue }
                             
-                            if (Test-Path $worldDir) {
-                                try {
-                                    Remove-Item $worldDir -Recurse -Force -ErrorAction SilentlyContinue
-                                    Write-Host "[SUCCESS] Corrupted world deleted. Server will regenerate it." -ForegroundColor Green
-                                    
-                                    Start-Sleep -Seconds 2
-                                    $stable = $false
-                                    $global:forceRestart = $true
-                                    $global:autoRepairTriggered = $true
-                                    break
-                                } catch {
-                                    Write-Host "      [ERROR] Failed to delete world: $($_.Exception.Message)" -ForegroundColor Red
-                                }
-                            } else {
-                                Write-Host "      [WARN] Could not locate 'default' world folder to fix." -ForegroundColor Red
-                            }
+                            $global:forceRestart = $true
+                            $global:autoRepairTriggered = $true
+                            $stable = $false; break
                         }
-                        # --- D. ASSET DECODE / PROTOCOL MISMATCH (Version Mismatch) ---
-                        elseif ($err -match "Failed to decode asset" -or $err -match "CodecException" -or $err -match "No codec registered" -or $err -match "ALPN mismatch" -or $err -match "client outdated") {
-                            Write-Host "      [FIX] Version Mismatch Detected (Asset/Protocol). Resetting Server JAR..." -ForegroundColor Yellow
-                            
+                        # C. ASSET DECODE / PROTOCOL MISMATCH
+                        elseif ($err -match "Failed to decode asset" -or $err -match "ALPN mismatch" -or $err -match "client outdated" -or $err -match "CodecException") {
+                            Write-Host "      → [FIX] Asset Mismatch Detected!" -ForegroundColor Red
+                            Write-Host "      → [ACTION] Synchronizing Assets.zip with Server JAR..." -ForegroundColor Yellow
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
                             $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
+                            if (Test-Path $serverJarPath) { Remove-Item $serverJarPath -Force -ErrorAction SilentlyContinue }
                             
-                            if (Test-Path $serverJarPath) {
-                                try {
-                                    Remove-Item $serverJarPath -Force -ErrorAction SilentlyContinue
-                                    Write-Host "[SUCCESS] Server JAR deleted. Launcher will re-download/patch it." -ForegroundColor Green
-                                    
-                                    Start-Sleep -Seconds 2
-                                    $stable = $false
-                                    $global:forceRestart = $true
-                                    $global:autoRepairTriggered = $true
-                                    break
-                                } catch {
-                                    Write-Host "      [ERROR] Failed to delete HytaleServer.jar: $($_.Exception.Message)" -ForegroundColor Red
-                                }
-                            } else {
-                                Write-Host "      [WARN] HytaleServer.jar not found to reset." -ForegroundColor Red
-                                # Force restart anyway to let Ensure-Server handle it
-                                $global:forceRestart = $true
-                                $global:autoRepairTriggered = $true
-                                break
-                            }
-                        }
-
-                        # --- HYFIXES FALLBACK (Priority 3) ---
-                        # User Request: Don't run HyFixes for VM Init errors as it doesn't help.
-                        # Only run for generic "Server failed to boot" if no other fixes applied.
-                        if (-not ($err -match "VM Initialization Error") -and $global:pwrVersion -and $global:pwrVersion -notin $global:autoFixedVersions) {
-                            Write-Host "      [FIX] Attempting to apply HyFixes automatically..." -ForegroundColor Cyan
-                            if (Install-HyFixes) {
-                                Write-Host "[SUCCESS] Fix applied. Restarting..." -ForegroundColor Green
-                                if (-not $global:autoFixedVersions) { $global:autoFixedVersions = @() }
-                                $global:autoFixedVersions += $global:pwrVersion
-                                Save-Config
-                                Start-Sleep -Seconds 2
-                                $stable = $false; 
-                                $global:forceRestart = $true
-                                break
-                            }
+                            $global:forceRestart = $true
+                            $global:autoRepairTriggered = $true
+                            $stable = $false; break
                         }
                     }
+                    # --- PRIORITY 3: ISSUER MISMATCH ---
                     elseif ($err -match "Identity token has invalid issuer: expected (https?://[^\s,]+)") {
-                        # --- FIX FOR ISSUER MISMATCH ---
                         $expectedUrl = $matches[1].TrimEnd('/')
-                        
-                        Write-Host "`n      [FIX] Issuer Mismatch Detected!" -ForegroundColor Red
-                        Write-Host "      [INFO] Game expects: $expectedUrl" -ForegroundColor Cyan
-                        
-                        # Mark this error as handled to prevent re-detection
+                        Write-Host "      → [FIX] Issuer Mismatch Detected!" -ForegroundColor Red
+                        Write-Host "      → [ACTION] Updating configuration to match Game Client..." -ForegroundColor Yellow
                         $reportedErrors += $err
-                        
                         if ($global:AUTH_URL_CURRENT -ne $expectedUrl) {
-                            Write-Host "      [ACTION] Updating configuration to match Game Client..." -ForegroundColor Yellow
-                            
-                            # 1. Update Global
                             $global:AUTH_URL_CURRENT = $expectedUrl
-                            
-                            # 2. Persist to file immediately
                             Save-Config
-                            
-                            # 3. Kill the current game process (it will restart with new URL)
-                            Write-Host "      [ACTION] Restarting game with corrected settings..." -ForegroundColor Yellow
                             Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
                             Start-Sleep -Seconds 2
-
-                            # 4. Trigger Restart
                             $global:forceRestart = $true
-                            $stable = $false
-                            break
-                        } else {
-                            # URL is already correct, this is a stale error from old log
-                            Write-Host "      [INFO] Configuration already correct. Ignoring stale log entry." -ForegroundColor Gray
+                            $stable = $false; break
                         }
                     }
                     else {
-                        # Non-critical error - track it
                         $reportedErrors += $err
-                        
-                        # ERROR LOOP DETECTION: If same error appears multiple times, stop and pause
                         $sameErrorCount = ($reportedErrors | Where-Object { $_ -eq $err }).Count
                         if ($sameErrorCount -ge 3) {
                             Write-Host "`n      =============================================" -ForegroundColor Red
@@ -3360,7 +3296,6 @@ if (Test-Path $gameExe) {
                             Write-Host ""
                             Write-Host "      Press any key to continue monitoring, or Ctrl+C to exit..." -ForegroundColor DarkGray
                             [void][System.Console]::ReadKey($true)
-                            # Clear the duplicate errors to prevent re-triggering immediately
                             $reportedErrors = $reportedErrors | Select-Object -Unique
                         }
                     }
@@ -3369,12 +3304,6 @@ if (Test-Path $gameExe) {
             if ($global:forceRestart) { break }
         }
         if ($global:forceRestart) { break }
-
-        # UX: Notify User of Fixed State
-        if ($global:forceRestart) {
-             [System.Windows.Forms.MessageBox]::Show("Fix applied!`nPlease try joining the server again.", "Hytale Auto-Recovery", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
-             break
-        }
 
         $memMB = [math]::Round($cp.WorkingSet64 / 1MB, 0)
         
@@ -3496,7 +3425,7 @@ if (Test-Path $gameExe) {
             Show-LatestLogs $logPath 
         }
         pause
-        }
+    }
 }
 }
 }
