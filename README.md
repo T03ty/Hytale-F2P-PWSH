@@ -1,228 +1,151 @@
 ![Hytale](./Image/image_hytale.png)
 
-# 🛠️ Hytale F2P: PowerShell Self-Repair Launcher
-**A one-click solution to install, patch, and fix Hytale environment issues.**
+# 🛠️ Hytale F2P: The PowerShell Fixer Script
+**One click and your Hytale is fixed. No more environment bugs.**
 
-This script is designed to solve the common errors found in the standalone `.exe` versions. It automatically handles high-level system tasks like bypassing permission errors, fixing broken game files, and setting up the correct Java version. 
+I made this script because the standard .exe version has too many problems. It fixes permissions, broken files, and gets the right Java version for you automatically. Simple.
 
-> **Note:** This project is for **educational purposes only**.
+> **Note:** This is just for **educational purposes**.
 
 ---
 
-## 🚀 How to Run (and Fix Your Game)
+## 🚀 How to use (and fix your game)
 
-If your game is crashing, failing to download, or showing "Permission Denied," follow these steps to let the script repair your installation:
+If your game crashes or says "Permission Denied," just do this:
 
-1.  **Open PowerShell as Admin:** Right-click the **Windows Start Button** and select **PowerShell (Admin)** or **Terminal (Admin)**.
-2.  **Paste & Run:** Copy the command below and press **Enter**:
+1.  **Open PowerShell as Admin:** Right-click the **Start button** and choose **PowerShell (Admin)**.
+2.  **Paste and Enter:** Copy-paste this line and let the script do the work:
     ```powershell
     irm https://raw.githubusercontent.com/T03ty/Hytale-F2P-PWSH/refs/heads/main/src/launcher.ps1 | iex
     ```
 
 ---
 
-## ✨ New Features (v2.0)
+## ✨ New cool things (v2.0)
 
-### Server Menu System
-A dedicated submenu for server-related tasks:
-- **[1] Download server.bat** - Fetches the launcher script for hosting
-- **[2] Download HytaleServer.jar** - Downloads the official Sanasol F2P server JAR directly from `https://download.sanasol.ws/download/HytaleServer.jar`
-- **[3] Run Existing server.bat** - Quickly launch your existing server
+### Server Menu
+I added a menu for your server:
+- **[1] Download server.bat** - The script to host your game.
+- **[2] Download HytaleServer.jar** - Gets the official Sanasol JAR.
+- **[3] Run server.bat** - Start the server quickly.
 
-### Multiple Launch Modes
-- **Authenticated** - Standard login with JWT tokens
-- **Unauthenticated (Server Auth)** - For F2P servers that handle authentication internally
-- **Offline (Guest Mode)** - Play without any network authentication
+### Choose how you launch
+- **Authenticated** - Use your tokens.
+- **Unauthenticated** - For servers with their own login.
+- **Offline** - Play as a guest, no internet needed.
 
-### Smart wget Integration
-- Auto-detects `wget.exe` in PATH and Chocolatey bin folder
-- Falls back to built-in HTTP client if wget unavailable
-- Admin check before attempting Chocolatey installation
+### Better Downloads
+- Uses `wget.exe` if you have it. If not, it uses normal Windows tools.
+- It can install `wget` for you if you are Admin.
 
-### Error Loop Detection
-When the same error appears 3+ times, the launcher:
-- Pauses execution with a clear "LOOP DETECTED" message
-- Displays the problematic error for screenshot/reporting
-- Prevents infinite restart loops
+### No more infinite loops
+If a mistake happens 3 times, the script stops and says "LOOP DETECTED". You can take a screenshot and show me.
 
 ---
 
-## 🐛 Bug Fixes (v2.0)
+## 🐛 Bugs I fixed (v2.0)
 
-### Server JAR Patching
-- **Fixed:** Server JAR download validation now checks file existence AND size (minimum 1MB)
-- **Fixed:** Stale patch flags are now cleared if JAR is missing or corrupted
-- **Fixed:** Uses official Sanasol download URL for F2P client compatibility
+### Server JAR
+- **Fix:** Now it checks the size (at least 1MB) so you don't have empty files.
+- **Fix:** Clears old patch files if they are broken.
 
 ### Download System
-- **Fixed:** wget detection no longer conflicts with PowerShell's `wget` alias
-- **Fixed:** Authentication headers now applied BEFORE URL verification for API downloads
-- **Fixed:** HTTP fallback properly handles 403 Forbidden errors
+- **Fix:** No more conflict with PowerShell's own `wget` name.
+- **Fix:** Authentication works better for the API.
+- **Fix:** Handles 403 errors properly now.
 
-### Error Handling
-- **Fixed:** NullReferenceException from AppMainMenu now triggers server download
-- **Fixed:** JWT token validation errors properly trigger server patching
-- **Fixed:** Repeated errors no longer cause infinite restart loops
+### Errors
+- **Fix:** No more crash if the Server folder is missing.
+- **Fix:** JWT errors now trigger the server patch.
 
-### Launch System
-- **Fixed:** Launcher self-update hash check filename typo
-- **Fixed:** Shortcut detection logic corrected (`IS_SHORTCUT` comparison)
-
----
-
-## Recent Improvements (February 2026)
-
-### Fresh Installation Experience
-The launcher now fully supports starting from scratch:
-- Empty folders are now accepted as valid installation paths
-- When you select a drive root like `C:\`, the launcher automatically creates a `HytaleF2P` subdirectory
-- Path detection improved to find `HytaleClient.exe` whether it's in the root or the `Client\` subfolder
-- No more "invalid path" errors when doing a clean install
-
-### Smarter Game Launch Process
-Added safety checks before starting the game:
-- Launcher verifies `HytaleClient.exe` exists at the configured path before attempting to launch
-- If the game files are missing, you're automatically taken to the repair menu instead of crashing
-- The `Patch-HytaleClient` function now skips gracefully if no client is found, preventing patch errors on incomplete installations
-
-### Download Experience Polish
-Fixed wget progress visibility:
-- Download progress bars now show up correctly in real-time during file downloads
-- Removed the stderr redirect that was hiding the `--show-progress` output
-- Better error messages when downloads fail
-
-### Minor Fixes
-- Corrected the launcher self-update hash check (was checking "game launcher.bata" instead of "game launcher.bat")
+### Other things
+- Fixed the hash check filename (no more ".bata").
+- Fixed the shortcut detection.
 
 ---
 
-## 🔧 What this PowerShell Script Fixes
+## 🔧 What this script actually fixes
 
-This script doesn't just "open" the game; it actively repairs the following problems:
+This script doesn't just open the game, it repairs everything:
 
-### 1. Permission & "Access Denied" Errors
-* **The Problem:** Windows often blocks the launcher from editing game files.
-* **The Fix:** This script uses a built-in "Self-Elevation" technique to gain the necessary permissions to move files and apply patches automatically.
+### 1. Permission and "Access Denied"
+* **The Problem:** Windows blocks the game from changing files.
+* **The Fix:** The script asks for Admin and fixes permissions itself.
 
-### 2. Missing Files & "Hytale Has Crashed"
-* **The Problem:** Antivirus programs often delete files like `Logo@2x.png`, causing a "Critical Error."
-* **The Fix:** The script performs an **Integrity Check** and re-downloads only the missing or broken files.
+### 2. Missing Files or Crashes
+* **The Problem:** Antivirus often deletes important images or files.
+* **The Fix:** The script checks all files and downloads only what is missing.
 
-### 3. Connection & "ETIMEDOUT" Issues
-* **The Problem:** Downloads fail midway due to server timeouts.
-* **The Fix:** Uses a "Resume-Capable" downloader to pick up exactly where it stopped.
+### 3. Connection and Timeout
+* **The Problem:** Download fails because the internet is slow.
+* **The Fix:** It can resume the download from where it stopped.
 
-### 4. "Server Failed to Boot" & Network Issues
-* **The Problem:** Blocked network access, corrupted cache, or failed token validation.
-* **The Fix:** **Clears UserData**, grants network permissions, and performs a **Windows Time Sync**. It also **updates the JRE files and HytaleServer.jar** to ensure a clean boot.
-  
-### 5. "Invalid Identity" & Signature Failures
-* **The Problem:** `Ed25519 signature verification failed` errors in logs.
-* **The Fix:** Detects "kid" mismatches and **re-aligns the authentication system** keys.
+### 4. "Server Failed to Boot" and Network
+* **The Problem:** Bad cache, wrong time, or network blocks.
+* **The Fix:** It clears the cache, syncs the **Windows Time**, and updates JRE.
 
-### 6. "Play" Button Disabled or Update UI Stuck
-* **The Problem:** F2P Launcher gets stuck at 0% or 60%.
-* **The Fix:** Bypasses the bug UI and **force-launches Hytale** via PowerShell.
-  
-### 7. Version Mismatch / "Server is running an older version"
-* **The Problem:** Your client version is newer than the server, preventing connection.
-* **The Fix:** Performs a **Update server.jar** to align your binaries with the server's requirements.
+### 5. "Invalid Identity"
+* **The Problem:** Login errors (Ed25519) in the logs.
+* **The Fix:** It re-aligns the keys so your login works again.
 
-### 8. World State Corruption / "World already exists on disk"
-* **The Problem:** Singleplayer servers crash because world files (like `Caves.json`) are null or corrupted, but the existing folder prevents the game from trying to generate it again.
-* **The Fix:** The script performs a **Deep World-State Purge**. It detects generation failures and automatically clears the corrupted `Saves` and `Internal/Worlds` folders to allow a clean world generation.
+### 6. Stuck at 0% or 60%
+* **The Problem:** The normal UI is buggy and gets stuck.
+* **The Fix:** It bypasses the UI and launches Hytale directly.
 
-### 9. Asset Decoding Failures / "Failed to find enum value"
-* **The Problem:** The server crashes during boot because it cannot parse certain models (e.g., `Snake_Marsh`) due to unrecognized tags like `Ophidiophobia`.
-* **The Fix:** Executes an **Asset Integrity Sync**. It identifies version conflicts between your `Assets.zip` and `HytaleServer.jar`, re-aligning them so the server can parse game data without crashing.
+### 7. Version Mismatch
+* **The Problem:** Your game is newer than the server.
+* **The Fix:** It updates the server.jar to match your game perfectly.
 
-### 10. Protocol Version Mismatch / "ALPN mismatch"
-* **The Problem:** The game client and server are speaking different network languages (e.g., `hytale/1` vs `hytale/2`), causing immediate disconnection.
-* **The Fix:** Triggers a **Protocol Handshake Alignment**. It detects the required ALPN version and updates your server binaries to ensure they match your client's protocol version.
-  
+### 8. Corrupted Worlds
+* **The Problem:** Your world file is broken and the game crashes.
+* **The Fix:** It purges the corrupted `Saves` so you can start clean.
+
+### 9. Asset Errors
+* **The Problem:** The server crashes because it doesn't understand some models.
+* **The Fix:** It syncs your `Assets.zip` with the server version.
+
+### 10. ALPN Mismatch
+* **The Problem:** Different network versions (hytale/1 vs hytale/2).
+* **The Fix:** It aligns the protocol so you can connect.
+
 ---
 
-## 📂 Auto-Recovery Error Types
+## 📂 Auto-Recovery (The Script is Smart)
 
-The launcher monitors game logs in real-time and automatically handles these specific errors:
+The script looks at the logs and fixes these things automatically:
 
-| Priority | Error Pattern | Auto-Fix Action |
-|----------|--------------|-----------------|
-| **0** | `AppMainMenu.*NullReferenceException` | Checks for missing Server directory/JAR, downloads `HytaleServer.jar` |
-| **1** | `Token validation failed` / `signature verification failed` | Downloads pre-patched server with correct authentication keys |
-| **2** | `VM Initialization Error` / `Failed setting boot class path` | Clears AOT/Prefab cache and purges corrupted JRE |
-| **3** | `Identity token has invalid issuer` | Auto-updates AUTH_URL config to match game client |
-| **4** | `IllegalArgumentException: World default already exists` | Purges corrupted singleplayer world data and cache |
-| **5** | `Failed to decode asset` / `Failed to find enum value` | Repairs conflicting model assets in the `Assets.zip` |
-| **6** | `client outdated (ALPN mismatch)` | Updates Server JAR to match Client network protocol |
-| **7** | `Server failed to boot` (generic) | Attempts HyFixes installation |
-| **∞** | Any error repeated 3+ times | **LOOP DETECTED** - Pauses for manual reporting |
+- **Missing Server JAR?** It downloads it.
+- **Token Error?** It patches the server keys.
+- **JRE Broken?** It purges the old Java and gets a new one.
+- **Wrong Issuer?** It updates the URL config.
+- **World Exists?** It clears the corrupted world data.
+- **Asset Mismatch?** It aligns the `Assets.zip`.
+- **Protocol Error?** It updates the Server protocol.
 
-### Error Detection Examples
+If it happens 3 times and still fails? **LOOP DETECTED**. It stops so it doesn't crash your PC forever.
+
+---
+
+## 📋 Menu
 
 ```
-[LOG ERROR] System.NullReferenceException: Object reference not set...
-      → [FIX] AppMainMenu NullReferenceException Detected!
-      → [ACTION] Triggering Patch-HytaleServer to download...
-
-[LOG ERROR] Token validation failed...
-      → [FIX] Server Token Validation Error Detected (Root Cause)!
-      → [ACTION] Downloading pre-patched server with correct keys...
-
-[LOG ERROR] VM Initialization Error...
-      → [AUTO-RECOVERY] Critical boot failure detected!
-      → [FIX] JRE Corruption detected. Switching to API Host JRE & purging...
-
-[LOG ERROR] Identity token has invalid issuer: expected https://sessions.sanasol.ws
-      → [FIX] Issuer Mismatch Detected!
-      → [ACTION] Updating configuration to match Game Client...
-
-[LOG ERROR] java.lang.IllegalArgumentException: World default already exists on disk!
-      → [FIX] World Corruption Detected!
-      → [ACTION] Purging corrupted save data and internal world cache...
-
-[LOG ERROR] Failed to find enum value for Ophidiophobia
-      → [FIX] Asset Mismatch Detected!
-      → [ACTION] Synchronizing Assets.zip with Server JAR...
-
-[LOG ERROR] client outdated (ALPN mismatch): ALPN hytale/1 < required 2
-      → [FIX] Protocol Mismatch Detected!
-      → [ACTION] Aligning Server Protocol Version to match Client...
-```
-
----
-
-## 📋 Menu Options
-
-```
-==========================================
-       HYTALE F2P - LAUNCHER MENU
-==========================================
-
- [1] Start Hytale F2P (Create Shortcut)
- [2] Server Menu (Host/Download)
+ [1] Start Hytale F2P
+ [2] Server Menu
  [3] Repair / Force Update
- [4] Install HyFixes (Server Crash Fixes)
- [5] Play Offline (Guest Mode)
- [6] Play Unauthenticated (No Login)
+ [4] Install HyFixes
+ [5] Play Offline
+ [6] Play Unauthenticated
 ```
 
 ---
 
-## ❓ FAQ for Users
+## ❓ Questions?
 
-**Do I need to delete my old game files before running this?**
+**Do I need to delete my game?**
+No. Just run the script, it fixes what is inside your folder.
 
-No. The script will scan your existing `HytaleF2P` folder and fix whatever is broken.
+**Why the blue window?**
+It's PowerShell. It's the best way to fix Windows problems deeply.
 
-**Why is the window blue/black text?**
-
-This is the PowerShell interface. It allows the script to perform "Low-Level" repairs that a standard window cannot do.
-
-**How do I know it's finished?**
-
-The script will show a real-time log of what it is fixing. Once it finishes the "Binary Modification," the game will launch automatically.
-
-**What does "LOOP DETECTED" mean?**
-
-If you see this message, an error is occurring repeatedly and cannot be auto-fixed. Take a screenshot and report it to the developers.
+**What is "LOOP DETECTED"?**
+It means even the script can't fix the bug. Ask for help and show the error!
