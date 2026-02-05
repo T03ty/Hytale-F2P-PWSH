@@ -308,12 +308,19 @@ if ($needsAV -or $needsSync) {
             [System.Windows.Forms.MessageBoxIcon]::Question
         )
         if ($resp -eq [System.Windows.Forms.DialogResult]::Yes) {
-            # FIX: Get the path of the actual running EXE/Process instead of the temp script file
-            $currentProcPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        if ($resp -eq [System.Windows.Forms.DialogResult]::Yes) {
+            $isExe = ($f -match '\.exe$')
             
-            # Re-launch the EXE with the required arguments and Admin verb
             try {
-                Start-Process "$currentProcPath" -ArgumentList "am_wt $EXTRA_ARGS" -Verb RunAs -ErrorAction Stop
+                if ($isExe) {
+                    # If running as compiled EXE, we must relaunch the EXE process itself
+                    $procPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+                    Start-Process "$procPath" -ArgumentList "am_wt $EXTRA_ARGS" -Verb RunAs -ErrorAction Stop
+                }
+                else {
+                    # If running as BAT, we relaunch the script trace ($f)
+                    Start-Process "$f" -ArgumentList "am_wt $EXTRA_ARGS" -Verb RunAs -ErrorAction Stop
+                }
                 exit
             } catch {
                 Write-Host "`n      [ERROR] Elevation failed: $($_.Exception.Message)" -ForegroundColor Red
@@ -347,7 +354,7 @@ if ($needsAV -or $needsSync) {
         }
     }
 }
-
+}
 # Declare shared paths (will be refined in loop)
 $cacheDir = Join-Path $localAppData "cache"
 $profilesDir = Join-Path $localAppData "profiles"
