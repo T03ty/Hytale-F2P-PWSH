@@ -308,7 +308,6 @@ if ($needsAV -or $needsSync) {
             [System.Windows.Forms.MessageBoxIcon]::Question
         )
         if ($resp -eq [System.Windows.Forms.DialogResult]::Yes) {
-        if ($resp -eq [System.Windows.Forms.DialogResult]::Yes) {
             $isExe = ($f -match '\.exe$')
             
             try {
@@ -354,7 +353,7 @@ if ($needsAV -or $needsSync) {
         }
     }
 }
-}
+
 # Declare shared paths (will be refined in loop)
 $cacheDir = Join-Path $localAppData "cache"
 $profilesDir = Join-Path $localAppData "profiles"
@@ -2317,7 +2316,7 @@ Write-Host "      UUID:    $global:pUuid" -ForegroundColor Gray
 # --- Launcher Self-Update ---
 
 try {
-    $remoteLauncherHash = Get-RemoteHash "game launcher.bat"
+    $remoteLauncherHash = Get-RemoteHash "game launcher.bata"
 } catch {
     $remoteLauncherHash = $null
 }
