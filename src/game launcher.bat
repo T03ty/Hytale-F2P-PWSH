@@ -3416,6 +3416,7 @@ if (Test-Path $gameExe) {
                         
                         $reportedErrors += $err
                         Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                        pause
                         
                         Show-NetworkFixMenu
                         
