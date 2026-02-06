@@ -164,6 +164,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIde
 
 # --- 1. GITHUB AUTO-UPDATE & DOWNLOAD LOGIC ---
 
+# --- SMART PATH DISCOVERY ---
 function Get-LauncherPath {
     # 1. Robust Directory Resolution
     $currentDir = if ($f) { Split-Path $f } else { $pwd.Path }
@@ -186,11 +187,7 @@ function Get-LauncherPath {
     }
     
     # 5. Check Local AppData (User-only installs)
-    if ($env:LOCALAPPDATA) { 
-        $searchPaths.Add((Join-Path $env:LOCALAPPDATA "Hytale F2P\Hytale F2P Launcher\$LAUNCHER_EXE_NAME")) 
-        $searchPaths.Add((Join-Path $env:LOCALAPPDATA "Hytale F2P Launcher\$LAUNCHER_EXE_NAME"))
-    }
-
+    if ($env:LOCALAPPDATA) { $searchPaths.Add((Join-Path $env:LOCALAPPDATA "HytaleF2P\Launcher\$LAUNCHER_EXE_NAME")) }
 
     # 6. Check Registry for known install locations
     $regPaths = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*")
@@ -250,21 +247,34 @@ function Ensure-LauncherExe {
     
     # --- VERSION CHECK ---
     if (Test-Path $installedFile) {
-        $localVersion = (Get-Item $installedFile).VersionInfo.ProductVersion
-        # Standardize formats (remove 'v' prefixes)
-        $cleanRemote = if ($latest) { $latest.Version -replace 'v', '' } else { "Unknown" }
-        $cleanLocal = $localVersion -replace 'v', ''
+        $localVersionStr = (Get-Item $installedFile).VersionInfo.ProductVersion
+        
+        # Clean strings (remove 'v')
+        $cleanRemote = if ($latest) { $latest.Version -replace 'v', '' } else { "0.0.0" }
+        $cleanLocal = $localVersionStr -replace 'v', ''
 
-        Write-Host "      [DEBUG] Version Check:" -ForegroundColor Gray
-        Write-Host "              Local:  $cleanLocal" -ForegroundColor DarkGray
-        Write-Host "              Remote: $cleanRemote" -ForegroundColor DarkGray
+        try {
+            # FIX: Convert to [System.Version] objects.
+            # This handles the mismatch where Windows reports "2.2.1.0" but GitHub says "2.2.1".
+            # [System.Version]"2.2.1.0" is EQUAL to [System.Version]"2.2.1"
+            $vLocal = [System.Version]$cleanLocal
+            $vRemote = [System.Version]$cleanRemote
 
-        if ($cleanLocal -eq $cleanRemote) {
-            Write-Host "      [SUCCESS] Launcher is up to date." -ForegroundColor Green
-            return # Exit function early
-        } else {
-            Write-Host "      [UPDATE] Version mismatch detected." -ForegroundColor Yellow
-            $needsUpdate = $true
+            Write-Host "      [DEBUG] Version Check:" -ForegroundColor Gray
+            Write-Host "              Local:  $vLocal" -ForegroundColor DarkGray
+            Write-Host "              Remote: $vRemote" -ForegroundColor DarkGray
+
+            if ($vLocal -ge $vRemote) {
+                Write-Host "      [SUCCESS] Launcher is up to date." -ForegroundColor Green
+                return # Exit function early
+            } else {
+                Write-Host "      [UPDATE] New version found ($vRemote)." -ForegroundColor Yellow
+                $needsUpdate = $true
+            }
+        } catch {
+            # Fallback to string comparison if version parsing fails
+            Write-Host "      [WARN] Could not parse version numbers. Performing string match." -ForegroundColor Yellow
+            if ($cleanLocal -eq $cleanRemote) { return } else { $needsUpdate = $true }
         }
     } else {
         Write-Host "      [MISSING] Launcher not installed." -ForegroundColor Yellow
