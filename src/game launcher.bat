@@ -3408,6 +3408,20 @@ if (Test-Path $gameExe) {
                 if ($reportedErrors -notcontains $err) {
                     Write-Host "`r      [LOG ERROR] $($err.Trim())" -ForegroundColor Red
                     
+                    # --- NEW: DETECT IP BLOCK / CLOUDFLARE 403 ---
+                    if ($err -match "Failed to fetch JWKS" -and ($err -match "403" -or $err -match "1106")) {
+                        Write-Host "      -> [BLOCK] Network Connection Denied (HTTP 403 / 1106)!" -ForegroundColor Red
+                        Write-Host "      -> [CAUSE] The server admin or Cloudflare has blocked your IP." -ForegroundColor Yellow
+                        Write-Host "      -> [ACTION] Opening Network Unblocker options..." -ForegroundColor Cyan
+                        
+                        $reportedErrors += $err
+                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                        
+                        Show-NetworkFixMenu
+                        
+                        $global:forceRestart = $true
+                        $stable = $false; break
+                    }
 
                     # --- PRIORITY 0: TIME SYNC / TOKEN FUTURE ERROR ---
                     $isTimeError = $err -match "Identity token was issued in the future" -or $logContent -match "Identity token was issued in the future"
