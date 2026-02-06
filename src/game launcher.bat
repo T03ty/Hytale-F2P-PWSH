@@ -61,8 +61,16 @@ exit /b
 #PS_START
 $ProgressPreference = 'SilentlyContinue'
 
-# --- SECURITY PROTOCOL (Fix for GitHub Downloads) ---
+# --- DUAL-STACK NETWORK OPTIMIZATION ---
+# 1. Force Modern Security Protocols
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+
+# 2. Tweak Connection Manager for IPv4/IPv6 Dual Stack
+# Enable DNS round robin and increase connection limits for faster parallel asset downloads
+[Net.ServicePointManager]::EnableDnsRoundRobin = $true
+[Net.ServicePointManager]::DefaultConnectionLimit = 10
+[Net.ServicePointManager]::DnsRefreshTimeout = 0 # Forces fresh lookups for multi-IP hosts
+[Net.ServicePointManager]::Expect100Continue = $false # Speeds up POST requests to API
 
 # --- Admin Detection ---
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
@@ -117,7 +125,7 @@ $global:HEADERS = @{
     'User-Agent'    = 'HytaleF2P-Client-v2.0.11';
     'X-Auth-Token'  = 'YourSuperSecretLaunchToken12345';
 }
-$API_HOST = "https://hytaleapi.online"
+$API_HOST = "https://file.hytaleapi.online"
 $AUTH_URL_SESSIONS = "https://auth.sanasol.ws"
 $global:AUTH_URL_CURRENT = $AUTH_URL_SESSIONS
 
@@ -1171,15 +1179,40 @@ function Get-LocalSha1($filePath) {
     } catch { return "ERROR" }
 }
 
-function Get-RemoteHash($fileName) {
+function Get-RemoteHash {
+    param($fileName)
     try {
-        $hashUrl = "$API_HOST/api/hash/$fileName"
-        $response = Invoke-RestMethod -Uri $hashUrl -Headers $global:HEADERS -Method Get -TimeoutSec 10
-        return $response.hash
+        # Encode filename for URL (converts spaces to %20)
+        $encodedName = [uri]::EscapeDataString($fileName)
+        $hashUrl = "$API_HOST/api/hash/$encodedName"
+        
+        $response = Invoke-RestMethod -Uri $hashUrl -Headers $global:HEADERS -Method Get -TimeoutSec 30
+        
+        if ($response.success -eq $true) {
+            return $response.hash
+        } else {
+            Write-Host "      [DEBUG] API returned success=false: $($response.error)" -ForegroundColor Gray
+            return $null
+        }
     } catch {
+        Write-Host "`n      [DEBUG HASH ERROR]" -ForegroundColor Red
+        Write-Host "      Target: $fileName" -ForegroundColor Gray
+        
+        if ($_.Exception.Response) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+            $stream = $_.Exception.Response.GetResponseStream()
+            $reader = New-Object System.IO.StreamReader($stream)
+            $body = $reader.ReadToEnd()
+            
+            Write-Host "      HTTP Status: $statusCode" -ForegroundColor Yellow
+            Write-Host "      Server Sent: $body" -ForegroundColor DarkGray
+        } else {
+            Write-Host "      Error: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
         return $null
     }
 }
+
 
 function Test-ZipValid($zipPath) {
     if (-not (Test-Path $zipPath)) { return $false }
@@ -1220,89 +1253,39 @@ function Test-FileNeedsDownload($filePath, $fileName) {
     }
 }
 
-function Download-WithProgress($url, $destination, $useHeaders=$true) {
-    # --- PHASE 1: CHECK FOR EXISTING wget.exe ---
-    # Check for REAL wget.exe (not PowerShell's alias to Invoke-WebRequest)
-    $wgetExe = Get-Command wget.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    
-    # Also check Chocolatey bin folder directly (in case PATH isn't refreshed)
-    if (-not $wgetExe) {
-        $chocoWget = "C:\ProgramData\chocolatey\bin\wget.exe"
-        if (Test-Path $chocoWget) {
-            $wgetExe = [PSCustomObject]@{ Source = $chocoWget }
-            Write-Host "      [FOUND] wget.exe in Chocolatey bin folder" -ForegroundColor Gray
-        }
-    }
-    
-    # Only try to install wget if running as admin (choco requires admin)
-    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
-    
-    if (-not $wgetExe -and $isAdmin) {
-        Write-Host "[SETUP] wget.exe not found. Installing via Chocolatey (Admin Mode)..." -ForegroundColor Yellow
-        
-        $chocoExe = "C:\ProgramData\chocolatey\bin\choco.exe"
-        if (-not (Test-Path $chocoExe)) {
-            # Check if choco is on PATH
-            $chocoCmd = Get-Command choco -ErrorAction SilentlyContinue
-            if ($chocoCmd) { $chocoExe = $chocoCmd.Source }
-        }
-        
-        if (Test-Path $chocoExe) {
-            # Run choco with timeout
-            $stdoutFile = Join-Path $env:TEMP "choco_stdout_$(Get-Random).log"
-            $stderrFile = Join-Path $env:TEMP "choco_stderr_$(Get-Random).log"
-            try {
-                $proc = Start-Process $chocoExe -ArgumentList "install wget -y --no-progress" -NoNewWindow -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
-                $completed = $proc.WaitForExit(60000)  # 60s timeout
-                
-                if (-not $completed) {
-                    Write-Host "      [TIMEOUT] Choco hung. Using HTTP fallback..." -ForegroundColor Yellow
-                    try { $proc.Kill() } catch {}
-                } else {
-                    if (Test-Path $stdoutFile) {
-                        $stdout = Get-Content $stdoutFile -Raw -ErrorAction SilentlyContinue
-                        if ($stdout -and $stdout.Length -lt 2000) { Write-Host "      [CHOCO] $stdout" -ForegroundColor Gray }
-                    }
-                    Write-Host "      [CHOCO] Exit Code: $($proc.ExitCode)" -ForegroundColor $(if ($proc.ExitCode -eq 0) { "Green" } else { "Yellow" })
-                }
-            } catch {
-                Write-Host "      [CHOCO ERROR] $($_.Exception.Message)" -ForegroundColor Yellow
-            } finally {
-                if (Test-Path $stdoutFile) { Remove-Item $stdoutFile -Force -ErrorAction SilentlyContinue }
-                if (Test-Path $stderrFile) { Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue }
-            }
-            
-            # Refresh path and re-check
-            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-            $chocoWget = "C:\ProgramData\chocolatey\bin\wget.exe"
-            if (Test-Path $chocoWget) {
-                $wgetExe = [PSCustomObject]@{ Source = $chocoWget }
-            }
-        } else {
-            Write-Host "      [SKIP] Chocolatey not installed. Using HTTP fallback..." -ForegroundColor Gray
-        }
-    } elseif (-not $wgetExe) {
-        Write-Host "      [SKIP] wget not found, not admin. Using HTTP fallback..." -ForegroundColor Gray
+function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOverwrite=$false) {
+    # --- PHASE 0: PRE-FLIGHT CLEANUP ---
+    # Ensure a fresh start if forceOverwrite is requested
+    if ($forceOverwrite -and (Test-Path $destination)) {
+        Write-Host "      [CLEANUP] Removing existing file for fresh overwrite..." -ForegroundColor Gray
+        Remove-Item $destination -Force -ErrorAction SilentlyContinue
     }
 
+    # --- PHASE 1: CHECK FOR EXISTING wget.exe ---
+    $wgetExe = Get-Command wget.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    
     # --- PHASE 2: TURBO ATTEMPT (wget.exe) ---
     if ($wgetExe) {
         Write-Host "`n[TURBO] Initializing wget high-speed transfer..." -ForegroundColor Cyan
         
+        # Ensure directory exists
         $dir = Split-Path $destination
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory $dir -Force | Out-Null }
 
         $wgetArgs = @(
-            "--continue", 
-            "--tries=5",          # Increased retries
+            "--tries=5", 
             "--timeout=30", 
             "--show-progress", 
             "--no-check-certificate", 
             "--user-agent='Mozilla/5.0'",
-            "--inet4-only"        # [FIX] Force IPv4 to avoid IPv6 routing issues
+            "--inet4-only"
         )
+
+        # Only use --continue if we are NOT forcing an overwrite
+        if (-not $forceOverwrite) { 
+            $wgetArgs += "--continue" 
+        }
         
-        # Add auth header for API Host downloads
         if ($useHeaders -and $global:HEADERS) {
             foreach ($key in $global:HEADERS.Keys) {
                 $wgetArgs += "--header=`"${key}: $($global:HEADERS[$key])`""
@@ -1312,146 +1295,78 @@ function Download-WithProgress($url, $destination, $useHeaders=$true) {
         $wgetArgs += @("-O", "`"$destination`"", "`"$url`"")
 
         try {
-            # Don't redirect stderr - let progress bar show
-            $proc = Start-Process $wgetExe.Source -ArgumentList $wgetArgs -Wait -NoNewWindow -PassThru
+            # Capture output to check for 416 errors
+            $logFile = Join-Path $env:TEMP "wget_log.txt"
+            $proc = Start-Process $wgetExe.Source -ArgumentList ($wgetArgs + "--output-file=`"$logFile`"") -Wait -NoNewWindow -PassThru
             
+            $wgetOutput = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+            if (Test-Path $logFile) { Remove-Item $logFile -Force }
+
             if ($proc.ExitCode -eq 0) {
                 Write-Host "      [SUCCESS] Turbo download complete.`n" -ForegroundColor Green
                 return $true
+            } 
+            # Detect 416 or "already fully retrieved" inside wget output
+            elseif ($wgetOutput -match "416 Requested Range Not Satisfiable" -or $wgetOutput -match "already fully retrieved") {
+                Write-Host "      [FIX] Detected partial file conflict. Forcing reset..." -ForegroundColor Yellow
+                Remove-Item $destination -Force -ErrorAction SilentlyContinue
+                # Recursive call with forceOverwrite enabled
+                return Download-WithProgress $url $destination $useHeaders $true
             }
             
-            Write-Host "      [WARN] Turbo transfer interrupted (Code: $($proc.ExitCode)).`n" -ForegroundColor Yellow
+            Write-Host "      [WARN] Turbo transfer failed (Code: $($proc.ExitCode)). Switching to Fallback...`n" -ForegroundColor Yellow
         } catch {
-            Write-Host "      [WARN] wget failed to start: $($_.Exception.Message)`n" -ForegroundColor Yellow
+            Write-Host "      [WARN] wget execution error. Using Fallback...`n" -ForegroundColor Yellow
         }
     }
 
-    # --- PHASE 3: STANDARD FALLBACK (Fixed for Exceptions) [cite: 109, 110, 112] ---
-    Write-Host "`n[FALLBACK] Starting memory-efficient streaming download..." -ForegroundColor Gray
-    
-    # Ensure modern security protocols for R2/CDN [cite: 1]
+    # --- PHASE 3: STANDARD FALLBACK ---
+    Write-Host "`n[FALLBACK] Starting streaming download..." -ForegroundColor Gray
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    
+    $client = New-Object System.Net.Http.HttpClient
+    if ($useHeaders -and $global:HEADERS) { 
+        foreach ($key in $global:HEADERS.Keys) { $client.DefaultRequestHeaders.TryAddWithoutValidation($key, $global:HEADERS[$key]) } 
+    }
 
-    # Retry Loop for Fallback Stream
-    $maxFallbackRetries = 3
-    $currentFallbackRetry = 0
-    $success = $false
+    $existingOffset = 0
+    if (-not $forceOverwrite -and (Test-Path $destination)) { $existingOffset = (Get-Item $destination).Length }
+    
+    # Only set Range header if we are actually resuming
+    if ($existingOffset -gt 0) { 
+        $client.DefaultRequestHeaders.Range = New-Object System.Net.Http.Headers.RangeHeaderValue($existingOffset, $null) 
+    }
 
-    while (-not $success -and $currentFallbackRetry -lt $maxFallbackRetries) {
-        $currentFallbackRetry++
-        if ($currentFallbackRetry -gt 1) { 
-            Write-Host "      [RETRY] Attempt $currentFallbackRetry of $maxFallbackRetries..." -ForegroundColor Yellow
-            Start-Sleep -Seconds 2
-        }
-
-        $client = New-Object System.Net.Http.HttpClient
-        $client.Timeout = [System.TimeSpan]::FromMinutes(120)
+    try {
+        $response = $client.GetAsync($url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
         
-        # Add headers BEFORE URL check (required for API Host auth)
-        if ($useHeaders -and $global:HEADERS) { 
-            foreach ($key in $global:HEADERS.Keys) { $client.DefaultRequestHeaders.TryAddWithoutValidation($key, $global:HEADERS[$key]) } 
+        # Handle 416 error in Fallback mode
+        if ($response.StatusCode -eq 416) {
+             Write-Host "      [INFO] Server rejected range. Resetting file..." -ForegroundColor Gray
+             $client.Dispose()
+             return Download-WithProgress $url $destination $useHeaders $true
         }
         
-        # Verify URL Access [cite: 111, 126] (Only on first try to save time)
-        if ($currentFallbackRetry -eq 1) {
-            try {
-                $headRequest = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Head, $url)
-                $check = $client.SendAsync($headRequest).GetAwaiter().GetResult()
-                if (-not $check.IsSuccessStatusCode) {
-                    Write-Host "      [ERROR] URL unreachable: $($check.StatusCode)" -ForegroundColor Red
-                    Write-Host "      [FIX] Your ISP might be blocking this node. Try a VPN (WARP) or DNS Change." -ForegroundColor Yellow
-                    $client.Dispose()
-                    Show-NetworkFixMenu
-                    return $false
-                }
-            } catch {
-                Write-Host "      [ERROR] Could not connect to storage node." -ForegroundColor Red
-                Write-Host "      [FIX] Connection timed out. This often means an ISP block. Try VPN/WARP." -ForegroundColor Yellow
-                
-                # Check for Time Desync
-                if (Test-TimeSync) {
-                    Write-Host "      [TIME] Your system clock is desynchronized. This breaks SSL/TLS." -ForegroundColor Yellow
-                    if ($isAdmin) { Sync-SystemTime } else { Write-Host "      [ACTION] Please fix your Date/Time settings in Windows." -ForegroundColor Red }
-                }
-
-                $client.Dispose()
-                Show-NetworkFixMenu
-                return $false
-            }
-        }
-
-        $existingOffset = 0
-        if (Test-Path $destination) { $existingOffset = (Get-Item $destination).Length }
-        
-        if ($existingOffset -gt 0) {
-            try {
-                $client.DefaultRequestHeaders.Range = New-Object System.Net.Http.Headers.RangeHeaderValue($existingOffset, $null)
-            } catch {}
-        }
-
-        try {
-            # ResponseHeadersRead prevents the memory buffering exception 
-            $response = $client.GetAsync($url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
-            
-            if ($response.StatusCode -eq [System.Net.HttpStatusCode]::RequestedRangeNotSatisfiable) {
-                 $client.Dispose()
-                 # File might be fully downloaded or corrupted, reset and retry
-                 Write-Host "      [INFO] Range not satisfiable. Resetting for fresh download..." -ForegroundColor Gray
-                 Remove-Item $destination -Force
-                 continue # Next retry iteration will start from 0
-            }
-            
-            if (-not $response.IsSuccessStatusCode) { 
-                # Don't break immediately, might be transient? NO, status code usually definitive.
-                # But let's log and retry if it's a 5xx error
-                if ([int]$response.StatusCode -ge 500) { throw "Server Error" }
-                $client.Dispose(); return $false 
-            }
-            
-            $isPartial = $response.StatusCode -eq [System.Net.HttpStatusCode]::PartialContent
-            $contentLength = $response.Content.Headers.ContentLength
-            $totalSize = if ($isPartial) { $contentLength + $existingOffset } else { $contentLength }
-            
+        if ($response.IsSuccessStatusCode) {
             $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-            $fileStream = if ($isPartial) { [System.IO.File]::Open($destination, [System.IO.FileMode]::Append) } 
-                          else { [System.IO.File]::Create($destination) }
+            # If we are resuming, Append. If not, Create.
+            $fileMode = if ($existingOffset -gt 0 -and $response.StatusCode -eq 206) { [System.IO.FileMode]::Append } else { [System.IO.FileMode]::Create }
+            $fileStream = [System.IO.File]::Open($destination, $fileMode)
             
-            $buffer = New-Object byte[] 4MB 
-            $downloaded = if ($isPartial) { $existingOffset } else { 0 }
-            $lastUpdate = $downloaded
-            $startTime = [DateTime]::Now
-            
+            $buffer = New-Object byte[] 1MB
             while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
                 $fileStream.Write($buffer, 0, $read)
-                $downloaded += $read
-                if ($downloaded -ge ($lastUpdate + 10MB) -or $downloaded -eq $totalSize) {
-                    $lastUpdate = $downloaded
-                    $percent = [math]::Floor(($downloaded / $totalSize) * 100)
-                    $elapsed = ([DateTime]::Now - $startTime).TotalSeconds
-                    $speed = if ($elapsed -gt 0) { [math]::Round(($downloaded - $existingOffset) / 1MB / $elapsed, 2) } else { 0 }
-                    $bar = ("#" * [math]::Floor($percent/5)) + ("." * (20 - [math]::Floor($percent/5)))
-                    Write-Host "`r      Progress: [$bar] $percent% ($([math]::Round($downloaded/1MB,2)) MB) @ $speed MB/s   " -NoNewline -ForegroundColor Yellow
-                }
             }
-            
-            $success = $true
-            Write-Host ""; 
-        } catch { 
-            Write-Host "`n      [DOWNLOAD EXCEPTION] $($_.Exception.Message)" -ForegroundColor Red
-            if ($_.Exception.Message -match "connected|unreachable|timeout") {
-                Write-Host "      [SUGGESTION] Networking issues detected. Suggesting Fix..." -ForegroundColor Yellow
-                Show-NetworkFixMenu
-            }
-            # Loop will retry
-            $success = $false
-        } finally { 
-            if ($fileStream) { $fileStream.Close(); $fileStream.Dispose() }
-            if ($stream) { $stream.Close(); $stream.Dispose() }
-            if ($client) { $client.Dispose() }
+            $fileStream.Close(); $stream.Close();
+            return $true
         }
+    } catch {
+        Write-Host "      [ERROR] Fallback failed: $($_.Exception.Message)" -ForegroundColor Red
+    } finally { 
+        if ($client) { $client.Dispose() }
     }
-
-    return $success
+    
+    return $false
 }
 
 function Copy-WithProgress($source, $destination) {
@@ -2315,8 +2230,11 @@ Write-Host "      UUID:    $global:pUuid" -ForegroundColor Gray
 
 # --- Launcher Self-Update ---
 
+$currentFileName = Split-Path $f -Leaf
+Write-Host "      [CHECK] Checking updates for: $currentFileName" -ForegroundColor Gray
+
 try {
-    $remoteLauncherHash = Get-RemoteHash "game launcher.bat"
+    $remoteLauncherHash = Get-RemoteHash $currentFileName
 } catch {
     $remoteLauncherHash = $null
 }
@@ -2326,30 +2244,29 @@ if (-not $remoteLauncherHash) {
     Write-Host "          Unable to check for a new launcher version." -ForegroundColor Yellow
 }
 else {
-    # $f is passed from the CMD bootstrap as the full path to this file
     $localLauncherHash = Get-LocalSha1 $f
 
     if ($localLauncherHash -ne $remoteLauncherHash) {
-        Write-Host "`n[UPDATE] A new version of the launcher is available!" -ForegroundColor Yellow
+        Write-Host "`n[UPDATE] A new version is available!" -ForegroundColor Green
+        Write-Host "          Local:  $localLauncherHash" -ForegroundColor Gray
+        Write-Host "          Remote: $remoteLauncherHash" -ForegroundColor Gray
 
         $tempLauncher = "$f.new"
+        $downloadUrl = "$API_HOST/file/game%20launcher.bat"
 
-        if (Download-WithProgress "$API_HOST/file/game%20launcher.bat" $tempLauncher $false) {
-            Write-Host "      [SUCCESS] Update downloaded. Restarting launcher..." -ForegroundColor Green
+        if (Download-WithProgress $downloadUrl $tempLauncher $false $true) {
+            Write-Host "      [SUCCESS] Update downloaded. Restarting..." -ForegroundColor Green
             Start-Sleep -Seconds 1
+            
 
-            # FIX: We use a simplified string without nested parentheses to avoid the "Unexpected token" error.
-            # We use 'start' instead of 'cmd /c' for the final step to ensure the new process detaches properly.
+            # Build the Batch-to-CMD handoff string
             $updateCmd = "timeout /t 2 >nul & move /y `"$tempLauncher`" `"$f`" & start `"`" `"$f`""
 
             try {
-                # Launch a separate CMD window to handle the file swap and restart
                 Start-Process "cmd.exe" -ArgumentList "/c $updateCmd" -WindowStyle Normal
                 exit
             } catch {
-                Write-Host "      [ERROR] Failed to restart: $($_.Exception.Message)" -ForegroundColor Red
-                Write-Host "      Please run the launcher manually to apply the update." -ForegroundColor Yellow
-                Read-Host "Press Enter to exit..."
+                Write-Host "      [ERROR] Auto-restart failed." -ForegroundColor Red
                 exit
             }
         }
