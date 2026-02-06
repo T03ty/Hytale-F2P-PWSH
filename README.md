@@ -1,6 +1,6 @@
 ![Hytale](./Image/image_hytale.png)
 
-# 🛠️ Hytale F2P: The PowerShell Fixer Script (v2.1)
+# 🛠️ Hytale F2P: The PowerShell Fixer Script (v2.2)
 **One click and your Hytale is fixed. No more environment bugs.**
 
 I made this script because the standard versions have too many problems. It fixes permissions, broken files, and gets the right Java version for you automatically. Simple.
@@ -36,6 +36,28 @@ Because I use a compiler to turn the script into an `.exe`, and because the scri
 *   **Trust:** If you are worried, just use **Option B** (the PowerShell command) instead.
 
 ---
+## ✨ New cool Features (v2.2)
+
+### 🔄 GitHub Bootstrapper (Auto-Update)
+The script now automatically monitors the `Hytale F2P Launcher.exe`.
+- **Exist Check:** It verifies if the EXE is installed in your Program Files.
+- **Auto-Install:** If missing, it automatically fetches the latest version from GitHub.
+- **Smart Update:** It compares your local file version against the GitHub API and auto-installs updates so you are always on the newest build.
+
+### 🆔 Username Availability API
+The Profile Manager now connects to `api.hytalef2p.com` in real-time to verify if your desired name is available before you change it.
+
+### 🚀 Instant Launch (Token Caching)
+The launcher now remembers your login tokens for 10 hours. If you restart the game, it bypasses the login server and opens **instantly**.
+
+### 🌐 Smart Proxy Bypass (Crawlbase)
+Are you getting **Cloudflare Error 1106** or an IP Ban? The launcher now detects this and automatically routes your login through a high-speed proxy tunnel to bypass the block.
+
+### ⚡ Dual IPv4/IPv6 Support
+The network stack is now optimized for **Dual-Stack** connections. If one protocol is slow or blocked, the script automatically switches to the fastest path to prevent "Update server unreachable" errors.
+
+### ⏰ Auto-Clean Monitoring
+The launcher stays open to catch crashes while you play. After **5 minutes** of game stability, the console will automatically clean up and close itself to save your PC's RAM.
 
 ## ✨ New cool things (v2.1)
 
@@ -101,3 +123,6 @@ It's PowerShell/CMD. It's the best way to fix Windows problems deeply without th
 
 **What is "LOOP DETECTED"?**
 It means the error is unfixable by a script. Take a screenshot of the error and ask for help!
+
+**Why is Option 1 greyed out?**
+If you are banned or have no internet, the launcher will grey out Option 1 and guide you to Option 5 (Offline Mode) so you can still play single-player.
