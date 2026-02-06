@@ -2316,7 +2316,7 @@ Write-Host "      UUID:    $global:pUuid" -ForegroundColor Gray
 # --- Launcher Self-Update ---
 
 try {
-    $remoteLauncherHash = Get-RemoteHash "game launcher.bata"
+    $remoteLauncherHash = Get-RemoteHash "game launcher.bat"
 } catch {
     $remoteLauncherHash = $null
 }
