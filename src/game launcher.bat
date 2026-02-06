@@ -164,18 +164,35 @@ $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIde
 
 # --- 1. GITHUB AUTO-UPDATE & DOWNLOAD LOGIC ---
 
-# --- SMART PATH DISCOVERY ---
 function Get-LauncherPath {
     # 1. Robust Directory Resolution
     $currentDir = if ($f) { Split-Path $f } else { $pwd.Path }
     
     $searchPaths = New-Object System.Collections.Generic.List[string]
+    
+    # 1. Check current directory (Portable)
     $searchPaths.Add((Join-Path $currentDir $LAUNCHER_EXE_NAME))
     
+    # 2. Check "Hytale F2P\Hytale F2P Launcher" (Old Installer Path)
     if ($env:ProgramFiles) { $searchPaths.Add((Join-Path $env:ProgramFiles "Hytale F2P\Hytale F2P Launcher\$LAUNCHER_EXE_NAME")) }
-    if ($env:LOCALAPPDATA) { $searchPaths.Add((Join-Path $env:LOCALAPPDATA "HytaleF2P\Launcher\$LAUNCHER_EXE_NAME")) }
+    
+    # 3. Check "Hytale F2P Launcher" (New Installer Path)
+    if ($env:ProgramFiles) { $searchPaths.Add((Join-Path $env:ProgramFiles "Hytale F2P Launcher\$LAUNCHER_EXE_NAME")) }
+    
+    # 4. Check x86 paths
+    if (${env:ProgramFiles(x86)}) { 
+        $searchPaths.Add((Join-Path ${env:ProgramFiles(x86)} "Hytale F2P\Hytale F2P Launcher\$LAUNCHER_EXE_NAME"))
+        $searchPaths.Add((Join-Path ${env:ProgramFiles(x86)} "Hytale F2P Launcher\$LAUNCHER_EXE_NAME")) 
+    }
+    
+    # 5. Check Local AppData (User-only installs)
+    if ($env:LOCALAPPDATA) { 
+        $searchPaths.Add((Join-Path $env:LOCALAPPDATA "Hytale F2P\Hytale F2P Launcher\$LAUNCHER_EXE_NAME")) 
+        $searchPaths.Add((Join-Path $env:LOCALAPPDATA "Hytale F2P Launcher\$LAUNCHER_EXE_NAME"))
+    }
 
-    # Check Registry for Hytale F2P entries
+
+    # 6. Check Registry for known install locations
     $regPaths = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*")
     foreach ($reg in $regPaths) {
         Get-ItemProperty $reg -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match "Hytale F2P" } | ForEach-Object {
@@ -183,6 +200,7 @@ function Get-LauncherPath {
         }
     }
 
+    # Return the first one that actually exists
     foreach ($path in $searchPaths) {
         if (-not [string]::IsNullOrEmpty($path) -and (Test-Path $path)) { return $path }
     }
@@ -193,8 +211,8 @@ function Get-LauncherPath {
 $global:LAUNCHER_PATH = Get-LauncherPath
 
 if (-not $global:LAUNCHER_PATH) {
-    # If not found, assume the standard Program Files location for version checking context
-    $global:LAUNCHER_PATH = Join-Path $env:ProgramFiles "Hytale F2P\Hytale F2P Launcher\$LAUNCHER_EXE_NAME"
+    # If not found, default to the NEW path format for the installer check
+    $global:LAUNCHER_PATH = Join-Path $env:ProgramFiles "Hytale F2P Launcher\$LAUNCHER_EXE_NAME"
     Write-Host "      [INFO] Launcher not found. Defaulting check path: $global:LAUNCHER_PATH" -ForegroundColor Gray
 } else {
     Write-Host "      [FOUND] Launcher located at: $global:LAUNCHER_PATH" -ForegroundColor Green
@@ -207,8 +225,10 @@ function Get-LatestLauncherInfo {
         Write-Host "      [CHECK] Querying GitHub for latest Launcher version..." -ForegroundColor Gray
         $uri = "https://api.github.com/repos/$GITHUB_REPO/releases/latest"
         $release = Invoke-RestMethod -Uri $uri -TimeoutSec 10
+        
         # Look for the asset containing "installer" or ".exe"
         $asset = $release.assets | Where-Object { $_.name -match "\.exe$" } | Select-Object -First 1
+        
         if ($asset) {
             return @{ 
                 Version = $release.tag_name; 
@@ -231,7 +251,7 @@ function Ensure-LauncherExe {
     # --- VERSION CHECK ---
     if (Test-Path $installedFile) {
         $localVersion = (Get-Item $installedFile).VersionInfo.ProductVersion
-        # Standardize formats (remove 'v' prefixes if present)
+        # Standardize formats (remove 'v' prefixes)
         $cleanRemote = if ($latest) { $latest.Version -replace 'v', '' } else { "Unknown" }
         $cleanLocal = $localVersion -replace 'v', ''
 
@@ -241,7 +261,7 @@ function Ensure-LauncherExe {
 
         if ($cleanLocal -eq $cleanRemote) {
             Write-Host "      [SUCCESS] Launcher is up to date." -ForegroundColor Green
-            return # Exit function early, nothing to do
+            return # Exit function early
         } else {
             Write-Host "      [UPDATE] Version mismatch detected." -ForegroundColor Yellow
             $needsUpdate = $true
@@ -253,13 +273,11 @@ function Ensure-LauncherExe {
 
     if ($needsUpdate -and $latest) {
         # --- PREPARE INSTALLER DOWNLOAD ---
-        # We download to TEMP, not the game folder, because it is an Installer
         $installerPath = Join-Path $env:TEMP "HytaleF2P_Setup_$($latest.Version).exe"
         
         Write-Host "`n[DOWNLOAD] Fetching Installer ($($latest.Name))..." -ForegroundColor Cyan
         
         try {
-            # Use Download-WithProgress if available, otherwise fallback
             if (Get-Command "Download-WithProgress" -ErrorAction SilentlyContinue) {
                 # Pass $true for overwrite to ensure fresh installer
                 Download-WithProgress $latest.Url $installerPath $false $true
@@ -272,7 +290,6 @@ function Ensure-LauncherExe {
                 Write-Host "      [INFO] Follow the on-screen instructions to update/install." -ForegroundColor Yellow
                 
                 # Run the installer and wait for it to close
-                # If your installer supports silent mode, add arguments like "/VERYSILENT" here
                 $proc = Start-Process -FilePath $installerPath -Wait -PassThru
                 
                 Write-Host "      [SUCCESS] Installation process finished (Code: $($proc.ExitCode))." -ForegroundColor Green
