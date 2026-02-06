@@ -166,7 +166,9 @@ $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIde
 
 # --- SMART PATH DISCOVERY ---
 function Get-LauncherPath {
+    # 1. Robust Directory Resolution
     $currentDir = if ($f) { Split-Path $f } else { $pwd.Path }
+    
     $searchPaths = New-Object System.Collections.Generic.List[string]
     $searchPaths.Add((Join-Path $currentDir $LAUNCHER_EXE_NAME))
     
@@ -191,8 +193,9 @@ function Get-LauncherPath {
 $global:LAUNCHER_PATH = Get-LauncherPath
 
 if (-not $global:LAUNCHER_PATH) {
+    # If not found, assume the standard Program Files location for version checking context
     $global:LAUNCHER_PATH = Join-Path $env:ProgramFiles "Hytale F2P\Hytale F2P Launcher\$LAUNCHER_EXE_NAME"
-    Write-Host "      [INFO] Launcher not found. Defaulting path: $global:LAUNCHER_PATH" -ForegroundColor Gray
+    Write-Host "      [INFO] Launcher not found. Defaulting check path: $global:LAUNCHER_PATH" -ForegroundColor Gray
 } else {
     Write-Host "      [FOUND] Launcher located at: $global:LAUNCHER_PATH" -ForegroundColor Green
 }
@@ -204,11 +207,13 @@ function Get-LatestLauncherInfo {
         Write-Host "      [CHECK] Querying GitHub for latest Launcher version..." -ForegroundColor Gray
         $uri = "https://api.github.com/repos/$GITHUB_REPO/releases/latest"
         $release = Invoke-RestMethod -Uri $uri -TimeoutSec 10
-        $asset = $release.assets | Where-Object { $_.name -match "launcher" -and $_.name -match "\.exe$" } | Select-Object -First 1
+        # Look for the asset containing "installer" or ".exe"
+        $asset = $release.assets | Where-Object { $_.name -match "\.exe$" } | Select-Object -First 1
         if ($asset) {
             return @{ 
                 Version = $release.tag_name; 
-                Url = $asset.browser_download_url 
+                Url = $asset.browser_download_url;
+                Name = $asset.name
             }
         }
     } catch {
@@ -219,16 +224,13 @@ function Get-LatestLauncherInfo {
 
 function Ensure-LauncherExe {
     $latest = Get-LatestLauncherInfo
-    $targetFile = $global:LAUNCHER_PATH
+    $installedFile = $global:LAUNCHER_PATH
     
-    if ([string]::IsNullOrEmpty($targetFile)) { return }
-    $targetDir = Split-Path $targetFile
-
-    $needsDownload = $false
+    $needsUpdate = $false
     
-    # --- START VERSION DEBUGGER ---
-    if (Test-Path $targetFile) {
-        $localVersion = (Get-Item $targetFile).VersionInfo.ProductVersion
+    # --- VERSION CHECK ---
+    if (Test-Path $installedFile) {
+        $localVersion = (Get-Item $installedFile).VersionInfo.ProductVersion
         # Standardize formats (remove 'v' prefixes if present)
         $cleanRemote = if ($latest) { $latest.Version -replace 'v', '' } else { "Unknown" }
         $cleanLocal = $localVersion -replace 'v', ''
@@ -242,51 +244,49 @@ function Ensure-LauncherExe {
             return # Exit function early, nothing to do
         } else {
             Write-Host "      [UPDATE] Version mismatch detected." -ForegroundColor Yellow
-            $needsDownload = $true
+            $needsUpdate = $true
         }
     } else {
-        Write-Host "      [MISSING] Launcher EXE not found at target path." -ForegroundColor Yellow
-        $needsDownload = $true
+        Write-Host "      [MISSING] Launcher not installed." -ForegroundColor Yellow
+        $needsUpdate = $true
     }
-    # --- END VERSION DEBUGGER ---
 
-    if ($needsDownload -and $latest) {
-        # --- AUTO-ELEVATION REQUEST ---
-        if ($targetFile -match "Program Files" -and -not $isAdmin) {
-            Write-Host "`n[!] Admin privileges required to update the Launcher in Program Files." -ForegroundColor Yellow
-            
-            Add-Type -AssemblyName System.Windows.Forms
-            $msg = "A new version of the Hytale F2P Launcher ($($latest.Version)) is available, but it requires Administrator privileges to update files in Program Files.`n`nWould you like to elevate now to install the update?"
-            $resp = [System.Windows.Forms.MessageBox]::Show($msg, "Launcher Update Required", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
-            
-            if ($resp -eq [System.Windows.Forms.DialogResult]::Yes) {
-                $isExe = ($f -match '\.exe$')
-                try {
-                    $procPath = if ($isExe) { [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } else { $f }
-                    Start-Process "$procPath" -ArgumentList "am_wt $EXTRA_ARGS" -Verb RunAs -ErrorAction Stop
-                    exit
-                } catch {
-                    Write-Host "      [ERROR] Elevation failed: $($_.Exception.Message)" -ForegroundColor Red
-                    Start-Sleep -Seconds 3
-                }
-            }
-            Write-Host "      [SKIP] Update cancelled by user." -ForegroundColor Gray
-            return
-        }
-
-        # --- PROCEED WITH DOWNLOAD ---
-        Write-Host "`n[DOWNLOAD] Fetching Hytale F2P Launcher $($latest.Version)..." -ForegroundColor Cyan
-        if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+    if ($needsUpdate -and $latest) {
+        # --- PREPARE INSTALLER DOWNLOAD ---
+        # We download to TEMP, not the game folder, because it is an Installer
+        $installerPath = Join-Path $env:TEMP "HytaleF2P_Setup_$($latest.Version).exe"
+        
+        Write-Host "`n[DOWNLOAD] Fetching Installer ($($latest.Name))..." -ForegroundColor Cyan
         
         try {
+            # Use Download-WithProgress if available, otherwise fallback
             if (Get-Command "Download-WithProgress" -ErrorAction SilentlyContinue) {
-                Download-WithProgress $latest.Url $targetFile $false $true
+                # Pass $true for overwrite to ensure fresh installer
+                Download-WithProgress $latest.Url $installerPath $false $true
             } else {
-                Invoke-WebRequest -Uri $latest.Url -OutFile $targetFile -UseBasicParsing
+                Invoke-WebRequest -Uri $latest.Url -OutFile $installerPath -UseBasicParsing
             }
-            Write-Host "      [SUCCESS] Launcher updated to version $($latest.Version)" -ForegroundColor Green
+
+            if (Test-Path $installerPath) {
+                Write-Host "      [INSTALL] Running Installer..." -ForegroundColor Cyan
+                Write-Host "      [INFO] Follow the on-screen instructions to update/install." -ForegroundColor Yellow
+                
+                # Run the installer and wait for it to close
+                # If your installer supports silent mode, add arguments like "/VERYSILENT" here
+                $proc = Start-Process -FilePath $installerPath -Wait -PassThru
+                
+                Write-Host "      [SUCCESS] Installation process finished (Code: $($proc.ExitCode))." -ForegroundColor Green
+                
+                # Cleanup the installer file
+                Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+                
+                # Re-check if the file exists now
+                if (Test-Path $installedFile) {
+                    Write-Host "      [READY] New version installed." -ForegroundColor Green
+                }
+            }
         } catch {
-            Write-Host "      [ERROR] Download failed: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "      [ERROR] Failed to download or run installer: $($_.Exception.Message)" -ForegroundColor Red
         }
     }
 }
