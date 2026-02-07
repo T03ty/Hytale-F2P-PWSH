@@ -155,6 +155,62 @@ $pathConfigFile = Join-Path $localAppData "path_config.json"
 # --- Admin Detection ---
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
 
+
+
+
+
+
+# --- Launcher Self-Update ---
+
+try {
+    # Skip self-update if running as a compiled EXE (to avoid process lock errors)
+    if ($f -match '\.exe$') { return }
+    
+    $currentFileName = Split-Path $f -Leaf
+    Write-Host "      [CHECK] Checking updates for: $currentFileName" -ForegroundColor Gray
+    
+    $remoteLauncherHash = Get-RemoteHash $currentFileName
+} catch {
+    $remoteLauncherHash = $null
+}
+# --if (-not $remoteLauncherHash) 
+if (-not $remoteLauncherHash) {
+    Write-Host "`n[WARNING] Update server is unreachable." -ForegroundColor Yellow
+    Write-Host "          Unable to check for a new launcher version." -ForegroundColor Yellow
+}
+else {
+    $localLauncherHash = Get-LocalSha1 $f
+
+    if ($localLauncherHash -ne $remoteLauncherHash) {
+        Write-Host "`n[UPDATE] A new version is available!" -ForegroundColor Green
+        Write-Host "          Local:  $localLauncherHash" -ForegroundColor Gray
+        Write-Host "          Remote: $remoteLauncherHash" -ForegroundColor Gray
+
+        $tempLauncher = "$f.new"
+        $downloadUrl = "$API_HOST/file/game%20launcher.bat"
+
+        if (Download-WithProgress $downloadUrl $tempLauncher $false $true) {
+            Write-Host "      [SUCCESS] Update downloaded. Restarting..." -ForegroundColor Green
+            Start-Sleep -Seconds 1
+            
+            
+            
+
+            # Build the Batch-to-CMD handoff string
+            $updateCmd = "timeout /t 2 >nul & move /y `"$tempLauncher`" `"$f`" & start `"`" `"$f`""
+
+            try {
+                Start-Process "cmd.exe" -ArgumentList "/c $updateCmd" -WindowStyle Normal
+                exit
+            } catch {
+                Write-Host "      [ERROR] Auto-restart failed." -ForegroundColor Red
+                exit
+            }
+        }
+    }
+}
+
+
 # --- 1. GITHUB AUTO-UPDATE & DOWNLOAD LOGIC ---
 
 # --- SMART PATH DISCOVERY ---
@@ -492,19 +548,23 @@ if ($needsAV -or $needsSync) {
             [System.Windows.Forms.MessageBoxIcon]::Question
         )
         if ($resp -eq [System.Windows.Forms.DialogResult]::Yes) {
-            $isExe = ($f -match '\.exe$')
-            
             try {
-                if ($isExe) {
-                    # If running as compiled EXE, we must relaunch the EXE process itself
-                    $procPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-                    Start-Process "$procPath" -ArgumentList "am_wt" -Verb RunAs -ErrorAction Stop
+                # SMART DETECTION: Always use the current process's executable path
+                # This works for: Standalone EXE, BAT-to-EXE wrapper, or direct BAT execution
+                $currentExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+                
+                # Check if we're running inside a BAT-to-EXE wrapper or as PowerShell
+                $isPowerShell = $currentExe -match "powershell|pwsh"
+                
+                if ($isPowerShell) {
+                    # Running directly as BAT/PS1, need to launch cmd with the script
+                    # Use proper escaping for paths with spaces
+                    Start-Process "cmd.exe" -ArgumentList "/c `"`"$f`" am_wt`"" -Verb RunAs -ErrorAction Stop
+                } else {
+                    # Running as compiled EXE (or BAT-to-EXE wrapper) - relaunch the EXE itself
+                    Start-Process $currentExe -ArgumentList "am_wt" -Verb RunAs -ErrorAction Stop
                 }
-                else {
-                    # If running as BAT, we MUST launch via cmd.exe for proper execution
-                    $safePath = $f -replace '"', '\"'
-                    Start-Process "cmd.exe" -ArgumentList "/c `"$safePath`" am_wt" -Verb RunAs -ErrorAction Stop
-                }
+                
                 Write-Host "      [ELEVATING] Launching elevated instance..." -ForegroundColor Cyan
                 Start-Sleep -Milliseconds 500
                 exit
@@ -2467,57 +2527,6 @@ Write-Host "      UUID:    $global:pUuid" -ForegroundColor Gray
 
 
 
-
-
-# --- Launcher Self-Update ---
-
-try {
-    # Skip self-update if running as a compiled EXE (to avoid process lock errors)
-    if ($f -match '\.exe$') { return }
-    
-    $currentFileName = Split-Path $f -Leaf
-    Write-Host "      [CHECK] Checking updates for: $currentFileName" -ForegroundColor Gray
-    
-    $remoteLauncherHash = Get-RemoteHash $currentFileName
-} catch {
-    $remoteLauncherHash = $null
-}
-# --if (-not $remoteLauncherHash) 
-if (-not $remoteLauncherHash) {
-    Write-Host "`n[WARNING] Update server is unreachable." -ForegroundColor Yellow
-    Write-Host "          Unable to check for a new launcher version." -ForegroundColor Yellow
-}
-else {
-    $localLauncherHash = Get-LocalSha1 $f
-
-    if ($localLauncherHash -ne $remoteLauncherHash) {
-        Write-Host "`n[UPDATE] A new version is available!" -ForegroundColor Green
-        Write-Host "          Local:  $localLauncherHash" -ForegroundColor Gray
-        Write-Host "          Remote: $remoteLauncherHash" -ForegroundColor Gray
-
-        $tempLauncher = "$f.new"
-        $downloadUrl = "$API_HOST/file/game%20launcher.bat"
-
-        if (Download-WithProgress $downloadUrl $tempLauncher $false $true) {
-            Write-Host "      [SUCCESS] Update downloaded. Restarting..." -ForegroundColor Green
-            Start-Sleep -Seconds 1
-            pause
-            
-            
-
-            # Build the Batch-to-CMD handoff string
-            $updateCmd = "timeout /t 2 >nul & move /y `"$tempLauncher`" `"$f`" & start `"`" `"$f`""
-
-            try {
-                Start-Process "cmd.exe" -ArgumentList "/c $updateCmd" -WindowStyle Normal
-                exit
-            } catch {
-                Write-Host "      [ERROR] Auto-restart failed." -ForegroundColor Red
-                exit
-            }
-        }
-    }
-}
 
 
 
