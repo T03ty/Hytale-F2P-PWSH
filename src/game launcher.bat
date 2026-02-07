@@ -155,62 +155,6 @@ $pathConfigFile = Join-Path $localAppData "path_config.json"
 # --- Admin Detection ---
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
 
-
-
-
-
-
-# --- Launcher Self-Update ---
-
-try {
-    # Skip self-update if running as a compiled EXE (to avoid process lock errors)
-    if ($f -match '\.exe$') { return }
-    
-    $currentFileName = Split-Path $f -Leaf
-    Write-Host "      [CHECK] Checking updates for: $currentFileName" -ForegroundColor Gray
-    
-    $remoteLauncherHash = Get-RemoteHash $currentFileName
-} catch {
-    $remoteLauncherHash = $null
-}
-# --if (-not $remoteLauncherHash) 
-if (-not $remoteLauncherHash) {
-    Write-Host "`n[WARNING] Update server is unreachable." -ForegroundColor Yellow
-    Write-Host "          Unable to check for a new launcher version." -ForegroundColor Yellow
-}
-else {
-    $localLauncherHash = Get-LocalSha1 $f
-
-    if ($localLauncherHash -ne $remoteLauncherHash) {
-        Write-Host "`n[UPDATE] A new version is available!" -ForegroundColor Green
-        Write-Host "          Local:  $localLauncherHash" -ForegroundColor Gray
-        Write-Host "          Remote: $remoteLauncherHash" -ForegroundColor Gray
-
-        $tempLauncher = "$f.new"
-        $downloadUrl = "$API_HOST/file/game%20launcher.bat"
-
-        if (Download-WithProgress $downloadUrl $tempLauncher $false $true) {
-            Write-Host "      [SUCCESS] Update downloaded. Restarting..." -ForegroundColor Green
-            Start-Sleep -Seconds 1
-            
-            
-            
-
-            # Build the Batch-to-CMD handoff string
-            $updateCmd = "timeout /t 2 >nul & move /y `"$tempLauncher`" `"$f`" & start `"`" `"$f`""
-
-            try {
-                Start-Process "cmd.exe" -ArgumentList "/c $updateCmd" -WindowStyle Normal
-                exit
-            } catch {
-                Write-Host "      [ERROR] Auto-restart failed." -ForegroundColor Red
-                exit
-            }
-        }
-    }
-}
-
-
 # --- 1. GITHUB AUTO-UPDATE & DOWNLOAD LOGIC ---
 
 # --- SMART PATH DISCOVERY ---
@@ -2527,6 +2471,57 @@ Write-Host "      UUID:    $global:pUuid" -ForegroundColor Gray
 
 
 
+
+
+# --- Launcher Self-Update ---
+
+try {
+    # Skip self-update if running as a compiled EXE (to avoid process lock errors)
+    if ($f -match '\.exe$') { return }
+    
+    $currentFileName = Split-Path $f -Leaf
+    Write-Host "      [CHECK] Checking updates for: $currentFileName" -ForegroundColor Gray
+    
+    $remoteLauncherHash = Get-RemoteHash $currentFileName
+} catch {
+    $remoteLauncherHash = $null
+}
+# --if (-not $remoteLauncherHash) 
+if (-not $remoteLauncherHash) {
+    Write-Host "`n[WARNING] Update server is unreachable." -ForegroundColor Yellow
+    Write-Host "          Unable to check for a new launcher version." -ForegroundColor Yellow
+}
+else {
+    $localLauncherHash = Get-LocalSha1 $f
+
+    if ($localLauncherHash -ne $remoteLauncherHash) {
+        Write-Host "`n[UPDATE] A new version is available!" -ForegroundColor Green
+        Write-Host "          Local:  $localLauncherHash" -ForegroundColor Gray
+        Write-Host "          Remote: $remoteLauncherHash" -ForegroundColor Gray
+
+        $tempLauncher = "$f.new"
+        $downloadUrl = "$API_HOST/file/game%20launcher.bat"
+
+        if (Download-WithProgress $downloadUrl $tempLauncher $false $true) {
+            Write-Host "      [SUCCESS] Update downloaded. Restarting..." -ForegroundColor Green
+            Start-Sleep -Seconds 1
+            pause
+            
+            
+
+            # Build the Batch-to-CMD handoff string
+            $updateCmd = "timeout /t 2 >nul & move /y `"$tempLauncher`" `"$f`" & start `"`" `"$f`""
+
+            try {
+                Start-Process "cmd.exe" -ArgumentList "/c $updateCmd" -WindowStyle Normal
+                exit
+            } catch {
+                Write-Host "      [ERROR] Auto-restart failed." -ForegroundColor Red
+                exit
+            }
+        }
+    }
+}
 
 
 
