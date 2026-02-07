@@ -50,8 +50,7 @@ if not "%~1"=="am_wt" (
     )
 )
 
-:: 3. CRASH-PROOF LOADER
-:: Optimized to prevent header leakage and ensure $f is always valid.
+:: 3. LOADER - Writes to temp .ps1 for real line numbers (HALTS on error)
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$f = [System.IO.Path]::GetFullPath('%~f0'); " ^
     "$t = Get-Content -LiteralPath $f -Raw; " ^
@@ -59,17 +58,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$i = $t.IndexOf($m); " ^
     "if($i -lt 0) { Write-Host 'Marker not found!' -ForegroundColor Red; exit 1 } " ^
     "$s = $t.Substring($i + $m.Length); " ^
-    "try { Invoke-Expression $s } catch { " ^
-    "  Write-Host ' ' ; " ^
-    "  Write-Host '==================================================' -ForegroundColor Red; " ^
-    "  Write-Host '        CRITICAL LAUNCHER ERROR' -ForegroundColor Red; " ^
-    "  Write-Host '==================================================' -ForegroundColor Red; " ^
-    "  Write-Host ('Error    : ' + $_.Exception.Message) -ForegroundColor White; " ^
-    "  Write-Host ('Location : ' + $_.InvocationInfo.PositionMessage) -ForegroundColor Yellow; " ^
-    "  Write-Host '==================================================' -ForegroundColor Red; " ^
-    "  Write-Host 'Press any key to exit...' -ForegroundColor Gray; " ^
-    "  [void][System.Console]::ReadKey($true); exit 1 " ^
-    "}"
+    "$ps1 = Join-Path $env:TEMP 'hytale_launcher.ps1'; " ^
+    "if(Test-Path $ps1){ Remove-Item $ps1 -Force }; " ^
+    "\"`$ErrorActionPreference = 'Stop'`n`$f = '$($f -replace \"'\",\"''\")'`n\" + $s | Out-File $ps1 -Encoding UTF8 -Force; " ^
+    "& $ps1"
+if errorlevel 1 pause
 exit /b
 #>
 
@@ -505,15 +498,19 @@ if ($needsAV -or $needsSync) {
                 if ($isExe) {
                     # If running as compiled EXE, we must relaunch the EXE process itself
                     $procPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-                    Start-Process "$procPath" -ArgumentList "am_wt $EXTRA_ARGS" -Verb RunAs -ErrorAction Stop
+                    Start-Process "$procPath" -ArgumentList "am_wt" -Verb RunAs -ErrorAction Stop
                 }
                 else {
-                    # If running as BAT, we relaunch the script trace ($f)
-                    Start-Process "$f" -ArgumentList "am_wt $EXTRA_ARGS" -Verb RunAs -ErrorAction Stop
+                    # If running as BAT, we MUST launch via cmd.exe for proper execution
+                    $safePath = $f -replace '"', '\"'
+                    Start-Process "cmd.exe" -ArgumentList "/c `"$safePath`" am_wt" -Verb RunAs -ErrorAction Stop
                 }
+                Write-Host "      [ELEVATING] Launching elevated instance..." -ForegroundColor Cyan
+                Start-Sleep -Milliseconds 500
                 exit
             } catch {
                 Write-Host "`n      [ERROR] Elevation failed: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "      [TIP] Try running this launcher as Administrator manually." -ForegroundColor Yellow
                 Start-Sleep -Seconds 3
             }
         }
@@ -914,7 +911,7 @@ function Restore-WorldSaves($userDataPath) {
 function Update-PlayerIdentityInSaves($userDataPath, $newUuid, $newName) {
     if (-not $userDataPath) { return }
     $savesDir = Join-Path $userDataPath "Saves"
-    $backupRoot = Join-Path $global:PublicConfig "WorldBackups"
+    $backupRoot = Join-Path $PublicConfig "WorldBackups"
     
     $updateDir = { param($monitorDir, $targetUuid, $targetName)
         if (-not (Test-Path $monitorDir)) { return }
@@ -971,7 +968,7 @@ function Update-PlayerIdentityInSaves($userDataPath, $newUuid, $newName) {
 function Sync-PlayerIdentityFromSaves($userDataPath) {
     if (-not $userDataPath) { return $false }
     $savesDir = Join-Path $userDataPath "Saves"
-    $backupRoot = Join-Path $global:PublicConfig "WorldBackups"
+    $backupRoot = Join-Path $PublicConfig "WorldBackups"
     
     $processSavesRecursive = { param($monitorDir)
         if (-not (Test-Path $monitorDir)) { return $false }
@@ -999,12 +996,12 @@ function Sync-PlayerIdentityFromSaves($userDataPath) {
                             $global:pUuid = $extractedUuid
                             
                             # Sync persistence
-                            $idFile = Join-Path $global:PublicConfig "player_id.json"
-                            if (-not (Test-Path $global:PublicConfig)) { New-Item -ItemType Directory $global:PublicConfig -Force | Out-Null }
+                            $idFile = Join-Path $PublicConfig "player_id.json"
+                            if (-not (Test-Path $PublicConfig)) { New-Item -ItemType Directory $PublicConfig -Force | Out-Null }
                             
                             @{ playerId = $extractedUuid; createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") } | ConvertTo-Json | Out-File $idFile -Encoding UTF8 -Force
                             
-                            $cfgFile = Join-Path $global:PublicConfig "config_data.json"
+                            $cfgFile = Join-Path $PublicConfig "config_data.json"
                             if (Test-Path $cfgFile) {
                                 try {
                                     $json = Get-Content $cfgFile -Raw | ConvertFrom-Json
@@ -1282,11 +1279,6 @@ function Assert-DiskSpace($path, $requiredBytes) {
     return $true
 }
 
-function Get-LocalSha256($filePath) {
-    if (-not (Test-Path $filePath)) { return "MISSING" }
-    try { return (Get-FileHash $filePath -Algorithm SHA256).Hash } catch { return "ERROR" }
-}
-
 function Find-SystemJava {
     $candidates = @()
     if ($env:JAVA_HOME) { $candidates += Join-Path $env:JAVA_HOME "bin\java.exe" }
@@ -1377,9 +1369,9 @@ function Save-Config {
 }
 
 function Get-LocalSha1($filePath) {
-    if (-not (Test-Path $filePath)) { return "MISSING" }
-    $hashCacheFile = $filePath + ".hashcache"
     try {
+        if (-not (Test-Path $filePath)) { return "MISSING" }
+        $hashCacheFile = $filePath + ".hashcache"
         $lastModified = (Get-Item $filePath).LastWriteTime.Ticks
         if (Test-Path $hashCacheFile) {
             $cache = Get-Content $hashCacheFile -Raw | ConvertFrom-Json
@@ -1389,7 +1381,14 @@ function Get-LocalSha1($filePath) {
         $cacheObj = @{ hash = $actualHash; lastModified = $lastModified }
         $cacheObj | ConvertTo-Json | Out-File $hashCacheFile
         return $actualHash
-    } catch { return "ERROR" }
+    } catch { return "MISSING" }
+}
+
+function Safe-TestPath($path) {
+    try {
+        if ([string]::IsNullOrEmpty($path)) { return $false }
+        return (Test-Path $path)
+    } catch { return $false }
 }
 
 function Get-RemoteHash {
@@ -2540,6 +2539,13 @@ while ($true) {
         } catch {}
     }
 
+    # REFRESH GAME PATH (Critical: After updates, the path may have changed)
+    $gameExe = Resolve-GamePath
+    if (-not $gameExe) {
+        # If still not found, default to standard path
+        $gameExe = Join-Path $localAppData "release\package\game\latest\Client\HytaleClient.exe"
+    }
+
     # REFRESH DYNAMIC PATHS based on current $gameExe
     $launcherRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $localAppData }
     $appDir = Join-Path $launcherRoot "release\package\game\latest"
@@ -2589,7 +2595,7 @@ while ($true) {
     }
 
     # 3. Decision Tree
-    if ((Test-Path $gameExe) -and -not $global:forceShowMenu) {
+    if ((Safe-TestPath $gameExe) -and -not $global:forceShowMenu) {
         # AUTO-LAUNCH (Both F2P and PWR)
         if ($f2pMatch) {
             Write-Host "[2/2] Auto-Launching Hytale F2P..." -ForegroundColor Cyan
@@ -2648,7 +2654,7 @@ while ($true) {
         
     } else {
         # SHOW MENU ONLY IF MISSING OR RECOVERY NEEDED
-        if (-not (Test-Path $gameExe)) {
+        if (-not (Safe-TestPath $gameExe)) {
             Write-Host "[!] Hytale is not installed or files are missing." -ForegroundColor Red
         } elseif (-not $f2pMatch) {
             Write-Host "[!] Local version does not match F2P server." -ForegroundColor Yellow
@@ -2684,10 +2690,10 @@ while ($true) {
         elseif ($choice -ne "2") { exit }
     }
 
-# --- LAUNCH SEQUENCE ---
+    # --- LAUNCH SEQUENCE ---
 
     # Final Readiness Guard: Verify all critical files exist right before launch
-    if (-not (Test-Path $gameExe)) {
+    if (-not (Safe-TestPath $gameExe)) {
         Write-Host "`n[ERROR] Game Executable (HytaleClient.exe) is missing!" -ForegroundColor Red
         Write-Host "        Redirecting to Repair menu..." -ForegroundColor Cyan
         $forceShowMenu = $true; continue
@@ -3612,14 +3618,6 @@ if (Test-Path $gameExe) {
              Write-Host "`n[INFO] Game Process Exited (Zero Memory). Closing." -ForegroundColor Gray
              $stable = $true
              break 
-            # Force menu to show for repair AND auto-select option [2]
-            Write-Host "      [ACTION] Auto-triggering F2P redownload..." -ForegroundColor Yellow
-            $global:assetsVerified = $false
-            $global:forceRestart = $true
-            $global:autoRepairTriggered = $true  # NEW: Auto-select repair option
-            $global:forceShowMenu = $true  # Make it global so it persists
-            $stable = $false
-            break
         }
         
 
