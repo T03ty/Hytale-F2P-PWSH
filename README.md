@@ -1,6 +1,6 @@
 ![Hytale](./Image/image_hytale.png)
 
-# 🛠️ Hytale F2P: The PowerShell Fixer Script (v2.2)
+# 🛠️ Hytale F2P: The PowerShell Fixer Script (v2.3)
 **One click and your Hytale is fixed. No more environment bugs.**
 
 I made this script because the standard versions have too many problems. It fixes permissions, broken files, and gets the right Java version for you automatically. Simple.
