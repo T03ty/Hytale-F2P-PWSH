@@ -103,6 +103,22 @@ try {
         public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     }
 
+    // Console Mode Control (Quick Edit Toggle)
+    public class Kernel32 {
+        public const int STD_INPUT_HANDLE = -10;
+        public const uint ENABLE_QUICK_EDIT_MODE = 0x0040;
+        public const uint ENABLE_EXTENDED_FLAGS = 0x0080;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GetStdHandle(int nStdHandle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+    }
+
     public class ByteUtils {
         public static List<int> FindPattern(byte[] fileBytes, byte[] pattern) {
             List<int> positions = new List<int>();
@@ -155,6 +171,241 @@ $pathConfigFile = Join-Path $localAppData "path_config.json"
 # --- Admin Detection ---
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
 
+# --- Quick Edit Mode Control ---
+# Disables Quick Edit during automated operations to prevent console freeze on click
+# Re-enables when user input is needed (menus)
+$global:originalConsoleMode = $null
+
+function Set-QuickEditMode {
+    param([bool]$Enable = $true)
+    try {
+        $handle = [Kernel32]::GetStdHandle([Kernel32]::STD_INPUT_HANDLE)
+        $mode = 0
+        [Kernel32]::GetConsoleMode($handle, [ref]$mode) | Out-Null
+        
+        # Store original mode on first call
+        if ($null -eq $global:originalConsoleMode) {
+            $global:originalConsoleMode = $mode
+        }
+        
+        if ($Enable) {
+            # Enable Quick Edit (for menus)
+            $mode = $mode -bor [Kernel32]::ENABLE_QUICK_EDIT_MODE
+        } else {
+            # Disable Quick Edit (for automated operations)
+            $mode = $mode -band (-bnot [Kernel32]::ENABLE_QUICK_EDIT_MODE)
+        }
+        $mode = $mode -bor [Kernel32]::ENABLE_EXTENDED_FLAGS
+        [Kernel32]::SetConsoleMode($handle, $mode) | Out-Null
+    } catch {
+        # Silently fail - not critical
+    }
+}
+
+# Disable Quick Edit at startup (prevents console freeze during automated operations)
+Set-QuickEditMode $false
+
+# --- Interactive Menu with Mouse Click Support ---
+# Works in Windows Terminal with mouse clicks, falls back to keyboard for legacy consoles
+
+# Enable Virtual Terminal Processing and Mouse Input
+function Enable-MouseSupport {
+    $success = $false
+    try {
+        # Enable VT processing on stdout
+        $hOut = [Kernel32]::GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        $outMode = 0
+        [Kernel32]::GetConsoleMode($hOut, [ref]$outMode) | Out-Null
+        $ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        $outMode = $outMode -bor $ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        [Kernel32]::SetConsoleMode($hOut, $outMode) | Out-Null
+        
+        # Enable VT input and mouse on stdin
+        $hIn = [Kernel32]::GetStdHandle(-10)  # STD_INPUT_HANDLE
+        $inMode = 0
+        [Kernel32]::GetConsoleMode($hIn, [ref]$inMode) | Out-Null
+        $global:originalInputMode = $inMode
+        
+        $ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+        $ENABLE_MOUSE_INPUT = 0x0010
+        $ENABLE_WINDOW_INPUT = 0x0008
+        
+        # Add mouse and VT input, but keep other modes
+        $inMode = $inMode -bor $ENABLE_VIRTUAL_TERMINAL_INPUT -bor $ENABLE_MOUSE_INPUT -bor $ENABLE_WINDOW_INPUT
+        # Must disable Quick Edit for mouse to work
+        $inMode = $inMode -band (-bnot 0x0040)  # Disable ENABLE_QUICK_EDIT_MODE
+        $inMode = $inMode -bor 0x0080  # ENABLE_EXTENDED_FLAGS
+        
+        [Kernel32]::SetConsoleMode($hIn, $inMode) | Out-Null
+        $success = $true
+    } catch { }
+    return $success
+}
+
+function Restore-InputMode {
+    try {
+        if ($global:originalInputMode) {
+            $hIn = [Kernel32]::GetStdHandle(-10)
+            [Kernel32]::SetConsoleMode($hIn, $global:originalInputMode) | Out-Null
+        }
+    } catch { }
+}
+
+# Initialize mouse support at startup
+$global:mouseEnabled = Enable-MouseSupport
+
+# Safe Read-Host wrapper that disables mouse tracking first
+function Safe-ReadHost {
+    param([string]$Prompt)
+    
+    # Disable mouse tracking before Read-Host
+    $ESC = [char]27
+    [Console]::Write("$ESC[?1000l$ESC[?1006l")
+    
+    # Clear any buffered mouse input
+    Start-Sleep -Milliseconds 50
+    while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
+    
+    # Now safe to call Read-Host
+    return Read-Host $Prompt
+}
+
+function Show-InteractiveMenu {
+    param(
+        [string[]]$Options,
+        [string]$Title = "Select an option:",
+        [int]$Default = 0,
+        [switch]$ShowNumbers = $true
+    )
+    
+    $selected = $Default
+    $optionCount = $Options.Count
+    $ESC = [char]27
+    
+    # 1. Detect Modern Terminals
+    $isWindowsTerminal = ($env:WT_SESSION -or $env:TERM_PROGRAM -eq "vscode") -and $global:mouseEnabled
+    
+    # 2. Enhanced Legacy Detection
+    $isLegacyConsole = $false
+    if (-not $env:WT_SESSION -and -not $env:TERM_PROGRAM) {
+        try {
+            $currentProc = Get-CimInstance Win32_Process -Filter "ProcessId=$PID"
+            $parentProcId = $currentProc.ParentProcessId
+            if ($parentProcId) {
+                $parentProc = Get-Process -Id $parentProcId -ErrorAction SilentlyContinue
+                if ($parentProc) {
+                    $pPath = $parentProc.Path
+                    if ($pPath -match "System32\\cmd\.exe" -or $pPath -match "SysWOW64\\cmd\.exe" -or $parentProc.ProcessName -eq "conhost") {
+                        $isLegacyConsole = $true
+                    }
+                }
+            }
+        } catch { $isLegacyConsole = $true }
+    }
+
+    # Fallback for Legacy Consoles (CMD.exe / System32)
+    if ($isLegacyConsole) {
+        Write-Host "`n  $Title" -ForegroundColor Cyan
+        Write-Host ""
+        for ($i = 0; $i -lt $optionCount; $i++) {
+            $prefix = if ($ShowNumbers) { "[$($i+1)]" } else { "   " }
+            if ($i -eq $Default) { Write-Host "  $prefix $($Options[$i]) (default)" -ForegroundColor Yellow }
+            else { Write-Host "  $prefix $($Options[$i])" -ForegroundColor White }
+        }
+        Write-Host ""
+        $input = Read-Host "  Enter choice (1-$optionCount) [$($Default+1)]"
+        if ([string]::IsNullOrWhiteSpace($input)) { return $Default }
+        
+        $choice = 0 # Fix: Initialize for [ref]
+        if ([int]::TryParse($input, [ref]$choice)) {
+            $choice--
+            if ($choice -ge 0 -and $choice -lt $optionCount) { return $choice }
+        }
+        return $Default
+    }
+    
+    # --- Modern VT/Mouse Logic ---
+    $startRow = [Console]::CursorTop
+    $script:menuFirstRow = 0 
+    
+    function Render-Menu {
+        param([int]$sel)
+        [Console]::SetCursorPosition(0, $startRow)
+        Write-Host "`n  $Title" -ForegroundColor Cyan
+        Write-Host ""
+        $script:menuFirstRow = $startRow + 3 
+        
+        for ($i = 0; $i -lt $optionCount; $i++) {
+            $prefix = if ($ShowNumbers) { "[$($i+1)]" } else { "   " }
+            if ($i -eq $sel) {
+                Write-Host "  $prefix $($Options[$i])   " -ForegroundColor Black -BackgroundColor Cyan -NoNewline
+                Write-Host " <--" -ForegroundColor Green
+            } else {
+                Write-Host "  $prefix $($Options[$i])                    " -ForegroundColor White
+            }
+        }
+        $hint = if ($isWindowsTerminal) { "(Click, W/S or Arrows, 1-$optionCount)" } else { "(W/S/Arrows + Enter, 1-$optionCount)" }
+        Write-Host "`n  $hint" -ForegroundColor DarkGray
+    }
+    
+    if ($isWindowsTerminal) { [Console]::Write("$ESC[?1000h$ESC[?1006h") }
+    Render-Menu $selected
+    Start-Sleep -Milliseconds 150
+    while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
+    
+    try {
+        while ($true) {
+            $keyInfo = [Console]::ReadKey($true)
+            $keyChar = $keyInfo.KeyChar
+            $keyCode = $keyInfo.Key
+            
+            # Escape Sequences (Mouse)
+            if ([int]$keyChar -eq 27) {
+                $seq = ""
+                $timeout = [DateTime]::Now.AddMilliseconds(50)
+                while ([Console]::KeyAvailable -and [DateTime]::Now -lt $timeout) { $seq += [Console]::ReadKey($true).KeyChar }
+                if ([string]::IsNullOrEmpty($seq)) { return -1 }
+                if ($seq -match '\[<(\d+);(\d+);(\d+)([Mm])') {
+                    $btn = [int]$Matches[1]; $row = [int]$Matches[3]; $isRelease = $Matches[4] -eq 'm'
+                    if ($btn -eq 64) { $selected = if ($selected -gt 0) { $selected - 1 } else { $optionCount - 1 }; Render-Menu $selected; continue }
+                    if ($btn -eq 65) { $selected = if ($selected -lt $optionCount - 1) { $selected + 1 } else { 0 }; Render-Menu $selected; continue }
+                    if ($isRelease -and ($btn -eq 0 -or $btn -eq 32)) {
+                        $menuRow = $row - $script:menuFirstRow - 1
+                        if ($menuRow -ge 0 -and $menuRow -lt $optionCount) { $selected = $menuRow; Render-Menu $selected; return $selected }
+                    }
+                }
+                continue
+            }
+            
+            # --- FIXED INPUT DETECTION ---
+            # 1. Check by ConsoleKey Enum
+            if ($keyCode -eq [System.ConsoleKey]::UpArrow -or $keyCode -eq [System.ConsoleKey]::W) {
+                $selected = if ($selected -gt 0) { $selected - 1 } else { $optionCount - 1 }; Render-Menu $selected
+            }
+            elseif ($keyCode -eq [System.ConsoleKey]::DownArrow -or $keyCode -eq [System.ConsoleKey]::S) {
+                $selected = if ($selected -lt $optionCount - 1) { $selected + 1 } else { 0 }; Render-Menu $selected
+            }
+            elseif ($keyCode -eq [System.ConsoleKey]::Enter -or $keyCode -eq [System.ConsoleKey]::Spacebar) {
+                return $selected
+            }
+            elseif ($keyCode -eq [System.ConsoleKey]::Escape) {
+                return -1
+            }
+            # 2. Check by KeyChar (Robust fallback for Enter/Space)
+            elseif ([int]$keyChar -eq 13 -or [int]$keyChar -eq 32) {
+                return $selected
+            }
+            # 3. Number Keys
+            elseif ($keyChar -ge '1' -and $keyChar -le '9') {
+                $num = [int]$keyChar.ToString() - 1
+                if ($num -ge 0 -and $num -lt $optionCount) { $selected = $num; Render-Menu $selected; return $selected }
+            }
+        }
+    } finally {
+        if ($isWindowsTerminal) { [Console]::Write("$ESC[?1000l$ESC[?1006l") }
+    }
+}
+
 # --- 1. GITHUB AUTO-UPDATE & DOWNLOAD LOGIC ---
 
 # --- SMART PATH DISCOVERY ---
@@ -180,7 +431,12 @@ function Get-LauncherPath {
     }
     
     # 5. Check Local AppData (User-only installs)
-    if ($env:LOCALAPPDATA) { $searchPaths.Add((Join-Path $env:LOCALAPPDATA "HytaleF2P\Launcher\$LAUNCHER_EXE_NAME")) }
+    if ($env:LOCALAPPDATA) { 
+        $searchPaths.Add((Join-Path $env:LOCALAPPDATA "HytaleF2P\Launcher\$LAUNCHER_EXE_NAME"))
+        # Common user-level install path (AppData\Local\Programs)
+        $searchPaths.Add((Join-Path $env:LOCALAPPDATA "Programs\Hytale F2P Launcher\$LAUNCHER_EXE_NAME"))
+        $searchPaths.Add((Join-Path $env:LOCALAPPDATA "Programs\Hytale F2P\Hytale F2P Launcher\$LAUNCHER_EXE_NAME"))
+    }
 
     # 6. Check Registry for known install locations
     $regPaths = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*")
@@ -1480,6 +1736,40 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
     # --- PHASE 1: CHECK FOR EXISTING wget.exe ---
     $wgetExe = Get-Command wget.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     
+    # --- PHASE 1.5: AUTO-INSTALL wget IF ADMIN ---
+    if (-not $wgetExe -and $global:isAdmin) {
+        # Check if winget is available
+        $wingetExe = Get-Command winget -CommandType Application -ErrorAction SilentlyContinue
+        if ($wingetExe) {
+            Write-Host "`n[SETUP] wget not found. Installing via winget (requires admin)..." -ForegroundColor Yellow
+            try {
+                $installResult = Start-Process winget -ArgumentList "install --id GNU.Wget2 --accept-source-agreements --accept-package-agreements --silent" -Wait -NoNewWindow -PassThru
+                if ($installResult.ExitCode -eq 0) {
+                    Write-Host "      [SUCCESS] wget installed successfully!" -ForegroundColor Green
+                    # Refresh PATH and re-check for wget
+                    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+                    $wgetExe = Get-Command wget.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if (-not $wgetExe) {
+                        # Try common install paths
+                        $commonPaths = @(
+                            "$env:ProgramFiles\GnuWin32\bin\wget.exe",
+                            "$env:ProgramFiles(x86)\GnuWin32\bin\wget.exe",
+                            "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\*\wget*.exe"
+                        )
+                        foreach ($path in $commonPaths) {
+                            $found = Get-ChildItem $path -ErrorAction SilentlyContinue | Select-Object -First 1
+                            if ($found) { $wgetExe = $found; break }
+                        }
+                    }
+                } else {
+                    Write-Host "      [WARN] winget install returned code $($installResult.ExitCode)" -ForegroundColor Yellow
+                }
+            } catch {
+                Write-Host "      [WARN] Failed to install wget: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+    }
+    
     # --- PHASE 2: TURBO ATTEMPT (wget.exe) ---
     if ($wgetExe) {
         Write-Host "`n[TURBO] Initializing wget high-speed transfer..." -ForegroundColor Cyan
@@ -1817,12 +2107,28 @@ function Ensure-JRE($launcherRoot, $cacheDir) {
         try {
             Write-Host "      [METADATA] Fetching JRE release info..." -ForegroundColor Cyan
             $json = Invoke-RestMethod -Uri $metadataUrl -Headers @{ "User-Agent" = "Mozilla/5.0" }
-            $release = $json.download_url.windows.amd64
-            $jreDownloadUrl = $release.url
-            $jreSha256 = $release.sha256
-            if ($jreDownloadUrl) { $useOfficial = $true }
+            
+            # Parse nested structure carefully (bracket notation for reliability)
+            $downloadUrls = $json.download_url
+            if ($downloadUrls -and $downloadUrls.windows -and $downloadUrls.windows.amd64) {
+                $release = $downloadUrls.windows.amd64
+                $jreDownloadUrl = $release.url
+                $jreSha256 = $release.sha256
+                
+                if ($jreDownloadUrl) {
+                    Write-Host "      [METADATA] Version: $($json.version)" -ForegroundColor Gray
+                    Write-Host "      [METADATA] URL: $jreDownloadUrl" -ForegroundColor Gray
+                    $useOfficial = $true
+                } else {
+                    Write-Host "      [WARN] Official JRE URL is empty in metadata." -ForegroundColor Yellow
+                    $useOfficial = $false
+                }
+            } else {
+                Write-Host "      [WARN] Official JRE metadata missing windows.amd64 entry." -ForegroundColor Yellow
+                $useOfficial = $false
+            }
         } catch {
-            Write-Host "      [ERROR] Failed to fetch JRE metadata from official server." -ForegroundColor Red
+            Write-Host "      [ERROR] Failed to fetch JRE metadata: $($_.Exception.Message)" -ForegroundColor Red
             $useOfficial = $false
         }
     }
@@ -1920,20 +2226,24 @@ function Ensure-JRE($launcherRoot, $cacheDir) {
     
     if (Expand-WithProgress $jreZip $tempDir) {
         
-        # Analyze Structure
-        $srcJre = Join-Path $tempDir "jre"
-        $srcLatest = Join-Path $srcJre "latest"
-        
         # Nuke target JRE to ensure clean slate (User Request)
-        if (Test-Path $jreDir) { Remove-Item $jreDir -Recurse -Force }
+        if (Test-Path $jreDir) { 
+            try { Remove-Item $jreDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+            # If normal remove fails, try robocopy empty technique
+            if (Test-Path $jreDir) {
+                $emptyDir = Join-Path $cacheDir "empty_cleanup"
+                New-Item -ItemType Directory $emptyDir -Force -ErrorAction SilentlyContinue | Out-Null
+                robocopy $emptyDir $jreDir /MIR /NFL /NDL /NJH /NJS /nc /ns /np 2>&1 | Out-Null
+                Remove-Item $emptyDir -Force -ErrorAction SilentlyContinue
+                Remove-Item $jreDir -Force -ErrorAction SilentlyContinue
+            }
+        }
         
         # Ensure parent package dir exists
         $packageDir = Split-Path $jreDir
         if (-not (Test-Path $packageDir)) { New-Item -ItemType Directory $packageDir -Force | Out-Null }
         
         Write-Host "      [INSTALL] Normalizing directory structure..." -ForegroundColor Gray
-        
-        if (-not (Test-Path $javaLatest)) { New-Item -ItemType Directory $javaLatest -Force | Out-Null }
 
         # Smart-Detect: Find the 'bin' folder containing 'java.exe' (search deep for any structure)
         $javaCands = Get-ChildItem -Path $tempDir -Filter "java.exe" -Recurse -Depth 10 -ErrorAction SilentlyContinue
@@ -1944,15 +2254,45 @@ function Ensure-JRE($launcherRoot, $cacheDir) {
             $jreRoot = $validJava.Directory.Parent.FullName
             Write-Host "      [FIX] Found JRE Root at: $(Split-Path $jreRoot -Leaf)" -ForegroundColor DarkGray
             
-            # Move contents of $jreRoot to $javaLatest
-            Get-ChildItem -Path $jreRoot | Move-Item -Destination $javaLatest -Force
+            # Ensure target exists
+            if (-not (Test-Path $javaLatest)) { New-Item -ItemType Directory $javaLatest -Force | Out-Null }
+            
+            # FIX: Use robocopy instead of Move-Item (handles read-only files like 'legal' folder)
+            # robocopy /MOVE /E = move all files and subdirectories
+            $robocopyResult = robocopy "$jreRoot" "$javaLatest" /MOVE /E /NFL /NDL /NJH /NJS /nc /ns /np 2>&1
+            
+            # Robocopy exit codes: 0-7 are success (bits indicate what happened)
+            if ($LASTEXITCODE -gt 7) {
+                Write-Host "      [WARN] Robocopy returned code $LASTEXITCODE, trying fallback..." -ForegroundColor Yellow
+                # Fallback: Copy-Item with -Force (slower but more compatible)
+                try {
+                    Copy-Item -Path "$jreRoot\*" -Destination $javaLatest -Recurse -Force -ErrorAction Stop
+                } catch {
+                    Write-Host "      [ERROR] Copy operation failed: $_" -ForegroundColor Red
+                }
+            }
         } else {
-             # Fallback: Just move everything if no obvious structure
-             Get-ChildItem $tempDir | Move-Item -Destination $javaLatest -Force
+            # Fallback: Just copy everything if no obvious structure
+            if (-not (Test-Path $javaLatest)) { New-Item -ItemType Directory $javaLatest -Force | Out-Null }
+            
+            # Use robocopy for reliable copy
+            $robocopyResult = robocopy "$tempDir" "$javaLatest" /MOVE /E /NFL /NDL /NJH /NJS /nc /ns /np 2>&1
+            if ($LASTEXITCODE -gt 7) {
+                Copy-Item -Path "$tempDir\*" -Destination $javaLatest -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
         
-        # Cleanup Temp
-        if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
+        # Cleanup Temp (use robocopy for stubborn files)
+        if (Test-Path $tempDir) { 
+            try { Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+            if (Test-Path $tempDir) {
+                $emptyDir = Join-Path $cacheDir "empty_cleanup"
+                New-Item -ItemType Directory $emptyDir -Force -ErrorAction SilentlyContinue | Out-Null
+                robocopy $emptyDir $tempDir /MIR /NFL /NDL /NJH /NJS /nc /ns /np 2>&1 | Out-Null
+                Remove-Item $emptyDir -Force -ErrorAction SilentlyContinue
+                Remove-Item $tempDir -Force -ErrorAction SilentlyContinue
+            }
+        }
         
         # Final Verification
         if (Test-Path $javaPath) {
@@ -2144,17 +2484,18 @@ function Show-NetworkFixMenu {
         Write-Host "==========================================" -ForegroundColor Yellow
         Write-Host "       NETWORK FIXES / UNBLOCKER" -ForegroundColor Yellow
         Write-Host "==========================================" -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host " [1] Use Cloudflare DNS (1.1.1.1) - Recommended" -ForegroundColor Cyan
-        Write-Host " [2] Use Google DNS (8.8.8.8)" -ForegroundColor Cyan
-        Write-Host " [3] Reset DNS to Automatic" -ForegroundColor Gray
-        Write-Host " [4] Install Cloudflare WARP VPN (Best for blocks)" -ForegroundColor Magenta
-        Write-Host " [5] Sync System Time (Fixes SSL/TLS Errors)" -ForegroundColor Yellow
-        Write-Host " [0] Back (Resume)" -ForegroundColor DarkGray
-        Write-Host ""
         
-        $netChoice = Read-Host " Select an option [0]"
-        if ($netChoice -eq "") { $netChoice = "0" }
+        $netOptions = @(
+            "Use Cloudflare DNS (1.1.1.1) - Recommended",
+            "Use Google DNS (8.8.8.8)",
+            "Reset DNS to Automatic",
+            "Install Cloudflare WARP VPN (Best for blocks)",
+            "Sync System Time (Fixes SSL/TLS Errors)",
+            "Back (Resume)"
+        )
+        
+        $netIdx = Show-InteractiveMenu -Options $netOptions -Title "Select network fix:" -Default 5
+        $netChoice = if ($netIdx -eq 5 -or $netIdx -eq -1) { "0" } else { ($netIdx + 1).ToString() }
         
         switch ($netChoice) {
             "1" { Set-GameDNS "Cloudflare"; Pause }
@@ -2178,17 +2519,18 @@ function Show-ProfileMenu {
         Write-Host "      Current Profile:" -ForegroundColor Gray
         Write-Host "      Name: $global:pName" -ForegroundColor Cyan
         Write-Host "      UUID: $global:pUuid" -ForegroundColor DarkGray
-        Write-Host ""
-        Write-Host " [1] Change Username" -ForegroundColor Green
-        Write-Host " [2] Change UUID (Manual)" -ForegroundColor Yellow
-        Write-Host " [3] Regenerate UUID (Random)" -ForegroundColor Cyan
-        Write-Host " [4] Sync from Save URL (Import Identity)" -ForegroundColor White
-        Write-Host " [5] Overwrite all Worlds with current Profile" -ForegroundColor Magenta
-        Write-Host " [0] Back to Main Menu" -ForegroundColor DarkGray
-        Write-Host ""
         
-        $pChoice = Read-Host " Select an option [0]"
-        if ($pChoice -eq "") { $pChoice = "0" }
+        $profileOptions = @(
+            "Change Username",
+            "Change UUID (Manual)",
+            "Regenerate UUID (Random)",
+            "Sync from Save URL (Import Identity)",
+            "Overwrite all Worlds with current Profile",
+            "Back to Main Menu"
+        )
+        
+        $pIdx = Show-InteractiveMenu -Options $profileOptions -Title "Select profile action:" -Default 5
+        $pChoice = if ($pIdx -eq 5 -or $pIdx -eq -1) { "0" } else { ($pIdx + 1).ToString() }
         
         # Pre-resolve UserData path for sync operations
         $lRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $localAppData }
@@ -2197,7 +2539,7 @@ function Show-ProfileMenu {
 
         switch ($pChoice) {
             "1" {
-                $newName = Read-Host "`n      Enter new Username"
+                $newName = Safe-ReadHost "`n      Enter new Username"
                 if ($newName -and $newName.Trim().Length -gt 0) {
                     $cleanName = $newName.Trim()
                     
@@ -2245,7 +2587,7 @@ function Show-ProfileMenu {
                 Start-Sleep -Seconds 2
             }
             "2" {
-                $newUuid = Read-Host "`n      Enter new UUID"
+                $newUuid = Safe-ReadHost "`n      Enter new UUID"
                 if ($newUuid -match "^[0-9a-fA-F\-]{36}$") {
                     $global:pUuid = $newUuid
                     Write-Host "      [SUCCESS] UUID updated!" -ForegroundColor Green
@@ -2360,7 +2702,7 @@ function Invoke-OfficialUpdate($latestVer) {
         if ($localPatch) {
             Write-Host "`n      [FOUND] Existing Official Patch found:" -ForegroundColor Green
             Write-Host "      $localPatch" -ForegroundColor Gray
-            $importChoice = Read-Host "      Import local file instead of downloading $(if ($localPatch -notmatch $pwrName) { '(Warning: Version mismatch)' })? (y/n)"
+            $importChoice = Safe-ReadHost "      Import local file instead of downloading $(if ($localPatch -notmatch $pwrName) { '(Warning: Version mismatch)' })? (y/n)"
             if ($importChoice -eq "y") {
                 if (Copy-WithProgress $localPatch $pwrPath) {
                     Write-Host "      [SUCCESS] Patch imported locally." -ForegroundColor Green
@@ -2634,13 +2976,17 @@ while ($true) {
                     if (Invoke-OfficialUpdate $latestVer) { continue }
                 } else {
                     Write-Host "`n[UPDATE] A new Official Version ($latestVer) is available!" -ForegroundColor Yellow
-                    $uChoice = Read-Host "          Do you want to update the game? (y/n) [y]"
-                    if ($uChoice -eq "n") {
+                    
+                    $updateOptions = @("Yes, update now", "No, keep current version")
+                    $updateIdx = Show-InteractiveMenu -Options $updateOptions -Title "Do you want to update the game?" -Default 0
+                    
+                    if ($updateIdx -eq 1) {
                         Write-Host "      [SKIP] Proceeding with current version." -ForegroundColor Gray
                         $global:pwrVersion = $latestVer; $global:pwrHash = $localHash; Save-Config
                     } else {
-                        $autoU = Read-Host "          Do you want to auto-update games when you launch the game? (y/n)"
-                        if ($autoU -eq "y") { $global:autoUpdate = $true; Save-Config }
+                        $autoOptions = @("Yes, auto-update on launch", "No, ask each time")
+                        $autoIdx = Show-InteractiveMenu -Options $autoOptions -Title "Enable auto-update on launch?" -Default 1
+                        if ($autoIdx -eq 0) { $global:autoUpdate = $true; Save-Config }
                         
                         if (Invoke-OfficialUpdate $latestVer) { 
                             Write-Host "      [INFO] Update applied successfully." -ForegroundColor Green
@@ -2672,18 +3018,17 @@ while ($true) {
         }
 
         Write-Host "`nAvailable Actions:" -ForegroundColor White
-        Write-Host " [1] Download Official Hytale Patches (PWR)" -ForegroundColor White
-        Write-Host " [2] Attempt Force Launch anyway" -ForegroundColor Gray
         
         # Auto-select option [1] if triggered by Assets error
         if ($global:autoRepairTriggered) {
-            Write-Host "`n[AUTO-REPAIR] Automatically selecting option [1] to fix Assets..." -ForegroundColor Magenta
+            Write-Host "[AUTO-REPAIR] Automatically selecting Download to fix Assets..." -ForegroundColor Magenta
             $choice = "1"
             $global:autoRepairTriggered = $false  # Reset flag
             Start-Sleep -Seconds 2
         } else {
-            $choice = Read-Host "`n Select an option [1]"
-            if ($choice -eq "") { $choice = "1" }
+            $actionOptions = @("Download Official Hytale Patches (PWR)", "Attempt Force Launch anyway")
+            $actionIdx = Show-InteractiveMenu -Options $actionOptions -Title "Select action:" -Default 0
+            $choice = ($actionIdx + 1).ToString()
         }
 
         if ($choice -eq "1") {
@@ -2718,14 +3063,34 @@ while ($true) {
             $shortcutPath = "$env:USERPROFILE\Desktop\Hytale F2P.lnk"
             if (-not (Test-Path $shortcutPath)) {
                 Write-Host "      [SETUP] Creating Desktop Shortcut..." -ForegroundColor Yellow
+                Write-Host "              Target: $targetBat" -ForegroundColor DarkGray
+                Write-Host "              Icon: $iconPath" -ForegroundColor DarkGray
+                
                 $wShell = New-Object -ComObject WScript.Shell
                 $shortcut = $wShell.CreateShortcut($shortcutPath)
-                $shortcut.TargetPath = $targetBat
-                $shortcut.Arguments = "am_shortcut" # This flag tells the script to skip the menu next time
-                $shortcut.IconLocation = $iconPath
-                $shortcut.WindowStyle = 1
+                
+                # For .bat files, use cmd.exe /C to run them
+                $shortcut.TargetPath = "cmd.exe"
+                $shortcut.Arguments = "/C `"$targetBat`" am_shortcut"
+                
+                # Set working directory to the script's folder
+                $shortcut.WorkingDirectory = Split-Path $targetBat
+                
+                # Set icon with index (,0 = first icon)
+                if ($iconPath -and (Test-Path $iconPath)) {
+                    $shortcut.IconLocation = "$iconPath,0"
+                }
+                
+                $shortcut.WindowStyle = 1  # Normal window
+                $shortcut.Description = "Hytale F2P Launcher"
                 $shortcut.Save()
+                
+                # Release COM object
+                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($wShell) | Out-Null
+                
                 Write-Host "      [SUCCESS] Shortcut created on Desktop." -ForegroundColor Green
+            } else {
+                Write-Host "      [INFO] Shortcut already exists." -ForegroundColor DarkGray
             }
         } catch {
             Write-Host "      [WARN] Could not create shortcut: $($_.Exception.Message)" -ForegroundColor DarkGray
@@ -2904,37 +3269,42 @@ while ($true) {
             Write-Host "==========================================" -ForegroundColor Cyan
             Write-Host "       HYTALE F2P - LAUNCHER MENU" -ForegroundColor Cyan
             Write-Host "==========================================" -ForegroundColor Cyan
-            Write-Host ""
-
-            # --- OPTION 1: DYNAMIC STYLING (Grey out if Offline or Blocked) ---
+            
+            # Build menu options dynamically
+            $menuOptions = @()
+            
+            # Option 1: Start Hytale F2P
             if ($global:offlineMode) {
-                Write-Host " [1] Start Hytale F2P (Create Shortcut) [OFFLINE]" -ForegroundColor DarkGray
+                $menuOptions += "Start Hytale F2P [OFFLINE]"
             } elseif ($global:ispBlocked) {
-                Write-Host " [1] Start Hytale F2P (Create Shortcut) [BLOCKED]" -ForegroundColor DarkGray
+                $menuOptions += "Start Hytale F2P [BLOCKED]"
             } else {
-                Write-Host " [1] Start Hytale F2P (Create Shortcut)" -ForegroundColor Green
+                $menuOptions += "Start Hytale F2P (Create Shortcut)"
             }
-
-            Write-Host " [2] Server Menu (Host/Download)" -ForegroundColor Yellow
-            Write-Host " [3] Repair / Force Update" -ForegroundColor Red
-            Write-Host " [4] Install HyFixes (Server Crash Fixes)" -ForegroundColor Cyan
             
-            # Highlight Offline mode if it is active
+            $menuOptions += "Server Menu (Host/Download)"
+            $menuOptions += "Repair / Force Update"
+            $menuOptions += "Install HyFixes (Server Crash Fixes)"
+            
+            # Option 5: Offline Mode
             if ($global:offlineMode) {
-                Write-Host " [5] Play Offline (Guest Mode) [ACTIVE]" -ForegroundColor Green
+                $menuOptions += "Play Offline (Guest Mode) [ACTIVE]"
             } else {
-                Write-Host " [5] Play Offline (Guest Mode)" -ForegroundColor Magenta
+                $menuOptions += "Play Offline (Guest Mode)"
             }
-
-            Write-Host " [6] Change Game Installation Path" -ForegroundColor Blue
-            Write-Host " [7] Profile Manager (Change Name/UUID)" -ForegroundColor White
-            Write-Host ""
             
-            $menuChoice = Read-Host " Select an option [1]"
-            if ($menuChoice -eq "") { 
-                # Smart default: if offline, default to 5. Otherwise default to 1.
-                $menuChoice = if ($global:offlineMode) { "5" } else { "1" } 
-            }
+            $menuOptions += "Change Game Installation Path"
+            $menuOptions += "Profile Manager (Change Name/UUID)"
+            
+            # Smart default: if offline, default to option 5 (index 4), else 1 (index 0)
+            $defaultIdx = if ($global:offlineMode) { 4 } else { 0 }
+            
+            $selectedIdx = Show-InteractiveMenu -Options $menuOptions -Title "Click or select an option:" -Default $defaultIdx
+            
+            # Map index back to menu choice (1-based)
+            $menuChoice = ($selectedIdx + 1).ToString()
+            
+            if ($selectedIdx -eq -1) { continue }  # Escape pressed
         }
         
         # Auto-Repair: Reset flag after selection is made
@@ -2959,15 +3329,16 @@ while ($true) {
                     Write-Host "==========================================" -ForegroundColor Yellow
                     Write-Host "         SERVER SETUP MENU" -ForegroundColor Yellow
                     Write-Host "==========================================" -ForegroundColor Yellow
-                    Write-Host ""
-                    Write-Host " [1] Download server.bat (Launcher Script)" -ForegroundColor Green
-                    Write-Host " [2] Download HytaleServer.jar (Sanasol F2P)" -ForegroundColor Cyan
-                    Write-Host " [3] Run Existing server.bat" -ForegroundColor Gray
-                    Write-Host " [0] Back to Main Menu" -ForegroundColor DarkGray
-                    Write-Host ""
                     
-                    $serverChoice = Read-Host " Select an option [0]"
-                    if ($serverChoice -eq "") { $serverChoice = "0" }
+                    $serverOptions = @(
+                        "Download server.bat (Launcher Script)",
+                        "Download HytaleServer.jar (Sanasol F2P)",
+                        "Run Existing server.bat",
+                        "Back to Main Menu"
+                    )
+                    
+                    $serverIdx = Show-InteractiveMenu -Options $serverOptions -Title "Select server option:" -Default 3
+                    $serverChoice = if ($serverIdx -eq 3 -or $serverIdx -eq -1) { "0" } else { ($serverIdx + 1).ToString() }
                     
                     switch ($serverChoice) {
                         "1" {
@@ -2980,8 +3351,9 @@ while ($true) {
                                 Write-Host "      [SUCCESS] server.bat installed to: $serverBatDest" -ForegroundColor Green
                             } else {
                                 Write-Host "      [ERROR] Download failed." -ForegroundColor Red
-                                $retryNet = Read-Host "      Open Network Unblocker? (y/n) [n]"
-                                if ($retryNet -eq "y") { Show-NetworkFixMenu }
+                                $netFixOptions = @("Open Network Unblocker", "Cancel")
+                                $netFixIdx = Show-InteractiveMenu -Options $netFixOptions -Title "Download failed. Try fix?" -Default 1
+                                if ($netFixIdx -eq 0) { Show-NetworkFixMenu }
                             }
                             Write-Host "`nPress any key to continue..."
                             [void][System.Console]::ReadKey($true)
@@ -2992,12 +3364,12 @@ while ($true) {
                             $serverJarPath = Join-Path $serverDir "HytaleServer.jar"
                             
                             Write-Host "`n[SERVER] Server Version Selection" -ForegroundColor Cyan
-                            Write-Host " [1] Release (Stable)" -ForegroundColor Green
-                            Write-Host " [2] Pre-release (Experimental)" -ForegroundColor Yellow
                             
-                            $branchChoice = Read-Host " Select a version [1]"
+                            $versionOptions = @("Release (Stable)", "Pre-release (Experimental)")
+                            $versionIdx = Show-InteractiveMenu -Options $versionOptions -Title "Select server version:" -Default 0
+                            
                             $branch = "release"
-                            if ($branchChoice -eq "2") { $branch = "pre-release" }
+                            if ($versionIdx -eq 1) { $branch = "pre-release" }
                             
                             if (-not (Test-Path $serverDir)) {
                                 New-Item -ItemType Directory $serverDir -Force | Out-Null
@@ -3005,8 +3377,10 @@ while ($true) {
                             
                             # Use the new Patch-HytaleServer function
                             if (-not (Patch-HytaleServer $serverJarPath $branch)) {
-                                $retryNet = Read-Host "      [ERROR] Server patch failed. Open Network Unblocker? (y/n) [n]"
-                                if ($retryNet -eq "y") { Show-NetworkFixMenu }
+                                Write-Host "      [ERROR] Server patch failed." -ForegroundColor Red
+                                $netFixOptions2 = @("Open Network Unblocker", "Cancel")
+                                $netFixIdx2 = Show-InteractiveMenu -Options $netFixOptions2 -Title "Patch failed. Try fix?" -Default 1
+                                if ($netFixIdx2 -eq 0) { Show-NetworkFixMenu }
                             }
                             
                             Write-Host "`nPress any key to continue..."
@@ -3409,205 +3783,278 @@ if (Test-Path $gameExe) {
              $cp.Refresh()
         }
 
-        # Log Monitoring (Live)
+        # Log Monitoring (Live) - COLLECT ALL ERRORS FIRST, THEN ANALYZE ROOT CAUSE
         $newLogs = Get-ChildItem -Path $logPath -Filter "*.log" | Where-Object { $_.LastWriteTime -gt $preLaunchLogDate }
         foreach ($nl in $newLogs) {
             $logContent = Get-Content $nl.FullName -Raw -ErrorAction SilentlyContinue
-            $errors = Get-Content $nl.FullName | Where-Object { $_ -match "\|ERROR\||\|FATAL\|" -or $_ -match "VM Initialization Error" -or $_ -match "Server failed to boot" -or $_ -match "World default already exists" -or $_ -match "Failed to decode asset" -or $_ -match "ALPN mismatch" }
-            foreach ($err in $errors) {
-                if ($reportedErrors -notcontains $err) {
-                    Write-Host "`r      [LOG ERROR] $($err.Trim())" -ForegroundColor Red
-                    
-                    # --- NEW: DETECT IP BLOCK / CLOUDFLARE 403 ---
-                    if ($err -match "Failed to fetch JWKS" -and ($err -match "403" -or $err -match "1106")) {
-                        Write-Host "      -> [BLOCK] Network Connection Denied (HTTP 403 / 1106)!" -ForegroundColor Red
-                        Write-Host "      -> [CAUSE] The server admin or Cloudflare has blocked your IP." -ForegroundColor Yellow
-                        Write-Host "      -> [ACTION] Opening Network Unblocker options..." -ForegroundColor Cyan
+            $allErrors = Get-Content $nl.FullName | Where-Object { $_ -match "\|ERROR\||\|FATAL\||\|WARN\||\|SEVERE\|" -or $_ -match "VM Initialization Error" -or $_ -match "Server failed to boot" -or $_ -match "World default already exists" -or $_ -match "Failed to decode asset" -or $_ -match "ALPN mismatch" -or $_ -match "username mismatch" -or $_ -match "Token validation failed" -or $_ -match "HTTP 403" }
+            
+            # Skip if no new errors
+            $newErrors = $allErrors | Where-Object { $reportedErrors -notcontains $_ }
+            if (-not $newErrors -or $newErrors.Count -eq 0) { continue }
+            
+            # === PHASE 1: CATEGORIZE ALL ERRORS ===
+            $errorCategories = @{
+                TokenMismatch = @()      # Highest priority - auth issues
+                TimeSync = @()           # Time desync
+                IpBlock = @()            # Network blocked
+                IssuerMismatch = @()     # Wrong auth URL
+                JwtValidation = @()      # Server JWT issues
+                AppMainMenu = @()        # NullRef issues
+                JavaBoot = @()           # JRE issues
+                WorldCorruption = @()    # Save issues
+                AssetMismatch = @()      # Asset decode issues
+                ServerBoot = @()         # Generic server boot (symptom, not cause)
+                Other = @()              # Unknown errors
+            }
+            
+            foreach ($err in $newErrors) {
+                # Categorize each error
+                if ($err -match "username mismatch" -or $err -match "Token validation failed.*expired.*tampered" -or $err -match "HTTP 403 - invalid token" -or $err -match "UUID mismatch") {
+                    $errorCategories.TokenMismatch += $err
+                }
+                elseif ($err -match "Identity token was issued in the future") {
+                    $errorCategories.TimeSync += $err
+                }
+                elseif ($err -match "Failed to fetch JWKS" -and ($err -match "403" -or $err -match "1106")) {
+                    $errorCategories.IpBlock += $err
+                }
+                elseif ($err -match "Identity token has invalid issuer") {
+                    $errorCategories.IssuerMismatch += $err
+                }
+                elseif ($err -match "signature verification failed" -or $err -match "No Ed25519 key found" -or ($err -match "Token validation failed" -and $err -notmatch "expired.*tampered")) {
+                    $errorCategories.JwtValidation += $err
+                }
+                elseif ($err -match "AppMainMenu.*NullReferenceException") {
+                    $errorCategories.AppMainMenu += $err
+                }
+                elseif ($err -match "Failed setting boot class path" -or $err -match "VM Initialization Error") {
+                    $errorCategories.JavaBoot += $err
+                }
+                elseif ($err -match "World default already exists") {
+                    $errorCategories.WorldCorruption += $err
+                }
+                elseif ($err -match "Failed to decode asset" -or $err -match "ALPN mismatch" -or $err -match "client outdated" -or $err -match "CodecException") {
+                    $errorCategories.AssetMismatch += $err
+                }
+                elseif ($err -match "Server failed to boot") {
+                    $errorCategories.ServerBoot += $err
+                }
+                else {
+                    $errorCategories.Other += $err
+                }
+            }
+            
+            # === PHASE 2: DISPLAY ALL COLLECTED ERRORS ===
+            $totalErrors = ($newErrors | Measure-Object).Count
+            if ($totalErrors -gt 0) {
+                Write-Host "`n      [ANALYSIS] Collected $totalErrors error(s) from logs..." -ForegroundColor Yellow
+                foreach ($err in $newErrors) {
+                    Write-Host "      [LOG] $($err.Trim().Substring(0, [Math]::Min(120, $err.Trim().Length)))..." -ForegroundColor DarkGray
+                    $reportedErrors += $err
+                }
+            }
+            
+            # === PHASE 3: IDENTIFY ROOT CAUSE (Priority Order) ===
+            $rootCause = $null
+            $rootCauseErrors = @()
+            
+            # Priority 1: Token Username Mismatch / Invalid Token (most specific auth issue)
+            if ($errorCategories.TokenMismatch.Count -gt 0) {
+                $rootCause = "TokenMismatch"
+                $rootCauseErrors = $errorCategories.TokenMismatch
+            }
+            # Priority 2: Time Sync Issues
+            elseif ($errorCategories.TimeSync.Count -gt 0) {
+                $rootCause = "TimeSync"
+                $rootCauseErrors = $errorCategories.TimeSync
+            }
+            # Priority 3: IP Blocked
+            elseif ($errorCategories.IpBlock.Count -gt 0) {
+                $rootCause = "IpBlock"
+                $rootCauseErrors = $errorCategories.IpBlock
+            }
+            # Priority 4: Issuer Mismatch
+            elseif ($errorCategories.IssuerMismatch.Count -gt 0) {
+                $rootCause = "IssuerMismatch"
+                $rootCauseErrors = $errorCategories.IssuerMismatch
+            }
+            # Priority 5: JWT Validation (server-side key issues)
+            elseif ($errorCategories.JwtValidation.Count -gt 0) {
+                $rootCause = "JwtValidation"
+                $rootCauseErrors = $errorCategories.JwtValidation
+            }
+            # Priority 6: Asset Mismatch
+            elseif ($errorCategories.AssetMismatch.Count -gt 0) {
+                $rootCause = "AssetMismatch"
+                $rootCauseErrors = $errorCategories.AssetMismatch
+            }
+            # Priority 7: World Corruption
+            elseif ($errorCategories.WorldCorruption.Count -gt 0) {
+                $rootCause = "WorldCorruption"
+                $rootCauseErrors = $errorCategories.WorldCorruption
+            }
+            # Priority 8: Java Boot Issues
+            elseif ($errorCategories.JavaBoot.Count -gt 0) {
+                $rootCause = "JavaBoot"
+                $rootCauseErrors = $errorCategories.JavaBoot
+            }
+            # Priority 9: AppMainMenu NullRef (may be caused by missing server)
+            elseif ($errorCategories.AppMainMenu.Count -gt 0) {
+                $rootCause = "AppMainMenu"
+                $rootCauseErrors = $errorCategories.AppMainMenu
+            }
+            # Priority LAST: Server Boot (this is usually a SYMPTOM, not a cause)
+            elseif ($errorCategories.ServerBoot.Count -gt 0 -and $errorCategories.Other.Count -eq 0) {
+                # Only treat as root cause if there are no other clues
+                $rootCause = "ServerBoot"
+                $rootCauseErrors = $errorCategories.ServerBoot
+            }
+            
+            # === PHASE 4: TAKE ACTION ON ROOT CAUSE ===
+            if ($rootCause) {
+                Write-Host "`n      [ROOT CAUSE] Identified: $rootCause" -ForegroundColor Cyan
+                Write-Host "      [EVIDENCE] $($rootCauseErrors[0].Substring(0, [Math]::Min(100, $rootCauseErrors[0].Length)))..." -ForegroundColor Gray
+                
+                switch ($rootCause) {
+                    "TokenMismatch" {
+                        Write-Host "      -> [FIX] Token Mismatch Detected!" -ForegroundColor Red
                         
-                        $reportedErrors += $err
+                        # Check if this is specifically a UUID mismatch
+                        $uuidMismatchError = $rootCauseErrors | Where-Object { $_ -match "UUID mismatch.*token has ([a-f0-9\-]{36})" }
+                        
+                        if ($uuidMismatchError) {
+                            # Extract the correct UUID from the token
+                            if ($uuidMismatchError -match "token has ([a-f0-9\-]{36})") {
+                                $correctUuid = $Matches[1]
+                                Write-Host "      -> [CAUSE] Your profile UUID does not match your authentication token." -ForegroundColor Yellow
+                                Write-Host "      -> [DETECTED] Token UUID: $correctUuid" -ForegroundColor Cyan
+                                Write-Host "      -> [CURRENT] Profile UUID: $global:pUuid" -ForegroundColor Gray
+                                
+                                # 1. Stop the game immediately
+                                Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                                
+                                # 2. Update the Launcher's global variables
+                                $oldUuid = $global:pUuid
+                                $global:pUuid = $correctUuid
+                                
+                                # 3. Permanently save the new UUID to config files
+                                if (Get-Command "Save-Config" -ErrorAction SilentlyContinue) {
+                                    Save-Config
+                                    Write-Host "      -> [CONFIG] Launcher profile updated to match token." -ForegroundColor Green
+                                }
+
+                                # 4. Update World Saves (Migrate items/stats from old UUID to new UUID)
+                                # We use the $userDir which is already calculated at the start of the launch block
+                                $uDir = $userDir 
+                                if (-not (Test-Path $uDir)) {
+                                    # Fallback discovery logic
+                                    $lRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $env:LOCALAPPDATA }
+                                    $uDir = Join-Path $lRoot "release\package\game\latest\Client\UserData"
+                                }
+
+                                if (Test-Path $uDir) {
+                                    Write-Host "      -> [SYNC] Migrating player data in world saves..." -ForegroundColor Cyan
+                                    # Use your existing function to rename .json files and update internal metadata
+                                    Update-PlayerIdentityInSaves -userDataPath $uDir -newUuid $correctUuid -newName $global:pName
+                                }
+                                
+                                Write-Host "      -> [READY] Identity synced! Restarting game..." -ForegroundColor Green
+                                Start-Sleep -Seconds 2
+                                $global:forceRestart = $true; $stable = $false; break
+                            }
+                        } else {
+                            # Generic token mismatch (username, expired, etc.)
+                            Write-Host "      -> [CAUSE] Cached tokens have wrong username or are expired." -ForegroundColor Yellow
+                            Write-Host "      -> [ACTION] Clearing auth cache and refreshing tokens..." -ForegroundColor Cyan
+                            
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                            
+                            # Clear auth cache
+                            $authCacheFile = Join-Path $localAppData "auth_cache.json"
+                            if (Test-Path $authCacheFile) { Remove-Item $authCacheFile -Force -ErrorAction SilentlyContinue }
+                            $publicAuthCache = Join-Path (Join-Path $env:PUBLIC "HytaleF2P") "auth_cache.json"
+                            if (Test-Path $publicAuthCache) { Remove-Item $publicAuthCache -Force -ErrorAction SilentlyContinue }
+                            $global:idToken = $null; $global:ssToken = $null
+                            
+                            Write-Host "      -> [CLEARED] Auth cache deleted. Restarting..." -ForegroundColor Green
+                            Start-Sleep -Seconds 2
+                            $global:forceRestart = $true; $stable = $false; break
+                        }
+                    }
+                    "TimeSync" {
+                        Write-Host "      -> [FIX] System Time Desync Detected!" -ForegroundColor Red
                         Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                        pause
-                        
+                        if ($isAdmin) { Sync-SystemTime } else { $global:autoRepairTriggered = $true }
+                        $global:forceRestart = $true; $stable = $false; break
+                    }
+                    "IpBlock" {
+                        Write-Host "      -> [BLOCK] Network Connection Denied!" -ForegroundColor Red
+                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                        Safe-ReadHost "Press Enter to continue..." | Out-Null
                         Show-NetworkFixMenu
-                        
-                        $global:forceRestart = $true
-                        $stable = $false; break
+                        $global:forceRestart = $true; $stable = $false; break
                     }
-
-                    # --- PRIORITY 0: TIME SYNC / TOKEN FUTURE ERROR ---
-                    $isTimeError = $err -match "Identity token was issued in the future" -or $logContent -match "Identity token was issued in the future"
-                    if ($isTimeError) {
-                        Write-Host "      -> [FIX] System Time Desync Detected (Token Issue)!" -ForegroundColor Red
-                        Write-Host "      -> [ACTION] Attempting explicit time synchronization..." -ForegroundColor Yellow
-                        
-                        $reportedErrors += $err
-                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                        
-                        if ($isAdmin) {
-                             Sync-SystemTime
-                        } else {
-                             # Trigger admin relaunch for time sync
-                             $global:forceRestart = $true
-                             $global:autoRepairTriggered = $true
-                             $stable = $false; break
-                        }
-                        
-                        $global:forceRestart = $true
-                        $stable = $false; break
-                    }
-
-                    # --- PRIORITY 1: NullReference from AppMainMenu ---
-                    $isAppMainMenuNullRef = $err -match "AppMainMenu.*NullReferenceException" -or $err -match "HytaleClient\.Application\.AppMainMenu.*NullReferenceException"
-                    
-                    if ($isAppMainMenuNullRef) {
-                        $serverDir = Join-Path $appDir "Server"
-                        $serverJarPath = Join-Path $serverDir "HytaleServer.jar"
-                        
-                        Write-Host "      -> [FIX] AppMainMenu NullReferenceException Detected!" -ForegroundColor Red
-                        
-                        if (-not (Test-Path $serverDir) -or -not (Test-Path $serverJarPath)) {
-                            Write-Host "      -> [ACTION] Triggering Patch-HytaleServer to download..." -ForegroundColor Yellow
-                            
-                            $reportedErrors += $err
-                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                            Start-Sleep -Seconds 1
-                            
-                            if (Patch-HytaleServer $serverJarPath) {
-                                Write-Host "      -> [SUCCESS] Server installed! Restarting game..." -ForegroundColor Green
-                                Start-Sleep -Seconds 2
-                                $global:forceRestart = $true
-                                $stable = $false; break
-                            } else {
-                                Write-Host "      -> [ERROR] Failed to install server. Manual intervention required." -ForegroundColor Red
-                            }
-                        } else {
-                            Write-Host "      -> [INFO] Server directory exists. Passing to other handlers..." -ForegroundColor Gray
-                            $reportedErrors += $err
-                        }
-                    }
-                    # --- PRIORITY 1: JWT/TOKEN VALIDATION ERRORS ---
-                    $isJwtError = $err -match "Token validation failed" -or $err -match "signature verification failed" -or $err -match "No Ed25519 key found" -or $err -match "Failed to fetch JWKS"
-                    
-                    if ($isJwtError) {
-                        Write-Host "      -> [FIX] Server Token Validation Error Detected (Root Cause)!" -ForegroundColor Red
-                        Write-Host "      -> [ACTION] Downloading pre-patched server with correct keys..." -ForegroundColor Yellow
-                        
-                        $reportedErrors += $err
-                        $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
-                        
-                        $currentBranch = "release"
-                        if (Test-Path "$serverJarPath.dualauth_patched") {
-                            try { $currentBranch = (Get-Content "$serverJarPath.dualauth_patched" -Raw | ConvertFrom-Json).branch } catch {}
-                        }
-                        
-                        $targetBranch = $null
-                        if (-not $global:serverPatched) {
-                            $targetBranch = $currentBranch
-                        } elseif ($global:serverPatched -eq "release") {
-                            $targetBranch = "pre-release"
-                        }
-                        
-                        if ($targetBranch) {
-                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                            Start-Sleep -Seconds 1
-                            if (Patch-HytaleServer $serverJarPath $targetBranch $true) {
-                                $global:serverPatched = $targetBranch
-                                Write-Host "      -> [SUCCESS] Server patched ($targetBranch)! Restarting game..." -ForegroundColor Green
-                                Start-Sleep -Seconds 2
-                                $global:forceRestart = $true
-                                $stable = $false; break
-                            }
-                        }
-                    }
-                    # --- PRIORITY 2: BOOT / JAVA / WORLD / VERSION ERRORS ---
-                    elseif ($err -match "VM Initialization Error" -or $err -match "Failed setting boot class path" -or $err -match "Server failed to boot" -or $err -match "World default already exists" -or $err -match "Failed to decode asset" -or $err -match "ALPN mismatch" -or $err -match "client outdated") {
-                        
-                        Write-Host "      -> [AUTO-RECOVERY] Critical boot failure detected!" -ForegroundColor Magenta
-                        
-                        # A. JAVA REPAIR
-                        if ($err -match "Failed setting boot class path" -or $err -match "VM Initialization Error" -or $err -match "Server failed to boot") {
-                            Write-Host "      -> [FIX] JRE Corruption detected. Switching to API Host JRE & purging..." -ForegroundColor Yellow
-                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                            $global:forceApiJre = $true
-                            $jreDir = Join-Path $launcherRoot "release\package\jre\latest"
-                            if (Test-Path $jreDir) { Remove-Item $jreDir -Recurse -Force -ErrorAction SilentlyContinue }
-                            $jreZip = Join-Path $cacheDir "jre_package.zip"
-                            if (Test-Path $jreZip) { Remove-Item $jreZip -Force -ErrorAction SilentlyContinue }
-                            
-                            $global:forceRestart = $true
-                            $global:autoRepairTriggered = $true
-                            $stable = $false; break
-                        }
-                        # B. WORLD CORRUPTION AUTO-FIX
-                        elseif ($err -match "World default already exists on disk") {
-                            Write-Host "      -> [FIX] World Corruption Detected (Name Collision)!" -ForegroundColor Yellow
-                            Write-Host "      -> [ACTION] Backing up saves and clearing collision..." -ForegroundColor Yellow
-                            
-                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                            
-                            # Backup entire saves folder first
-                            $userDataDir = Join-Path $appDir "Client\UserData"
-                            if (-not (Test-Path $userDataDir)) { $userDataDir = Join-Path (Split-Path $appDir) "Client\UserData" }
-                            
-                            Backup-WorldSaves $userDataDir
-                            
-                            # Clean up the specific colliding folder (fixes 'World default already exists')
-                            $targetSave = Join-Path $userDataDir "Saves\default"
-                            if (Test-Path $targetSave) { 
-                                try {
-                                    Remove-Item $targetSave -Recurse -Force -ErrorAction SilentlyContinue 
-                                    Write-Host "      -> [CLEANUP] Deleted colliding world: 'default'" -ForegroundColor Green
-                                } catch {}
-                            }
-                            
-                            $global:forceRestart = $true
-                            $global:autoRepairTriggered = $true
-                            $stable = $false; break
-                        }
-                        # C. ASSET DECODE / PROTOCOL MISMATCH
-                        elseif ($err -match "Failed to decode asset" -or $err -match "ALPN mismatch" -or $err -match "client outdated" -or $err -match "CodecException") {
-                            Write-Host "      -> [FIX] Asset Mismatch Detected!" -ForegroundColor Red
-                            Write-Host "      -> [ACTION] Synchronizing Assets.zip with Server JAR..." -ForegroundColor Yellow
-                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                            $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
-                            if (Test-Path $serverJarPath) { Remove-Item $serverJarPath -Force -ErrorAction SilentlyContinue }
-                            
-                            $global:forceRestart = $true
-                            $global:autoRepairTriggered = $true
-                            $stable = $false; break
-                        }
-                    }
-                    # --- PRIORITY 3: ISSUER MISMATCH ---
-                    elseif ($err -match "Identity token has invalid issuer: expected (https?://[^\s,]+)") {
-                        $expectedUrl = $matches[1].TrimEnd('/')
-                        Write-Host "      -> [FIX] Issuer Mismatch Detected!" -ForegroundColor Red
-                        Write-Host "      -> [ACTION] Updating configuration to match Game Client..." -ForegroundColor Yellow
-                        $reportedErrors += $err
-                        if ($global:AUTH_URL_CURRENT -ne $expectedUrl) {
-                            $global:AUTH_URL_CURRENT = $expectedUrl
-                            Save-Config
+                    "IssuerMismatch" {
+                        if ($rootCauseErrors[0] -match "expected (https?://[^\s,]+)") {
+                            $expectedUrl = $matches[1].TrimEnd('/')
+                            Write-Host "      -> [FIX] Updating auth URL to: $expectedUrl" -ForegroundColor Yellow
+                            $global:AUTH_URL_CURRENT = $expectedUrl; Save-Config
                             Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
                             Start-Sleep -Seconds 2
-                            $global:forceRestart = $true
-                            $stable = $false; break
+                            $global:forceRestart = $true; $stable = $false; break
                         }
                     }
-                    else {
-                        $reportedErrors += $err
-                        $sameErrorCount = ($reportedErrors | Where-Object { $_ -eq $err }).Count
-                        if ($sameErrorCount -ge 3) {
-                            Write-Host "`n      =============================================" -ForegroundColor Red
-                            Write-Host "      [LOOP DETECTED] Same error occurred $sameErrorCount times!" -ForegroundColor Red
-                            Write-Host "      =============================================" -ForegroundColor Red
-                            Write-Host "`n      ERROR: $($err.Trim())" -ForegroundColor Yellow
-                            Write-Host ""
-                            Write-Host "      This error is not automatically fixable." -ForegroundColor Gray
-                            Write-Host "      Please take a screenshot and report to the developers." -ForegroundColor Cyan
-                            Write-Host ""
-                            Write-Host "      Press any key to continue monitoring, or Ctrl+C to exit..." -ForegroundColor DarkGray
-                            [void][System.Console]::ReadKey($true)
-                            $reportedErrors = $reportedErrors | Select-Object -Unique
+                    "JwtValidation" {
+                        Write-Host "      -> [FIX] Downloading pre-patched server..." -ForegroundColor Yellow
+                        $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
+                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                        Start-Sleep -Seconds 1
+                        if (Patch-HytaleServer $serverJarPath "release" $true) {
+                            Write-Host "      -> [SUCCESS] Server patched!" -ForegroundColor Green
                         }
+                        Start-Sleep -Seconds 2
+                        $global:forceRestart = $true; $stable = $false; break
+                    }
+                    "AssetMismatch" {
+                        Write-Host "      -> [FIX] Asset Mismatch! Removing server JAR..." -ForegroundColor Yellow
+                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                        $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
+                        if (Test-Path $serverJarPath) { Remove-Item $serverJarPath -Force -ErrorAction SilentlyContinue }
+                        $global:forceRestart = $true; $global:autoRepairTriggered = $true; $stable = $false; break
+                    }
+                    "WorldCorruption" {
+                        Write-Host "      -> [FIX] World Corruption! Backing up and clearing..." -ForegroundColor Yellow
+                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                        $userDataDir = Join-Path $appDir "Client\UserData"
+                        Backup-WorldSaves $userDataDir
+                        $targetSave = Join-Path $userDataDir "Saves\default"
+                        if (Test-Path $targetSave) { Remove-Item $targetSave -Recurse -Force -ErrorAction SilentlyContinue }
+                        $global:forceRestart = $true; $global:autoRepairTriggered = $true; $stable = $false; break
+                    }
+                    "JavaBoot" {
+                        Write-Host "      -> [FIX] JRE Corruption! Purging and redownloading..." -ForegroundColor Yellow
+                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                        $global:forceApiJre = $true
+                        $jreDir = Join-Path $launcherRoot "release\package\jre\latest"
+                        if (Test-Path $jreDir) { Remove-Item $jreDir -Recurse -Force -ErrorAction SilentlyContinue }
+                        $global:forceRestart = $true; $global:autoRepairTriggered = $true; $stable = $false; break
+                    }
+                    "AppMainMenu" {
+                        $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
+                        if (-not (Test-Path $serverJarPath)) {
+                            Write-Host "      -> [FIX] Server missing! Downloading..." -ForegroundColor Yellow
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                            if (Patch-HytaleServer $serverJarPath) { Write-Host "      -> [SUCCESS] Server installed!" -ForegroundColor Green }
+                            Start-Sleep -Seconds 2
+                            $global:forceRestart = $true; $stable = $false; break
+                        }
+                    }
+                    "ServerBoot" {
+                        # This is usually a symptom - check if we have any other clues
+                        Write-Host "      -> [INFO] Server failed to boot - but no specific cause found." -ForegroundColor Yellow
+                        Write-Host "      -> [ACTION] Check the full log content for more details." -ForegroundColor Cyan
+                        # Don't auto-fix, let user investigate
                     }
                 }
             }
