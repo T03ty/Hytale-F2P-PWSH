@@ -36,6 +36,20 @@ Because I use a compiler to turn the script into an `.exe`, and because the scri
 *   **Trust:** If you are worried, just use **Option B** (the PowerShell command) instead.
 
 ---
+
+## 🌟 Latest Updates (v2.3)
+
+### 🖱️ Enhanced Interactive Menus
+- **Mouse & Scroll:** Full mouse support in Windows Terminal (Click to select, Scroll to navigate).
+- **Keyboard Navigation:** Use **W/S**, **Arrow Keys**, or **Numbers** to control menus.
+- **Legacy Detection:** Automatically switches to simple text input if you use an old Command Prompt.
+
+### 🛠️ Auto-Fixes & Smarts
+- **UUID Mismatch Fix:** Automatically detects identity errors and syncs your world saves (no lost user data!).
+- **Smart Path Discovery:** Now finds the game in user-level folders (`%LOCALAPPDATA%\Programs`).
+- **Desktop Shortcut:** Fixed shortcut creation to properly launch with `cmd.exe`.
+- **Wget Auto-Install:** If you run as Admin, it installs `wget` via Winget for faster downloads.
+
 ## ✨ New cool Features (v2.2)
 
 ### 🔄 GitHub Bootstrapper (Auto-Update)
