@@ -258,16 +258,60 @@ $global:mouseEnabled = Enable-MouseSupport
 function Safe-ReadHost {
     param([string]$Prompt)
     
-    # Disable mouse tracking before Read-Host
+    # Disable ALL mouse tracking modes before reading input
     $ESC = [char]27
-    [Console]::Write("$ESC[?1000l$ESC[?1006l")
+    [Console]::Write("$ESC[?1000l$ESC[?1003l$ESC[?1006l")
     
-    # Clear any buffered mouse input
-    Start-Sleep -Milliseconds 50
+    # Clear any buffered escape sequences
+    Start-Sleep -Milliseconds 150
     while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
     
-    # Now safe to call Read-Host
-    return Read-Host $Prompt
+    # Show prompt
+    Write-Host "$Prompt`: " -NoNewline
+    
+    # Read character by character for proper backspace handling
+    $inputBuffer = ""
+    while ($true) {
+        $key = [Console]::ReadKey($true)
+        
+        # Skip escape sequences (mouse events)
+        if ([int]$key.KeyChar -eq 27) {
+            # Consume any following escape sequence characters
+            $timeout = [DateTime]::Now.AddMilliseconds(50)
+            while ([Console]::KeyAvailable -and [DateTime]::Now -lt $timeout) {
+                [Console]::ReadKey($true) | Out-Null
+            }
+            continue
+        }
+        
+        # Enter - submit input (check both Key enum AND KeyChar values)
+        if ($key.Key -eq [ConsoleKey]::Enter -or [int]$key.KeyChar -eq 13 -or [int]$key.KeyChar -eq 10) {
+            Write-Host ""  # New line
+            return $inputBuffer
+        }
+        
+        # Backspace - remove last character (check both Key enum AND KeyChar value)
+        if ($key.Key -eq [ConsoleKey]::Backspace -or [int]$key.KeyChar -eq 8 -or [int]$key.KeyChar -eq 127) {
+            if ($inputBuffer.Length -gt 0) {
+                $inputBuffer = $inputBuffer.Substring(0, $inputBuffer.Length - 1)
+                # Erase character on screen: move back, write space, move back
+                [Console]::Write("`b `b")
+            }
+            continue
+        }
+        
+        # Escape - cancel input
+        if ($key.Key -eq [ConsoleKey]::Escape) {
+            Write-Host ""
+            return ""
+        }
+        
+        # Regular character - add to buffer and echo
+        if ([int]$key.KeyChar -ge 32 -and [int]$key.KeyChar -le 126) {
+            $inputBuffer += $key.KeyChar
+            [Console]::Write($key.KeyChar)
+        }
+    }
 }
 
 function Show-InteractiveMenu {
@@ -326,14 +370,25 @@ function Show-InteractiveMenu {
     
     # --- Modern VT/Mouse Logic ---
     $startRow = [Console]::CursorTop
-    $script:menuFirstRow = 0 
+    $script:menuFirstRow = 0
+    $script:menuColStart = 1  # Column where menu text starts (1-indexed)
+    $script:menuColEnd = 0    # Will be calculated based on longest option
     
     function Render-Menu {
         param([int]$sel)
         [Console]::SetCursorPosition(0, $startRow)
         Write-Host "`n  $Title" -ForegroundColor Cyan
         Write-Host ""
-        $script:menuFirstRow = $startRow + 3 
+        $script:menuFirstRow = $startRow + 3
+        
+        # Calculate max text width for column bounds
+        $maxLen = 0
+        for ($i = 0; $i -lt $optionCount; $i++) {
+            $prefix = if ($ShowNumbers) { "[$($i+1)]" } else { "   " }
+            $lineLen = 2 + $prefix.Length + 1 + $Options[$i].Length + 4  # "  " + prefix + " " + text + "   "
+            if ($lineLen -gt $maxLen) { $maxLen = $lineLen }
+        }
+        $script:menuColEnd = $maxLen
         
         for ($i = 0; $i -lt $optionCount; $i++) {
             $prefix = if ($ShowNumbers) { "[$($i+1)]" } else { "   " }
@@ -348,7 +403,8 @@ function Show-InteractiveMenu {
         Write-Host "`n  $hint" -ForegroundColor DarkGray
     }
     
-    if ($isWindowsTerminal) { [Console]::Write("$ESC[?1000h$ESC[?1006h") }
+    # Enable mouse tracking: 1000h=basic, 1003h=any-event (hover), 1006h=SGR format
+    if ($isWindowsTerminal) { [Console]::Write("$ESC[?1000h$ESC[?1003h$ESC[?1006h") }
     Render-Menu $selected
     Start-Sleep -Milliseconds 150
     while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
@@ -366,12 +422,31 @@ function Show-InteractiveMenu {
                 while ([Console]::KeyAvailable -and [DateTime]::Now -lt $timeout) { $seq += [Console]::ReadKey($true).KeyChar }
                 if ([string]::IsNullOrEmpty($seq)) { return -1 }
                 if ($seq -match '\[<(\d+);(\d+);(\d+)([Mm])') {
-                    $btn = [int]$Matches[1]; $row = [int]$Matches[3]; $isRelease = $Matches[4] -eq 'm'
+                    $btn = [int]$Matches[1]; $col = [int]$Matches[2]; $row = [int]$Matches[3]; $isRelease = $Matches[4] -eq 'm'
+                    # Scroll wheel: 64=up, 65=down
                     if ($btn -eq 64) { $selected = if ($selected -gt 0) { $selected - 1 } else { $optionCount - 1 }; Render-Menu $selected; continue }
                     if ($btn -eq 65) { $selected = if ($selected -lt $optionCount - 1) { $selected + 1 } else { 0 }; Render-Menu $selected; continue }
+                    
+                    # Mouse hover: btn 35 = mouse move without button pressed
+                    if ($btn -eq 35) {
+                        $menuRow = $row - $script:menuFirstRow - 1
+                        # Only highlight if cursor is within text bounds (column check)
+                        if ($menuRow -ge 0 -and $menuRow -lt $optionCount -and $menuRow -ne $selected) {
+                            if ($col -ge $script:menuColStart -and $col -le $script:menuColEnd) {
+                                $selected = $menuRow; Render-Menu $selected
+                            }
+                        }
+                        continue
+                    }
+                    
+                    # Left click release: confirm selection (only within text bounds)
                     if ($isRelease -and ($btn -eq 0 -or $btn -eq 32)) {
                         $menuRow = $row - $script:menuFirstRow - 1
-                        if ($menuRow -ge 0 -and $menuRow -lt $optionCount) { $selected = $menuRow; Render-Menu $selected; return $selected }
+                        if ($menuRow -ge 0 -and $menuRow -lt $optionCount) {
+                            if ($col -ge $script:menuColStart -and $col -le $script:menuColEnd) {
+                                $selected = $menuRow; Render-Menu $selected; return $selected
+                            }
+                        }
                     }
                 }
                 continue
@@ -402,7 +477,8 @@ function Show-InteractiveMenu {
             }
         }
     } finally {
-        if ($isWindowsTerminal) { [Console]::Write("$ESC[?1000l$ESC[?1006l") }
+        # Disable all mouse tracking modes
+        if ($isWindowsTerminal) { [Console]::Write("$ESC[?1000l$ESC[?1003l$ESC[?1006l") }
     }
 }
 
@@ -571,11 +647,15 @@ function Ensure-LauncherExe {
 Ensure-LauncherExe
 
 function Invoke-PathDialog {
+    param(
+        [string]$CurrentPath = $null  # Pass current path to return if cancelled
+    )
+    
     # Show folder browser dialog to select Hytale installation
     Add-Type -AssemblyName System.Windows.Forms
     
     $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dialog.Description = "Select your 'Hytale F2P Launcher' installation folder (or click 'Cancel' to use the default path)"
+    $dialog.Description = "Select your 'Hytale F2P Launcher' installation folder (or click 'Cancel' to keep current path)"
     $dialog.ShowNewFolderButton = $true
     
     # Robust Focus Fix: Use a hidden TopMost dummy form as owner
@@ -629,7 +709,7 @@ function Invoke-PathDialog {
                 } catch {
                     Write-Host "`n      [ERROR] Failed to create directory: $($_.Exception.Message)" -ForegroundColor Red
                     Start-Sleep -Seconds 3
-                    return $null
+                    return $CurrentPath  # Return current path on error
                 }
             }
             $clientPath
@@ -638,12 +718,16 @@ function Invoke-PathDialog {
         if ($potential) {
             # Persistent Cache for next run
             if (-not (Test-Path $localAppData)) { New-Item -ItemType Directory $localAppData -Force | Out-Null }
-            $obj = @{ gamePath = $potential }
-            $obj | ConvertTo-Json | Out-File $pathConfigFile
+            try {
+                $obj = @{ gamePath = $potential }
+                $obj | ConvertTo-Json | Out-File $pathConfigFile -Force
+            } catch { }
             return $potential
         }
     }
-    return $null
+    
+    # If cancelled or invalid, return the current path to preserve it
+    return $CurrentPath
 }
 
 function Resolve-GamePath {
@@ -977,6 +1061,45 @@ function Backup-WorldSaves($userDataPath) {
         }
         return $null
     }
+    
+    # --- CLEANUP: Remove duplicate world copies, keep only newest ---
+    if (Test-Path $backupRoot) {
+        $allTimestampFolders = Get-ChildItem -Path $backupRoot -Directory | Sort-Object Name -Descending
+        
+        if ($allTimestampFolders.Count -gt 1) {
+            $seenWorlds = @{}
+            $foldersToClean = @()
+            
+            foreach ($tsFolder in $allTimestampFolders) {
+                $worldsInFolder = Get-ChildItem -Path $tsFolder.FullName -Directory -ErrorAction SilentlyContinue
+                $worldsToRemove = @()
+                
+                foreach ($world in $worldsInFolder) {
+                    $worldKey = $world.Name.ToLower()
+                    if ($seenWorlds.ContainsKey($worldKey)) {
+                        $worldsToRemove += $world.FullName
+                    } else {
+                        $seenWorlds[$worldKey] = $tsFolder.Name
+                    }
+                }
+                
+                foreach ($oldWorld in $worldsToRemove) {
+                    try { Remove-Item $oldWorld -Recurse -Force -ErrorAction Stop } catch {}
+                }
+                
+                $remaining = Get-ChildItem -Path $tsFolder.FullName -ErrorAction SilentlyContinue
+                if ($remaining.Count -eq 0) { $foldersToClean += $tsFolder.FullName }
+            }
+            
+            foreach ($emptyFolder in $foldersToClean) {
+                try { Remove-Item $emptyFolder -Force -ErrorAction Stop } catch {}
+            }
+            
+            if ($foldersToClean.Count -gt 0) {
+                Write-Host "      [CLEANUP] Removed $($foldersToClean.Count) obsolete backup folder(s)." -ForegroundColor DarkGray
+            }
+        }
+    }
 
     if (-not (Test-Path $savesDir)) {
         Write-Host "      [BACKUP] No Saves folder found. Checking for existing backups..." -ForegroundColor Gray
@@ -1173,38 +1296,57 @@ function Update-PlayerIdentityInSaves($userDataPath, $newUuid, $newName) {
     $savesDir = Join-Path $userDataPath "Saves"
     $backupRoot = Join-Path $PublicConfig "WorldBackups"
     
-    $updateDir = { param($monitorDir, $targetUuid, $targetName)
-        if (-not (Test-Path $monitorDir)) { return }
+    # Process a directory for player identity files
+    function Process-PlayerDirectory {
+        param($SearchDir, $TargetUuid, $TargetName)
+        
+        if (-not (Test-Path $SearchDir)) { return }
+        
         # Recursive search for 'players' folder inside 'universe'
-        $playerDirs = Get-ChildItem -Path $monitorDir -Directory -Recurse -Filter "players" -ErrorAction SilentlyContinue | Where-Object { $_.Parent.Name -eq "universe" }
+        $playerDirs = Get-ChildItem -Path $SearchDir -Directory -Recurse -Filter "players" -ErrorAction SilentlyContinue | 
+            Where-Object { $_.Parent.Name -eq "universe" }
         
         foreach ($pDir in $playerDirs) {
-            $jsonFiles = Get-ChildItem -Path $pDir.FullName -Filter "*.json"
+            $jsonFiles = Get-ChildItem -Path $pDir.FullName -Filter "*.json" -ErrorAction SilentlyContinue
+            
             foreach ($file in $jsonFiles) {
                 try {
-                    $pDat = Get-Content $file.FullName -Raw | ConvertFrom-Json
+                    $pDat = Get-Content $file.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
                     $modified = $false
                     
                     # Update name in common components
-                    if ($null -ne $pDat.Components.Nameplate) { 
-                        $pDat.Components.Nameplate.Text = $targetName
+                    if ($null -ne $pDat.Components -and $null -ne $pDat.Components.Nameplate) { 
+                        $pDat.Components.Nameplate.Text = $TargetName
                         $modified = $true 
                     }
-                    if ($null -ne $pDat.Components.DisplayName.DisplayName) { 
-                        $pDat.Components.DisplayName.DisplayName.RawText = $targetName
+                    if ($null -ne $pDat.Components -and $null -ne $pDat.Components.DisplayName -and $null -ne $pDat.Components.DisplayName.DisplayName) { 
+                        $pDat.Components.DisplayName.DisplayName.RawText = $TargetName
                         $modified = $true
                     }
                     
-                    if ($modified) {
-                        $pDat | ConvertTo-Json -Depth 10 | Out-File $file.FullName -Encoding UTF8 -Force
-                    }
+                    # Determine new file path
+                    $newFilePath = Join-Path $pDir.FullName "$TargetUuid.json"
+                    # Get world name: players -> universe -> WorldName
+                    $worldName = $pDir.Parent.Parent.Name
                     
-                    # Rename file to target UUID to ensure ownership in Hytale
-                    $newFilePath = Join-Path $pDir.FullName "$targetUuid.json"
+                    # If file needs to be renamed (different UUID)
                     if ($file.FullName -ne $newFilePath) {
-                        if (Test-Path $newFilePath) { Remove-Item $newFilePath -Force }
-                        Rename-Item $file.FullName -NewName "$targetUuid.json" -Force
-                        Write-Host "      [SAVE] Migrated identity in: $(Split-Path (Split-Path (Split-Path $file.FullName) -Parent) -Leaf)" -ForegroundColor Gray
+                        # Delete existing target file if it exists
+                        if (Test-Path $newFilePath) { 
+                            Remove-Item $newFilePath -Force -ErrorAction SilentlyContinue 
+                        }
+                        
+                        # Write updated content to NEW file path
+                        $pDat | ConvertTo-Json -Depth 10 | Out-File $newFilePath -Encoding UTF8 -Force
+                        
+                        # Remove old file
+                        Remove-Item $file.FullName -Force -ErrorAction SilentlyContinue
+                        
+                        Write-Host "      [SAVE] Migrated identity in: $worldName" -ForegroundColor Gray
+                    } elseif ($modified) {
+                        # Same UUID, just update content
+                        $pDat | ConvertTo-Json -Depth 10 | Out-File $file.FullName -Encoding UTF8 -Force
+                        Write-Host "      [SAVE] Updated name in: $worldName" -ForegroundColor Gray
                     }
                 } catch {
                     Write-Host "      [WARN] Failed to update save at: $($file.FullName)" -ForegroundColor Yellow
@@ -1214,13 +1356,17 @@ function Update-PlayerIdentityInSaves($userDataPath, $newUuid, $newName) {
     }
 
     Write-Host "      [IDENTITY] Pushing profile to worlds..." -ForegroundColor Cyan
-    &$updateDir -monitorDir $savesDir -targetUuid $newUuid -targetName $newName
     
+    # Update local saves
+    Process-PlayerDirectory -SearchDir $savesDir -TargetUuid $newUuid -TargetName $newName
+    
+    # Update backup saves
     if (Test-Path $backupRoot) {
         Get-ChildItem -Path $backupRoot -Directory | ForEach-Object {
-            &$updateDir -monitorDir $_.FullName -targetUuid $newUuid -targetName $newName
+            Process-PlayerDirectory -SearchDir $_.FullName -TargetUuid $newUuid -TargetName $newName
         }
     }
+    
     Write-Host "      [SUCCESS] Worlds updated to $newName ($newUuid)" -ForegroundColor Green
 }
 
@@ -1413,7 +1559,7 @@ function Patch-HytaleClient($clientPath) {
     return $true
 }
 
-function Patch-HytaleServer($serverJarPath, $branch="release", $force=$false) {
+function Patch-HytaleServer($serverJarPath, $branch="release", $force=$false, $skipClientSync=$false) {
     $serverDir = Split-Path $serverJarPath
     if (-not (Test-Path $serverDir)) { 
         New-Item -ItemType Directory $serverDir -Force | Out-Null 
@@ -1515,8 +1661,48 @@ function Patch-HytaleServer($serverJarPath, $branch="release", $force=$false) {
             $flagObj | ConvertTo-Json | Out-File $patchFlag
             
             Write-Host "      [SUCCESS] Patched Server JAR installed and hashed." -ForegroundColor Green
+            
+            # --- PHASE 5: SYNC CLIENT TO MATCH BRANCH ---
+            if (-not $skipClientSync) {
+                Write-Host "      [SYNC] Ensuring Client matches Server branch '$branch'..." -ForegroundColor Cyan
+                
+                # 1. Update Config to remember this branch preference
+                $cfgFile = Join-Path $PublicConfig "config_data.json"
+                $config = @{}
+                if (Test-Path $cfgFile) { 
+                    try { $config = Get-Content $cfgFile -Raw | ConvertFrom-Json } catch {} 
+                }
+                # Handle PSCustomObject vs Hashtable
+                if ($config -is [PSCustomObject]) {
+                    # Clone to hashtable to allow adding properties
+                    $newConfig = @{}
+                    $config.PSObject.Properties | ForEach-Object { $newConfig[$_.Name] = $_.Value }
+                    $config = $newConfig
+                }
+                
+                $config['preferredBranch'] = $branch
+                $config | ConvertTo-Json | Out-File $cfgFile -Encoding UTF8 -Force
+                
+                # 2. Trigger Client Update
+                # Get the correct PWR version for this branch
+                $targetVer = Get-LatestPatchVersion -branch $branch
+                
+                # Check if we already have this version installed
+                $currentVer = 0
+                $verFile = Join-Path $localAppData "current_version.txt"
+                if (Test-Path $verFile) { $currentVer = [int](Get-Content $verFile) }
+                
+                if ($targetVer -gt 0 -and $targetVer -ne $currentVer) {
+                    Write-Host "      [UPDATE] Client update required (v$currentVer -> v$targetVer). Starting..." -ForegroundColor Yellow
+                    Invoke-OfficialUpdate $targetVer $true
+                } else {
+                    Write-Host "      [CHECK] Client is already up to date (v$currentVer)." -ForegroundColor Green
+                }
+            }
+
             return $true
         } catch {
+             Write-Host "      [WARN] Metadata save or client sync failed: $($_.Exception.Message)" -ForegroundColor Yellow
              return $true
         }
     }
@@ -1963,16 +2149,44 @@ function Install-HyFixes {
 }
 
 function Get-LatestPatchVersion {
-    $cacheFile = Join-Path $cacheDir "highest_version.txt"
+    param([string]$branch = "release")  # Support "release" or "pre-release"
+    
+    $cacheFile = Join-Path $cacheDir "highest_version_$branch.txt"
     $versionFile = Join-Path $localAppData "current_version.txt"
     $api_url = "https://files.hytalef2p.com/api/patch_manifest"
+    $version_api = "https://files.hytalef2p.com/api/version_client?branch=$branch"
     
     # 0. Detect Current Local Version
     $localVer = if (Test-Path $versionFile) { [int](Get-Content $versionFile) } else { 0 }
     $global:RemotePatchUrl = $null
     $global:IsDeltaPatch = $false
+    $global:TargetBranch = $branch  # Store branch for later use
 
-    # --- 1. Try API Manifest ---
+    # --- 0.5. Try Branch-Specific Version API First ---
+    try {
+        Write-Host "      [API] Fetching $branch client version..." -ForegroundColor Gray
+        $verRes = Invoke-RestMethod -Uri $version_api -Headers @{ 'User-Agent' = 'Hytale-F2P-Launcher' } -TimeoutSec 5
+        
+        if ($verRes -and $verRes.client_version) {
+            # Parse version number from "8.pwr" or "20.pwr"
+            $pwrFile = $verRes.client_version
+            if ($pwrFile -match "^(\d+)\.pwr$") {
+                $latestVer = [int]$Matches[1]
+                
+                # Build the PWR download URL
+                $global:RemotePatchUrl = "$OFFICIAL_BASE/windows/amd64/$branch/0/$latestVer.pwr"
+                $global:IsDeltaPatch = $false
+                $latestVer | Out-File $cacheFile
+                
+                Write-Host "      [SUCCESS] Target: v$latestVer ($branch branch)" -ForegroundColor Green
+                return $latestVer
+            }
+        }
+    } catch {
+        Write-Host "      [WARN] Version API unavailable for $branch." -ForegroundColor Yellow
+    }
+
+    # --- 1. Try API Manifest (Fallback) ---
     try {
         Write-Host "      [API] Fetching latest patch manifest..." -ForegroundColor Gray
         $api_res = Invoke-RestMethod -Uri $api_url -Headers @{ 'User-Agent' = 'Hytale-F2P-Launcher' } -TimeoutSec 5
@@ -2030,13 +2244,13 @@ function Get-LatestPatchVersion {
     $highestFound = $currentStart
     $batchSize = 10 
 
-    Write-Host "      [PROBE] Scanning CDN for updates..." -ForegroundColor Gray
+    Write-Host "      [PROBE] Scanning CDN for $branch updates..." -ForegroundColor Gray
 
     while ($true) {
         $tasks = New-Object System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]
         $range = $currentStart..($currentStart + $batchSize)
         foreach ($i in $range) {
-            $url = "$OFFICIAL_BASE/windows/amd64/release/0/$i.pwr"
+            $url = "$OFFICIAL_BASE/windows/amd64/$branch/0/$i.pwr"
             $tasks.Add($client.SendAsync((New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Head, $url))))
         }
         try { [System.Threading.Tasks.Task]::WaitAll($tasks.ToArray()) } catch {}
@@ -2044,7 +2258,7 @@ function Get-LatestPatchVersion {
         for ($j = $batchSize; $j -ge 0; $j--) {
             if ($tasks[$j].Status -eq 'RanToCompletion' -and $tasks[$j].Result.IsSuccessStatusCode) {
                 $highestFound = $range[$j]
-                $global:RemotePatchUrl = "$OFFICIAL_BASE/windows/amd64/release/0/$highestFound.pwr"
+                $global:RemotePatchUrl = "$OFFICIAL_BASE/windows/amd64/$branch/0/$highestFound.pwr"
                 $global:IsDeltaPatch = $false
                 $found = $true; break
             }
@@ -2539,49 +2753,67 @@ function Show-ProfileMenu {
 
         switch ($pChoice) {
             "1" {
-                $newName = Safe-ReadHost "`n      Enter new Username"
-                if ($newName -and $newName.Trim().Length -gt 0) {
-                    $cleanName = $newName.Trim()
-                    
-                    # --- NEW: USERNAME VALIDATION API ---
-                    Write-Host "      [CHECK] Verifying availability..." -ForegroundColor Gray
-                    $checkUrl = "https://api.hytalef2p.com/api/usernames/check/$cleanName"
-                    $isAvailable = $false
-                    
-                    try {
-                        # Requesting with 5s timeout to prevent hanging
-                        $validation = Invoke-RestMethod -Uri $checkUrl -Method Get -TimeoutSec 5
-                        if ($validation.available -eq $true) {
-                            $isAvailable = $true
-                        } else {
-                            Write-Host "      [ERROR] $($validation.message)" -ForegroundColor Red
-                        }
-                    } catch {
-                        Write-Host "      [WARN] Could not reach validation server. Proceeding anyway..." -ForegroundColor Yellow
+                $newName = Safe-ReadHost "`n      Enter new Username (min 3 characters)"
+                
+                # --- USERNAME VALIDATION ---
+                if ([string]::IsNullOrWhiteSpace($newName)) {
+                    Write-Host "      [ERROR] Username cannot be empty." -ForegroundColor Red
+                    Start-Sleep -Seconds 2
+                    continue
+                }
+                
+                $cleanName = $newName.Trim()
+                
+                if ($cleanName.Length -lt 3) {
+                    Write-Host "      [ERROR] Username must be at least 3 characters." -ForegroundColor Red
+                    Start-Sleep -Seconds 2
+                    continue
+                }
+                
+                if ($cleanName.Length -gt 16) {
+                    Write-Host "      [ERROR] Username cannot exceed 16 characters." -ForegroundColor Red
+                    Start-Sleep -Seconds 2
+                    continue
+                }
+                
+                # --- API VALIDATION ---
+                Write-Host "      [CHECK] Verifying availability..." -ForegroundColor Gray
+                $checkUrl = "https://api.hytalef2p.com/api/usernames/check/$cleanName"
+                $isAvailable = $false
+                
+                try {
+                    # Requesting with 5s timeout to prevent hanging
+                    $validation = Invoke-RestMethod -Uri $checkUrl -Method Get -TimeoutSec 5
+                    if ($validation.available -eq $true) {
                         $isAvailable = $true
+                    } else {
+                        Write-Host "      [ERROR] $($validation.message)" -ForegroundColor Red
                     }
+                } catch {
+                    Write-Host "      [WARN] Could not reach validation server. Proceeding anyway..." -ForegroundColor Yellow
+                    $isAvailable = $true
+                }
 
-                    if ($isAvailable) {
-                        $global:pName = $cleanName
-                        # Persist to config
-                        $cfgFile = Join-Path $PublicConfig "config_data.json"
-                        try {
-                            $json = if (Test-Path $cfgFile) { Get-Content $cfgFile -Raw | ConvertFrom-Json } else { @{} }
-                            $json.username = $global:pName
-                            $json | ConvertTo-Json -Depth 4 | Out-File $cfgFile -Encoding UTF8 -Force
-                            
-                            # Update ID File too
-                            $idFile = Join-Path $PublicConfig "player_id.json"
-                            $idPayload = @{ playerId = $global:pUuid; createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
-                            $idPayload | ConvertTo-Json | Out-File $idFile -Encoding UTF8 -Force
-                            
-                            Write-Host "      [SUCCESS] Username set to: $($global:pName)" -ForegroundColor Green
-                            
-                            # Auto-Sync to worlds
-                            if ($uDir) { Update-PlayerIdentityInSaves $uDir $global:pUuid $global:pName }
-                        } catch {
-                            Write-Host "      [ERROR] Failed to save profile settings." -ForegroundColor Red
-                        }
+                if ($isAvailable) {
+                    $global:pName = $cleanName
+                    # Persist to config
+                    $cfgFile = Join-Path $PublicConfig "config_data.json"
+                    try {
+                        $json = if (Test-Path $cfgFile) { Get-Content $cfgFile -Raw | ConvertFrom-Json } else { @{} }
+                        $json.username = $global:pName
+                        $json | ConvertTo-Json -Depth 4 | Out-File $cfgFile -Encoding UTF8 -Force
+                        
+                        # Update ID File too
+                        $idFile = Join-Path $PublicConfig "player_id.json"
+                        $idPayload = @{ playerId = $global:pUuid; createdAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
+                        $idPayload | ConvertTo-Json | Out-File $idFile -Encoding UTF8 -Force
+                        
+                        Write-Host "      [SUCCESS] Username set to: $($global:pName)" -ForegroundColor Green
+                        
+                        # Auto-Sync to worlds
+                        if ($uDir) { Update-PlayerIdentityInSaves $uDir $global:pUuid $global:pName }
+                    } catch {
+                        Write-Host "      [ERROR] Failed to save profile settings." -ForegroundColor Red
                     }
                 }
                 Start-Sleep -Seconds 2
@@ -2660,7 +2892,12 @@ function Show-LatestLogs($logDir, $lineCount=15, $filterErrors=$false) {
     }
 }
 
-function Invoke-OfficialUpdate($latestVer) {
+function Invoke-OfficialUpdate($latestVer, $skipServerSync=$false) {
+    # Kill any running Java processes to prevent file locks
+    # Specifically target 'java', 'javaw', and 'javaa' (renamed binary)
+    Write-Host "      [INIT] Cleaning up running Java processes..." -ForegroundColor Gray
+    Stop-Process -Name "java", "javaw", "javaa" -Force -ErrorAction SilentlyContinue
+
     # Reset verification flags to force full check after update
     $global:assetsVerified = $false
     $global:depsVerified = $false
@@ -2723,7 +2960,10 @@ function Invoke-OfficialUpdate($latestVer) {
 
     # [DOWNLOAD] Perform actual download with success check
     if (-not (Test-Path $pwrPath)) {
-        if (-not (Download-WithProgress "$OFFICIAL_BASE/windows/amd64/release/0/$pwrName" $pwrPath $false)) {
+        # Use global URL if available (set by Get-LatestPatchVersion)
+        $downloadUrl = if ($global:RemotePatchUrl) { $global:RemotePatchUrl } else { "$OFFICIAL_BASE/windows/amd64/release/0/$pwrName" }
+        
+        if (-not (Download-WithProgress $downloadUrl $pwrPath $false)) {
             Write-Host "      [ERROR] Official patch download failed." -ForegroundColor Red
             return $false
         }
@@ -2759,13 +2999,18 @@ function Invoke-OfficialUpdate($latestVer) {
     Sync-PlayerIdentityFromSaves $userDir | Out-Null
     
     # [SYNC] Ensure Server JAR is also patched/updated
-    Write-Host "[SYNC] Verifying Server JAR..." -ForegroundColor Cyan
-    $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
-    $serverDir = Split-Path $serverJarPath
-    if (-not (Test-Path $serverDir)) { New-Item -ItemType Directory $serverDir -Force | Out-Null }
-    # Use "release" as default target for official updates
-    if (-not (Patch-HytaleServer $serverJarPath "release")) {
-        Write-Host "      [WARN] Server patch failed. You might need to update it manually via menu." -ForegroundColor Yellow
+    if (-not $skipServerSync) {
+        Write-Host "[SYNC] Verifying Server JAR..." -ForegroundColor Cyan
+        $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
+        $serverDir = Split-Path $serverJarPath
+        if (-not (Test-Path $serverDir)) { New-Item -ItemType Directory $serverDir -Force | Out-Null }
+        
+        # Use the branch we just installed (or default to release)
+        $branch = if ($global:TargetBranch) { $global:TargetBranch } else { "release" }
+        
+        if (-not (Patch-HytaleServer $serverJarPath $branch $false $true)) {
+            Write-Host "      [WARN] Server patch failed. You might need to update it manually via menu." -ForegroundColor Yellow
+        }
     }
     # Restore world saves after successful installation
     if ($worldBackup) {
@@ -2946,7 +3191,7 @@ while ($true) {
         if ($f2pMatch) {
             Write-Host "[2/2] Auto-Launching Hytale F2P..." -ForegroundColor Cyan
         } else {
-            $latestVer = Get-LatestPatchVersion
+            $latestVer = Get-LatestPatchVersion -branch $global:preferredBranch
             
             # 1. Smart Applied Check (Hash or Version based)
             $isApplied = ($localHash -eq $global:pwrHash) -or ($global:pwrVersion -ge $latestVer)
@@ -3032,8 +3277,21 @@ while ($true) {
         }
 
         if ($choice -eq "1") {
+            # Ask for branch preference
+            Write-Host "`n[BRANCH] Select default update channel:" -ForegroundColor Cyan
+            $branchOps = @("Release (Stable)", "Pre-release (Experimental)")
+            $bIdx = Show-InteractiveMenu -Options $branchOps -Title "Select version:" -Default 0
+            $selBranch = if ($bIdx -eq 1) { "pre-release" } else { "release" }
+            
+            # Save preference
+            if ($global:preferredBranch -ne $selBranch) {
+                $global:preferredBranch = $selBranch
+                Save-Config
+                Write-Host "      [CONFIG] Preferred branch updated to: $selBranch" -ForegroundColor Green
+            }
+
             # Discover latest version
-            $latestVer = Get-LatestPatchVersion
+            $latestVer = Get-LatestPatchVersion -branch $selBranch
             if (Invoke-OfficialUpdate $latestVer) { continue }
         } 
         elseif ($choice -ne "2") { exit }
@@ -3116,7 +3374,10 @@ while ($true) {
             if ($null -ne $json.pwrVersion) { $global:pwrVersion = $json.pwrVersion }
             if ($null -ne $json.pwrHash) { $global:pwrHash = $json.pwrHash }
             if ($null -ne $json.autoFixedVersions) { $global:autoFixedVersions = $json.autoFixedVersions } else { $global:autoFixedVersions = @() }
+            if ($null -ne $json.preferredBranch) { $global:preferredBranch = $json.preferredBranch } else { $global:preferredBranch = "release" }
         } catch {}
+    } else {
+        $global:preferredBranch = "release"
     }
 
     # Define appDir early
@@ -3437,7 +3698,33 @@ while ($true) {
                 }
                 
                 # Discover latest version
-                $latestVer = Get-LatestPatchVersion
+                # AUTO-DETECT BRANCH
+                $detectedBranch = $global:preferredBranch
+                
+                # Try to read installed server info
+                $serverJarRec = Join-Path $appDir "Server\HytaleServer.jar"
+                $patchFlagRec = "$serverJarRec.dualauth_patched"
+                
+                if (Test-Path $patchFlagRec) {
+                    try {
+                        $flagData = Get-Content $patchFlagRec -Raw | ConvertFrom-Json
+                        if ($flagData.branch -in "release", "pre-release") {
+                            $detectedBranch = $flagData.branch
+                            Write-Host "      [AUTO] Detected installed branch: $detectedBranch" -ForegroundColor Green
+                        }
+                    } catch {}
+                }
+
+                # Update global target for Invoke-OfficialUpdate
+                $global:TargetBranch = $detectedBranch
+
+                $latestVer = Get-LatestPatchVersion -branch $detectedBranch
+                
+                # Update global preference to match what we just repaired
+                if ($global:preferredBranch -ne $detectedBranch) {
+                    $global:preferredBranch = $detectedBranch
+                    Save-Config
+                }
                 if (Invoke-OfficialUpdate $latestVer) { continue }
             }
             "4" {
@@ -3457,10 +3744,10 @@ while ($true) {
                 # Show current path
                 Write-Host "      Current: $gameExe" -ForegroundColor Gray
                 
-                # Invoke path selection dialog
-                $newPath = Invoke-PathDialog
+                # Invoke path selection dialog (pass current path to preserve on cancel)
+                $newPath = Invoke-PathDialog -CurrentPath $gameExe
                 
-                if ($newPath) {
+                if ($newPath -and $newPath -ne $gameExe) {
                     $gameExe = $newPath
                     Write-Host "      [SUCCESS] Game path updated to:" -ForegroundColor Green
                     Write-Host "                $newPath" -ForegroundColor Gray
@@ -3499,8 +3786,16 @@ if (-not (Ensure-JRE $launcherRoot $cacheDir)) {
     # If Ensure-JRE fails or isn't present, just warn
 }
 
-# Critical Check: Ensure game exists before patching/launching
-if (-not (Test-Path $gameExe)) {
+# Critical Check: Ensure game path is set and exists before patching/launching
+$gameExeValid = $false
+if ([string]::IsNullOrWhiteSpace($gameExe)) {
+    Write-Host "`n[ERROR] Game Executable (HytaleClient.exe) is missing!" -ForegroundColor Red
+    Write-Host "        Path not configured. Please select installation folder." -ForegroundColor Yellow
+    Write-Host "        Redirecting to Repair menu..." -ForegroundColor Cyan
+    $global:forceShowMenu = $true
+    $global:autoRepairTriggered = $true
+    continue
+} elseif (-not (Test-Path $gameExe)) {
     Write-Host "`n[ERROR] Game Executable (HytaleClient.exe) is missing!" -ForegroundColor Red
     Write-Host "        Expected at: $gameExe" -ForegroundColor Yellow
     Write-Host "        Redirecting to Repair menu..." -ForegroundColor Cyan
@@ -3745,6 +4040,7 @@ if (Test-Path $gameExe) {
     Write-Host "      [CHECK] Waiting for Game Window..." -NoNewline -ForegroundColor Gray
     $stable = $false
     $guiDetected = $false
+    $global:versionCheckDone = $false  # Reset version check for this launch
     $currentProc = $gameProc
     $guiDetected = $false
     $currentProc = $gameProc
@@ -3785,6 +4081,61 @@ if (Test-Path $gameExe) {
 
         # Log Monitoring (Live) - COLLECT ALL ERRORS FIRST, THEN ANALYZE ROOT CAUSE
         $newLogs = Get-ChildItem -Path $logPath -Filter "*.log" | Where-Object { $_.LastWriteTime -gt $preLaunchLogDate }
+        
+        # === VERSION MISMATCH DETECTION (Run ONCE before error processing) ===
+        if (-not $global:versionCheckDone -and $newLogs) {
+            foreach ($nl in $newLogs) {
+                $logContent = Get-Content $nl.FullName -Raw -ErrorAction SilentlyContinue
+                if ($logContent -match "Patchline:\s*(release|pre-release)") {
+                    $clientPatchline = $Matches[1]
+                    $global:versionCheckDone = $true
+                    
+                    # Check server JAR's current branch from metadata
+                    $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
+                    $patchFlag = "$serverJarPath.dualauth_patched"
+                    $serverBranch = "unknown"  # Default to unknown if no flag exists
+                    
+                    if (Test-Path $patchFlag) {
+                        try {
+                            $flagData = Get-Content $patchFlag -Raw | ConvertFrom-Json
+                            if ($flagData.branch) { $serverBranch = $flagData.branch }
+                        } catch { $serverBranch = "corrupted" }
+                    } elseif (-not (Test-Path $serverJarPath)) {
+                        $serverBranch = "missing"
+                    }
+                    
+                    Write-Host "`n      [VERSION] Client: $clientPatchline | Server JAR: $serverBranch" -ForegroundColor Gray
+                    
+                    # Compare and fix if mismatched
+                    if ($serverBranch -ne "unknown" -and $serverBranch -ne "missing" -and $clientPatchline -ne $serverBranch) {
+                        Write-Host "      [VERSION] Mismatch detected!" -ForegroundColor Yellow
+                        Write-Host "             Client Patchline: $clientPatchline" -ForegroundColor Cyan
+                        Write-Host "             Server JAR Branch: $serverBranch" -ForegroundColor Cyan
+                        Write-Host "      -> [FIX] Downloading '$clientPatchline' server JAR to match client..." -ForegroundColor Magenta
+                        
+                        # Stop the game
+                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                        Start-Sleep -Seconds 2
+                        
+                        # Re-patch server with correct branch
+                        $patchResult = Patch-HytaleServer $serverJarPath $clientPatchline $true
+                        
+                        if ($patchResult) {
+                            Write-Host "      -> [SUCCESS] Server JAR updated to '$clientPatchline'. Restarting game..." -ForegroundColor Green
+                        } else {
+                            Write-Host "      -> [WARN] Patch may have failed. Attempting restart anyway..." -ForegroundColor Yellow
+                        }
+                        
+                        Start-Sleep -Seconds 2
+                        $global:forceRestart = $true; $stable = $false
+                    }
+                    break  # Exit the foreach after finding patchline
+                }
+            }
+        }
+        if ($global:forceRestart) { break }  # Exit the for loop to restart
+        
+        # === ERROR MONITORING LOOP ===
         foreach ($nl in $newLogs) {
             $logContent = Get-Content $nl.FullName -Raw -ErrorAction SilentlyContinue
             $allErrors = Get-Content $nl.FullName | Where-Object { $_ -match "\|ERROR\||\|FATAL\||\|WARN\||\|SEVERE\|" -or $_ -match "VM Initialization Error" -or $_ -match "Server failed to boot" -or $_ -match "World default already exists" -or $_ -match "Failed to decode asset" -or $_ -match "ALPN mismatch" -or $_ -match "username mismatch" -or $_ -match "Token validation failed" -or $_ -match "HTTP 403" }
@@ -3800,6 +4151,8 @@ if (Test-Path $gameExe) {
                 IpBlock = @()            # Network blocked
                 IssuerMismatch = @()     # Wrong auth URL
                 JwtValidation = @()      # Server JWT issues
+                ModLock = @()            # Mod file locked/permission denied
+                SaveVersionMismatch = @() # Save created with newer game version
                 AppMainMenu = @()        # NullRef issues
                 JavaBoot = @()           # JRE issues
                 WorldCorruption = @()    # Save issues
@@ -3810,20 +4163,28 @@ if (Test-Path $gameExe) {
             
             foreach ($err in $newErrors) {
                 # Categorize each error
-                if ($err -match "username mismatch" -or $err -match "Token validation failed.*expired.*tampered" -or $err -match "HTTP 403 - invalid token" -or $err -match "UUID mismatch") {
+                # IpBlock check FIRST - HTTP 403 with session/terminate/fetch = Cloudflare block
+                if (($err -match "HTTP 403" -and ($err -match "terminate session" -or $err -match "Failed to fetch")) -or ($err -match "Failed to fetch JWKS" -and ($err -match "403" -or $err -match "1106"))) {
+                    $errorCategories.IpBlock += $err
+                }
+                # TokenMismatch - but exclude session termination failures (those are IP blocks)
+                elseif (($err -match "username mismatch" -or $err -match "Token validation failed.*expired.*tampered" -or $err -match "UUID mismatch") -and $err -notmatch "terminate session") {
                     $errorCategories.TokenMismatch += $err
                 }
                 elseif ($err -match "Identity token was issued in the future") {
                     $errorCategories.TimeSync += $err
-                }
-                elseif ($err -match "Failed to fetch JWKS" -and ($err -match "403" -or $err -match "1106")) {
-                    $errorCategories.IpBlock += $err
                 }
                 elseif ($err -match "Identity token has invalid issuer") {
                     $errorCategories.IssuerMismatch += $err
                 }
                 elseif ($err -match "signature verification failed" -or $err -match "No Ed25519 key found" -or ($err -match "Token validation failed" -and $err -notmatch "expired.*tampered")) {
                     $errorCategories.JwtValidation += $err
+                }
+                elseif ($err -match "EPERM" -or $err -match "operation not permitted" -or ($err -match "Failed to remove" -and $err -match "mods")) {
+                    $errorCategories.ModLock += $err
+                }
+                elseif ($err -match "Version \d+ is newer than expected version" -or ($err -match "Failed to read server config" -and $err -match "newer")) {
+                    $errorCategories.SaveVersionMismatch += $err
                 }
                 elseif ($err -match "AppMainMenu.*NullReferenceException") {
                     $errorCategories.AppMainMenu += $err
@@ -3884,7 +4245,17 @@ if (Test-Path $gameExe) {
                 $rootCause = "JwtValidation"
                 $rootCauseErrors = $errorCategories.JwtValidation
             }
-            # Priority 6: Asset Mismatch
+            # Priority 6: Mod Locked/Permission Denied
+            elseif ($errorCategories.ModLock.Count -gt 0) {
+                $rootCause = "ModLock"
+                $rootCauseErrors = $errorCategories.ModLock
+            }
+            # Priority 7: Save Version Mismatch (world created with newer game)
+            elseif ($errorCategories.SaveVersionMismatch.Count -gt 0) {
+                $rootCause = "SaveVersionMismatch"
+                $rootCauseErrors = $errorCategories.SaveVersionMismatch
+            }
+            # Priority 8: Asset Mismatch
             elseif ($errorCategories.AssetMismatch.Count -gt 0) {
                 $rootCause = "AssetMismatch"
                 $rootCauseErrors = $errorCategories.AssetMismatch
@@ -4016,6 +4387,126 @@ if (Test-Path $gameExe) {
                         Start-Sleep -Seconds 2
                         $global:forceRestart = $true; $stable = $false; break
                     }
+                    "ModLock" {
+                        Write-Host "      -> [FIX] Mod File Locked! Moving problematic mod to quarantine..." -ForegroundColor Yellow
+                        
+                        # Extract mod name from error (e.g., "Failed to remove BetterZoom from central mods: EPERM")
+                        $modName = $null
+                        foreach ($modErr in $rootCauseErrors) {
+                            if ($modErr -match "Failed to remove (\w+) from" -or $modErr -match "\\Mods\\([^'\\]+)" -or $modErr -match "unlink '.*\\Mods\\([^'\\]+)'") {
+                                $modName = $Matches[1]
+                                break
+                            }
+                        }
+                        
+                        if ($modName) {
+                            Write-Host "      -> [DETECTED] Problematic mod: $modName" -ForegroundColor Cyan
+                            
+                            # Define paths
+                            $modsDir = Join-Path $env:LOCALAPPDATA "HytaleSaves\Mods"
+                            $quarantineDir = Join-Path $env:LOCALAPPDATA "HytaleSaves\ModsQuarantine"
+                            $modPath = Join-Path $modsDir $modName
+                            
+                            # Create quarantine folder if needed
+                            if (-not (Test-Path $quarantineDir)) {
+                                New-Item -ItemType Directory -Path $quarantineDir -Force | Out-Null
+                            }
+                            
+                            # Try to move the mod
+                            if (Test-Path $modPath) {
+                                try {
+                                    $destPath = Join-Path $quarantineDir $modName
+                                    if (Test-Path $destPath) { Remove-Item $destPath -Recurse -Force -ErrorAction SilentlyContinue }
+                                    Move-Item -Path $modPath -Destination $destPath -Force -ErrorAction Stop
+                                    Write-Host "      -> [MOVED] Mod quarantined to: $destPath" -ForegroundColor Green
+                                } catch {
+                                    # If move fails, try to force delete
+                                    Write-Host "      -> [WARN] Move failed, attempting force delete..." -ForegroundColor Yellow
+                                    try {
+                                        Remove-Item -Path $modPath -Recurse -Force -ErrorAction Stop
+                                        Write-Host "      -> [DELETED] Mod removed from Mods folder." -ForegroundColor Green
+                                    } catch {
+                                        Write-Host "      -> [ERROR] Could not remove mod. Try closing any programs using it." -ForegroundColor Red
+                                    }
+                                }
+                            } else {
+                                Write-Host "      -> [INFO] Mod not found at: $modPath" -ForegroundColor Gray
+                            }
+                        } else {
+                            Write-Host "      -> [INFO] Could not identify specific mod from error." -ForegroundColor Yellow
+                        }
+                        
+                        Start-Sleep -Seconds 2
+                        $global:forceRestart = $true; $stable = $false; break
+                    }
+                    "SaveVersionMismatch" {
+                        Write-Host "      -> [FIX] Save Version Incompatible! Attempting to downgrade config..." -ForegroundColor Yellow
+                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                        
+                        # Extract expected version from error (e.g., "Version 4 is newer than expected version 3")
+                        $expectedVersion = 3  # Default fallback
+                        foreach ($verr in $rootCauseErrors) {
+                            if ($verr -match "Version \d+ is newer than expected version (\d+)") {
+                                $expectedVersion = [int]$Matches[1]
+                                break
+                            }
+                        }
+                        
+                        # Try to find which world was being loaded from logs
+                        $worldName = $null
+                        if ($logContent -match 'Connecting to singleplayer world "([^"\\]+)') {
+                            $worldName = $Matches[1].TrimEnd('\')
+                        }
+                        
+                        $userDataDir = Join-Path $appDir "Client\UserData"
+                        $configFixed = $false
+                        
+                        if ($worldName) {
+                            Write-Host "      -> [DETECTED] Incompatible world: $worldName" -ForegroundColor Cyan
+                            Write-Host "      -> [TARGET] Downgrading to version $expectedVersion..." -ForegroundColor Gray
+                            
+                            $targetSave = Join-Path $userDataDir "Saves\$worldName"
+                            
+                            # Find all config.json files in the world folder
+                            $configFiles = Get-ChildItem -Path $targetSave -Filter "config.json" -Recurse -ErrorAction SilentlyContinue
+                            
+                            foreach ($cfg in $configFiles) {
+                                try {
+                                    # Create backup
+                                    $backupPath = "$($cfg.FullName).backup"
+                                    Copy-Item $cfg.FullName -Destination $backupPath -Force -ErrorAction Stop
+                                    
+                                    # Read and modify JSON
+                                    $jsonContent = Get-Content $cfg.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
+                                    
+                                    if ($jsonContent.Version -and $jsonContent.Version -gt $expectedVersion) {
+                                        $oldVersion = $jsonContent.Version
+                                        $jsonContent.Version = $expectedVersion
+                                        
+                                        # Write back
+                                        $jsonContent | ConvertTo-Json -Depth 20 | Out-File $cfg.FullName -Encoding UTF8 -Force
+                                        
+                                        $relPath = $cfg.FullName.Replace($targetSave, "").TrimStart("\")
+                                        Write-Host "      -> [PATCHED] $relPath : v$oldVersion -> v$expectedVersion" -ForegroundColor Green
+                                        $configFixed = $true
+                                    }
+                                } catch {
+                                    Write-Host "      -> [WARN] Failed to patch: $($cfg.Name)" -ForegroundColor Yellow
+                                }
+                            }
+                            
+                            if ($configFixed) {
+                                Write-Host "      -> [SUCCESS] Config downgraded! Backups saved as config.json.backup" -ForegroundColor Green
+                            } else {
+                                Write-Host "      -> [INFO] No config files needed patching." -ForegroundColor Gray
+                            }
+                        } else {
+                            Write-Host "      -> [INFO] Could not identify specific world from logs." -ForegroundColor Yellow
+                        }
+                        
+                        Start-Sleep -Seconds 2
+                        $global:forceRestart = $true; $stable = $false; break
+                    }
                     "AssetMismatch" {
                         Write-Host "      -> [FIX] Asset Mismatch! Removing server JAR..." -ForegroundColor Yellow
                         Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
@@ -4061,6 +4552,23 @@ if (Test-Path $gameExe) {
             if ($global:forceRestart) { break }
         }
         if ($global:forceRestart) { break }
+
+        # === SUCCESS DETECTION: Player Joined Server ===
+        # Check if the player has successfully joined the server (server is listening & player connected)
+        if ($guiDetected -and $logContent) {
+            # Server is listening and player connected = success!
+            if ($logContent -match "Listening on /127\.0\.0\.1:\d+" -and $logContent -match "Stage MainMenu to GameLoading") {
+                # Check for additional success indicators
+                $serverReady = $logContent -match "ServerManager\|P\] Listening on"
+                $authSuccess = $logContent -match "Identity token validated.*success"
+                
+                if ($serverReady) {
+                    Write-Host "`n[SUCCESS] Player joined the server! Closing launcher." -ForegroundColor Green
+                    $stable = $true
+                    break
+                }
+            }
+        }
 
         $memMB = [math]::Round($cp.WorkingSet64 / 1MB, 0)
         
