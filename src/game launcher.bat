@@ -664,7 +664,7 @@ function Invoke-PathDialog {
     $dummy.WindowState = "Minimized"
     $dummy.Opacity = 0
     $dummy.Show()
-    [User32]::SetForegroundWindow($dummy.Handle)
+    [User32]::SetForegroundWindow($dummy.Handle) | Out-Null
     
     $result = $dialog.ShowDialog($dummy)
     $userInput = $dialog.SelectedPath
