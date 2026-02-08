@@ -37,6 +37,25 @@ Because I use a compiler to turn the script into an `.exe`, and because the scri
 
 ---
 
+## 🌟 Latest Cool Updates (v2.4)
+
+### 🔄 Bidirectional Version Sync
+- **Server <-> Client Sync:** Changing the Server Version (Release/Pre-release) now automatically updates your Client to match, and vice-versa. No more version mismatches!
+- **Auto-Fix on Launch:** If your Client and Server versions don't match when you start the game, the launcher automatically patches the Server JAR to ensure a clean launch.
+- **Smart Config:** The launcher remembers your preferred branch ("release" or "pre-release") and uses it for future repairs.
+### 🌿 Branch Selection (Release vs Pre-release)
+- **You Choose:** The launcher now lets you pick between **Stable Release** and **Experimental Pre-release** channels when repairing or updating.
+- **Auto-Detection:** The Repair tool scans your installation to detect which version you have and updates it intelligently. No more accidental downgrades!
+- **Smart Preferences:** Your choice is saved. Future auto-updates will respect your selected branch.
+
+### 🧹 Process Hygiene
+- **Access Denied Fix:** The launcher now forcefully closes any stuck `java`, `javaw`, and `javaa` processes before starting an update, preventing file lock errors.
+
+### 🛡️ Error Fixes
+- **Mod Lock Detection:** automatically quarantines mods that are locked or causing startup crashes.
+- **Duplicate World Generation:** Automatically fixes the "World default already exists" error by backing up and resetting the world.
+- **Save Version Mismatch:** Attempts to resolve incompatibilities when loading worlds from different versions.
+
 ## 🌟 Latest Updates (v2.3)
 
 ### 🖱️ Enhanced Interactive Menus
