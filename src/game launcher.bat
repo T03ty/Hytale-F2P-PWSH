@@ -314,6 +314,7 @@ function Safe-ReadHost {
     }
 }
 
+
 function Show-InteractiveMenu {
     param(
         [string[]]$Options,
@@ -360,7 +361,7 @@ function Show-InteractiveMenu {
         $input = Read-Host "  Enter choice (1-$optionCount) [$($Default+1)]"
         if ([string]::IsNullOrWhiteSpace($input)) { return $Default }
         
-        $choice = 0 # Fix: Initialize for [ref]
+        $choice = 0 
         if ([int]::TryParse($input, [ref]$choice)) {
             $choice--
             if ($choice -ge 0 -and $choice -lt $optionCount) { return $choice }
@@ -368,43 +369,82 @@ function Show-InteractiveMenu {
         return $Default
     }
     
-    # --- Modern VT/Mouse Logic ---
+    # --- Modern VT/Mouse Logic (Anti-Flicker) ---
+    
+    # 1. Pre-flight Scroll Check
+    # Ensure there is enough room at the bottom so the terminal doesn't auto-scroll 
+    # when we print, which causes the menu to "drift" up.
+    $menuHeight = $optionCount + 5
+    $currentTop = [Console]::CursorTop
+    $winHeight = [Console]::WindowHeight
+
+    if ($currentTop + $menuHeight -ge $winHeight) {
+        $linesNeeded = ($currentTop + $menuHeight) - $winHeight + 1
+        for ($k = 0; $k -lt $linesNeeded; $k++) { Write-Host "" }
+        # Move cursor back up to where the menu should start
+        [Console]::SetCursorPosition(0, [Console]::CursorTop - $menuHeight)
+    }
+
     $startRow = [Console]::CursorTop
     $script:menuFirstRow = 0
-    $script:menuColStart = 1  # Column where menu text starts (1-indexed)
-    $script:menuColEnd = 0    # Will be calculated based on longest option
+    $script:menuColStart = 1  
+    $script:menuColEnd = 0    
     
+    # [FIX] Initial Clear: Clear the area ONCE before we start rendering loops.
+    # We do NOT do this inside Render-Menu anymore.
+    [Console]::SetCursorPosition(0, $startRow)
+    [Console]::Write("$ESC[J")
+
     function Render-Menu {
         param([int]$sel)
+        
+        # 2. Strict Cursor Positioning (Overwrite Mode)
+        # We move to the start, but we DO NOT clear the screen ($ESC[J). 
+        # Clearing causing the flicker. Overwriting is instant.
         [Console]::SetCursorPosition(0, $startRow)
-        Write-Host "`n  $Title" -ForegroundColor Cyan
+        
         Write-Host ""
+        Write-Host "  $Title" -ForegroundColor Cyan
+        Write-Host ""
+        
         $script:menuFirstRow = $startRow + 3
         
-        # Calculate max text width for column bounds
+        # Calculate max text width for dynamic padding
         $maxLen = 0
         for ($i = 0; $i -lt $optionCount; $i++) {
             $prefix = if ($ShowNumbers) { "[$($i+1)]" } else { "   " }
-            $lineLen = 2 + $prefix.Length + 1 + $Options[$i].Length + 4  # "  " + prefix + " " + text + "   "
+            $lineLen = 2 + $prefix.Length + 1 + $Options[$i].Length + 3 
             if ($lineLen -gt $maxLen) { $maxLen = $lineLen }
         }
         $script:menuColEnd = $maxLen
         
         for ($i = 0; $i -lt $optionCount; $i++) {
             $prefix = if ($ShowNumbers) { "[$($i+1)]" } else { "   " }
+            
+            # Dynamic padding ensures old longer lines are wiped clean
+            $currentLineLength = 2 + $prefix.Length + 1 + $Options[$i].Length
+            $padding = " " * ($maxLen - $currentLineLength)
+
             if ($i -eq $sel) {
                 Write-Host "  $prefix $($Options[$i])   " -ForegroundColor Black -BackgroundColor Cyan -NoNewline
                 Write-Host " <--" -ForegroundColor Green
             } else {
-                Write-Host "  $prefix $($Options[$i])                    " -ForegroundColor White
+                # [FIX] Added 4 extra spaces at the end "$padding    "
+                # This wipes the " <--" arrow if this row was previously selected.
+                Write-Host "  $prefix $($Options[$i])$padding    " -ForegroundColor White
             }
         }
         $hint = if ($isWindowsTerminal) { "(Click, W/S or Arrows, 1-$optionCount)" } else { "(W/S/Arrows + Enter, 1-$optionCount)" }
-        Write-Host "`n  $hint" -ForegroundColor DarkGray
+        Write-Host "`n  $hint" -ForegroundColor DarkGray -NoNewline
     }
     
-    # Enable mouse tracking: 1000h=basic, 1003h=any-event (hover), 1006h=SGR format
+    # Hide cursor to prevent flickering
+    $origCursorVis = [Console]::CursorVisible
+    [Console]::CursorVisible = $false
+    
+    # Enable mouse tracking
     if ($isWindowsTerminal) { [Console]::Write("$ESC[?1000h$ESC[?1003h$ESC[?1006h") }
+    
     Render-Menu $selected
     Start-Sleep -Milliseconds 150
     while ([Console]::KeyAvailable) { [Console]::ReadKey($true) | Out-Null }
@@ -421,16 +461,28 @@ function Show-InteractiveMenu {
                 $timeout = [DateTime]::Now.AddMilliseconds(50)
                 while ([Console]::KeyAvailable -and [DateTime]::Now -lt $timeout) { $seq += [Console]::ReadKey($true).KeyChar }
                 if ([string]::IsNullOrEmpty($seq)) { return -1 }
+                
                 if ($seq -match '\[<(\d+);(\d+);(\d+)([Mm])') {
                     $btn = [int]$Matches[1]; $col = [int]$Matches[2]; $row = [int]$Matches[3]; $isRelease = $Matches[4] -eq 'm'
-                    # Scroll wheel: 64=up, 65=down
-                    if ($btn -eq 64) { $selected = if ($selected -gt 0) { $selected - 1 } else { $optionCount - 1 }; Render-Menu $selected; continue }
-                    if ($btn -eq 65) { $selected = if ($selected -lt $optionCount - 1) { $selected + 1 } else { 0 }; Render-Menu $selected; continue }
                     
-                    # Mouse hover: btn 35 = mouse move without button pressed
+                    # Scroll wheel: 64=up, 65=down - Only process on button press ('M')
+                    if ($btn -eq 64 -and $Matches[4] -eq 'M') { 
+                        $selected = if ($selected -gt 0) { $selected - 1 } else { $optionCount - 1 }
+                        Render-Menu $selected
+                        continue 
+                    }
+                    if ($btn -eq 65 -and $Matches[4] -eq 'M') { 
+                        $selected = if ($selected -lt $optionCount - 1) { $selected + 1 } else { 0 }
+                        Render-Menu $selected
+                        continue 
+                    }
+                    
+                    # Skip scroll releases
+                    if (($btn -eq 64 -or $btn -eq 65) -and $Matches[4] -eq 'm') { continue }
+                    
+                    # Mouse hover
                     if ($btn -eq 35) {
                         $menuRow = $row - $script:menuFirstRow - 1
-                        # Only highlight if cursor is within text bounds (column check)
                         if ($menuRow -ge 0 -and $menuRow -lt $optionCount -and $menuRow -ne $selected) {
                             if ($col -ge $script:menuColStart -and $col -le $script:menuColEnd) {
                                 $selected = $menuRow; Render-Menu $selected
@@ -439,7 +491,7 @@ function Show-InteractiveMenu {
                         continue
                     }
                     
-                    # Left click release: confirm selection (only within text bounds)
+                    # Left click release
                     if ($isRelease -and ($btn -eq 0 -or $btn -eq 32)) {
                         $menuRow = $row - $script:menuFirstRow - 1
                         if ($menuRow -ge 0 -and $menuRow -lt $optionCount) {
@@ -452,8 +504,7 @@ function Show-InteractiveMenu {
                 continue
             }
             
-            # --- FIXED INPUT DETECTION ---
-            # 1. Check by ConsoleKey Enum
+            # Keyboard Logic
             if ($keyCode -eq [System.ConsoleKey]::UpArrow -or $keyCode -eq [System.ConsoleKey]::W) {
                 $selected = if ($selected -gt 0) { $selected - 1 } else { $optionCount - 1 }; Render-Menu $selected
             }
@@ -466,21 +517,22 @@ function Show-InteractiveMenu {
             elseif ($keyCode -eq [System.ConsoleKey]::Escape) {
                 return -1
             }
-            # 2. Check by KeyChar (Robust fallback for Enter/Space)
             elseif ([int]$keyChar -eq 13 -or [int]$keyChar -eq 32) {
                 return $selected
             }
-            # 3. Number Keys
             elseif ($keyChar -ge '1' -and $keyChar -le '9') {
                 $num = [int]$keyChar.ToString() - 1
                 if ($num -ge 0 -and $num -lt $optionCount) { $selected = $num; Render-Menu $selected; return $selected }
             }
         }
     } finally {
-        # Disable all mouse tracking modes
         if ($isWindowsTerminal) { [Console]::Write("$ESC[?1000l$ESC[?1003l$ESC[?1006l") }
+        # Restore cursor visibility and ensure we are on a new line below the menu
+        [Console]::CursorVisible = $origCursorVis
+        Write-Host "" 
     }
 }
+
 
 # --- 1. GITHUB AUTO-UPDATE & DOWNLOAD LOGIC ---
 
@@ -731,6 +783,8 @@ function Invoke-PathDialog {
 }
 
 function Resolve-GamePath {
+    param([switch]$NoPrompt)
+
     # 1. Check Script Folder FIRST (Project Aware)
     $s_path = if ($env:_SCRIPT_PATH) { $env:_SCRIPT_PATH } else { $PSCommandPath }
     if ($s_path) {
@@ -765,10 +819,13 @@ function Resolve-GamePath {
     }
 
     # 5. Manual Prompt (GUI Folder Picker)
-    Write-Host "[!] Could not find HytaleClient.exe automatically." -ForegroundColor Yellow
-    Write-Host "    Launching Folder Selection Dialog... (Tip: Close it to use the default path)" -ForegroundColor Gray
-    
-    return Invoke-PathDialog
+    if (-not $NoPrompt) {
+        Write-Host "[!] Could not find HytaleClient.exe automatically." -ForegroundColor Yellow
+        Write-Host "    Launching Folder Selection Dialog... (Tip: Close it to use the default path)" -ForegroundColor Gray
+        
+        return Invoke-PathDialog
+    }
+    return $null
 }
 
 $gameExe = Resolve-GamePath
@@ -794,9 +851,8 @@ try {
     # Silently skip resize if terminal doesn't support it
 }
 
-$syncFlag = Join-Path $localAppData ".sys_synced"
+
 $needsAV = $true
-$needsSync = $true
 
 # --- ADVANCED CHECK 1: Antivirus ---
 try {
@@ -812,40 +868,67 @@ try {
     }
 } catch { $needsAV = $true }
 
-# --- ADVANCED CHECK 2: Time & DNS ---
-if (Test-Path $syncFlag) {
-    $lastSync = (Get-Item $syncFlag).LastWriteTime
-    if ($lastSync -gt (Get-Date).AddHours(-12)) {
-        $needsSync = $false
+$needsSync = $false
+$timeDrift = 0
+try {
+    Write-Host "[INIT] Checking system clock synchronization..." -ForegroundColor DarkGray
+    
+    # We use Google's server because it's high-availability and accurate.
+    # We perform a HEAD request to get the Date header without downloading content.
+    $webReq = Invoke-WebRequest -Uri "http://www.google.com" -Method Head -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+    
+    # Convert HTTP Header Time (GMT) to Local System Time (UTC)
+    $serverTime = [DateTime]::Parse($webReq.Headers.Date).ToUniversalTime()
+    $localTime  = [DateTime]::UtcNow
+    
+    # Calculate difference in seconds
+    $timeDrift = ($localTime - $serverTime).TotalSeconds
+    $absDrift  = [Math]::Abs($timeDrift)
+    
+    # THRESHOLD: If drift is > 30 seconds, Auth tokens/SSL usually fail.
+    if ($absDrift -gt 30) {
+        Write-Host "      [TIME] Clock drifted by $([Math]::Round($timeDrift, 2))s. Sync required." -ForegroundColor Yellow
+        $needsSync = $true
+    } else {
+        Write-Host "      [TIME] Clock is accurate (Drift: $([Math]::Round($timeDrift, 3))s)." -ForegroundColor DarkGray
     }
+} catch {
+    Write-Host "      [WARN] Could not check time (Offline?). Skipping sync check." -ForegroundColor DarkGray
 }
 
-# --- EXECUTION (Only if something actually needs fixing) ---
+# ==============================================================================
+# 2. EXECUTION LOGIC
+# ==============================================================================
+
 if ($needsAV -or $needsSync) {
     if (-not $isAdmin) {
         Write-Host "`n[!] Admin privileges required for environment initialization." -ForegroundColor Yellow
+        
+        # Build the prompt message based on what is actually missing
+        $reasons = @()
+        if ($needsSync) { $reasons += "System Clock Synchronization (Off by $([Math]::Round($timeDrift, 0))s)" }
+        if ($needsAV)   { $reasons += "Anti-Virus Exclusion" }
+        $msgBody = "The following fixes require administrator privileges:`n`n- " + ($reasons -join "`n- ") + "`n`nWould you like to elevate now?"
+
         Add-Type -AssemblyName System.Windows.Forms
         $resp = [System.Windows.Forms.MessageBox]::Show(
-            "Environment initialization (Time Sync & Anti-Virus exclusion) requires administrator privileges.`n`nWould you like to elevate now?",
-            "UAC - Elevation Request",
+            $msgBody,
+            "Environment Initialization",
             [System.Windows.Forms.MessageBoxButtons]::YesNo,
             [System.Windows.Forms.MessageBoxIcon]::Question
         )
+        
         if ($resp -eq [System.Windows.Forms.DialogResult]::Yes) {
             try {
                 # SMART DETECTION: Always use the current process's executable path
-                # This works for: Standalone EXE, BAT-to-EXE wrapper, or direct BAT execution
                 $currentExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-                
-                # Check if we're running inside a BAT-to-EXE wrapper or as PowerShell
                 $isPowerShell = $currentExe -match "powershell|pwsh"
                 
                 if ($isPowerShell) {
-                    # Running directly as BAT/PS1, need to launch cmd with the script
-                    # Use proper escaping for paths with spaces
+                    # Running directly as BAT/PS1
                     Start-Process "cmd.exe" -ArgumentList "/c `"`"$f`" am_wt`"" -Verb RunAs -ErrorAction Stop
                 } else {
-                    # Running as compiled EXE (or BAT-to-EXE wrapper) - relaunch the EXE itself
+                    # Running as compiled EXE
                     Start-Process $currentExe -ArgumentList "am_wt" -Verb RunAs -ErrorAction Stop
                 }
                 
@@ -867,18 +950,29 @@ if ($needsAV -or $needsSync) {
             try {
                 Add-MpPreference -ExclusionPath $localAppData, (Split-Path $f) -ErrorAction SilentlyContinue
                 Write-Host "      [SUCCESS] Folders Whitelisted." -ForegroundColor Green
-            } catch {}
+            } catch {
+                Write-Host "      [ERROR] Failed to add exclusion." -ForegroundColor Red
+            }
         }
 
         if ($needsSync) {
             Write-Host "      [SYNC] Synchronizing System Clock & DNS..." -ForegroundColor Cyan
             try {
+                # 1. Start Time Service if stopped
                 $timeSvc = Get-Service w32time -ErrorAction SilentlyContinue
                 if ($timeSvc.Status -ne 'Running') { Start-Service w32time }
-                & w32tm /resync /force | Out-Null
+                
+                # 2. Force Resync
+                $proc = Start-Process w32tm -ArgumentList "/resync", "/force" -NoNewWindow -PassThru -Wait
+                
+                # 3. Flush DNS
                 Clear-DnsClientCache -ErrorAction SilentlyContinue
-                "Synced" | Out-File $syncFlag
-                Write-Host "      [SUCCESS] Time & DNS Synced." -ForegroundColor Green
+                
+                if ($proc.ExitCode -eq 0) {
+                    Write-Host "      [SUCCESS] Time & DNS Synced." -ForegroundColor Green
+                } else {
+                    Write-Host "      [WARN] Windows Time Service reported an error." -ForegroundColor Yellow
+                }
             } catch {
                 Write-Host "      [WARN] Sync failed (Server Unreachable)." -ForegroundColor DarkGray
             }
@@ -1913,147 +2007,141 @@ function Test-FileNeedsDownload($filePath, $fileName) {
 
 function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOverwrite=$false) {
     # --- PHASE 0: PRE-FLIGHT CLEANUP ---
-    # Ensure a fresh start if forceOverwrite is requested
     if ($forceOverwrite -and (Test-Path $destination)) {
-        Write-Host "      [CLEANUP] Removing existing file for fresh overwrite..." -ForegroundColor Gray
         Remove-Item $destination -Force -ErrorAction SilentlyContinue
     }
 
-    # --- PHASE 1: CHECK FOR EXISTING wget.exe ---
-    $wgetExe = Get-Command wget.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    
-    # --- PHASE 1.5: AUTO-INSTALL wget IF ADMIN ---
-    if (-not $wgetExe -and $global:isAdmin) {
-        # Check if winget is available
-        $wingetExe = Get-Command winget -CommandType Application -ErrorAction SilentlyContinue
-        if ($wingetExe) {
-            Write-Host "`n[SETUP] wget not found. Installing via winget (requires admin)..." -ForegroundColor Yellow
-            try {
-                $installResult = Start-Process winget -ArgumentList "install --id GNU.Wget2 --accept-source-agreements --accept-package-agreements --silent" -Wait -NoNewWindow -PassThru
-                if ($installResult.ExitCode -eq 0) {
-                    Write-Host "      [SUCCESS] wget installed successfully!" -ForegroundColor Green
-                    # Refresh PATH and re-check for wget
-                    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
-                    $wgetExe = Get-Command wget.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-                    if (-not $wgetExe) {
-                        # Try common install paths
-                        $commonPaths = @(
-                            "$env:ProgramFiles\GnuWin32\bin\wget.exe",
-                            "$env:ProgramFiles(x86)\GnuWin32\bin\wget.exe",
-                            "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\*\wget*.exe"
-                        )
-                        foreach ($path in $commonPaths) {
-                            $found = Get-ChildItem $path -ErrorAction SilentlyContinue | Select-Object -First 1
-                            if ($found) { $wgetExe = $found; break }
-                        }
-                    }
-                } else {
-                    Write-Host "      [WARN] winget install returned code $($installResult.ExitCode)" -ForegroundColor Yellow
-                }
-            } catch {
-                Write-Host "      [WARN] Failed to install wget: $($_.Exception.Message)" -ForegroundColor Yellow
-            }
-        }
+    $toolDir = "$env:LOCALAPPDATA\HytaleTools"
+    $localWget = Join-Path $toolDir "wget.exe"
+    if (-not (Test-Path $toolDir)) { New-Item -ItemType Directory $toolDir -Force | Out-Null }
+
+    $wgetExe = $null
+
+    # --- PHASE 1: CHECK FOR EXISTING WGET ---
+    if (Test-Path $localWget) {
+        $wgetExe = [PSCustomObject]@{ Source = $localWget }
     }
     
-    # --- PHASE 2: TURBO ATTEMPT (wget.exe) ---
-    if ($wgetExe) {
-        Write-Host "`n[TURBO] Initializing wget high-speed transfer..." -ForegroundColor Cyan
-        
-        # Ensure directory exists
-        $dir = Split-Path $destination
-        if (-not (Test-Path $dir)) { New-Item -ItemType Directory $dir -Force | Out-Null }
+    if (-not $wgetExe) {
+        try { $wgetExe = Get-Command wget.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1 } catch {}
+    }
 
+    # --- PHASE 1.5: AUTO-PROVISION WGET 1.21.4 ---
+    if (-not $wgetExe) {
+        Write-Host "`n[SETUP] Compatible wget not found. Downloading v1.21.4..." -ForegroundColor Yellow
+        $zipUrl = "https://eternallybored.org/misc/wget/releases/wget-1.21.4-win64.zip"
+        $zipPath = "$env:TEMP\wget_temp.zip"
+        $extractPath = "$env:TEMP\wget_extract"
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add("User-Agent", "Mozilla/5.0")
+            $wc.DownloadFile($zipUrl, $zipPath)
+            Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+            $foundExe = Get-ChildItem -Path $extractPath -Filter "wget.exe" -Recurse | Select-Object -First 1
+            if ($foundExe) {
+                Move-Item -Path $foundExe.FullName -Destination $localWget -Force
+                $wgetExe = [PSCustomObject]@{ Source = $localWget }
+            }
+            Remove-Item $zipPath, $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+        } catch { Write-Host "      [WARN] Failed to auto-install wget." -ForegroundColor Red }
+    }
+    
+    # --- PHASE 2: TURBO ATTEMPT (wget) ---
+    if ($wgetExe) {
+        if (-not $global:hasShownTurboMsg) { 
+            Write-Host "      [TURBO] High-speed transfer enabled." -ForegroundColor Green
+            $global:hasShownTurboMsg = $true
+        }
+        
+        $exePath = $wgetExe.Source
+        $dir = Split-Path $destination
+        if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory $dir -Force | Out-Null }
+
+        # FIXED ARGUMENT HANDLING:
+        # We combine the flag and the value into ONE string (e.g., --user-agent=VALUE).
+        # This prevents the shell from splitting the string at the spaces.
+        $userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        
         $wgetArgs = @(
-            "--tries=5", 
-            "--timeout=30", 
-            "--show-progress", 
-            "--no-check-certificate", 
-            "--user-agent='Mozilla/5.0'",
-            "--inet4-only"
+            "--no-config",
+            "--tries=3",
+            "--timeout=20",
+            "--no-check-certificate",
+            "--user-agent=$userAgent",
+            "--inet4-only",
+            "--show-progress",
+            "--progress=bar:force:noscroll"
         )
 
-        # Only use --continue if we are NOT forcing an overwrite
-        if (-not $forceOverwrite) { 
-            $wgetArgs += "--continue" 
-        }
-        
+        if (-not $forceOverwrite) { $wgetArgs += "--continue" }
+
+        # FIXED HEADER HANDLING:
         if ($useHeaders -and $global:HEADERS) {
-            foreach ($key in $global:HEADERS.Keys) {
-                $wgetArgs += "--header=`"${key}: $($global:HEADERS[$key])`""
+            foreach ($k in $global:HEADERS.Keys) {
+                $val = $global:HEADERS[$k]
+                # Combine flag and value into a single item to prevent space-splitting
+                $wgetArgs += "--header=$($k): $($val)"
             }
         }
         
-        $wgetArgs += @("-O", "`"$destination`"", "`"$url`"")
+        # Add output and URL
+        $wgetArgs += "-O"
+        $wgetArgs += $destination
+        $wgetArgs += $url
 
         try {
-            # Capture output to check for 416 errors
-            $logFile = Join-Path $env:TEMP "wget_log.txt"
-            $proc = Start-Process $wgetExe.Source -ArgumentList ($wgetArgs + "--output-file=`"$logFile`"") -Wait -NoNewWindow -PassThru
+            # Use the Call Operator (&) which is much better than Start-Process 
+            # for passing arrays of arguments to native .exe files.
+            & $exePath $wgetArgs
             
-            $wgetOutput = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
-            if (Test-Path $logFile) { Remove-Item $logFile -Force }
-
-            if ($proc.ExitCode -eq 0) {
-                Write-Host "      [SUCCESS] Turbo download complete.`n" -ForegroundColor Green
-                return $true
+            if ($LASTEXITCODE -eq 0) { 
+                return $true 
             } 
-            # Detect 416 or "already fully retrieved" inside wget output
-            elseif ($wgetOutput -match "416 Requested Range Not Satisfiable" -or $wgetOutput -match "already fully retrieved") {
-                Write-Host "      [FIX] Detected partial file conflict. Forcing reset..." -ForegroundColor Yellow
-                Remove-Item $destination -Force -ErrorAction SilentlyContinue
-                # Recursive call with forceOverwrite enabled
-                return Download-WithProgress $url $destination $useHeaders $true
+            elseif ($LASTEXITCODE -eq 8) { 
+                Write-Host "      [403] Server refused request. Falling back..." -ForegroundColor Yellow
             }
-            
-            Write-Host "      [WARN] Turbo transfer failed (Code: $($proc.ExitCode)). Switching to Fallback...`n" -ForegroundColor Yellow
         } catch {
-            Write-Host "      [WARN] wget execution error. Using Fallback...`n" -ForegroundColor Yellow
+            Write-Host "      [ERROR] Turbo process failed: $_" -ForegroundColor DarkGray
         }
     }
 
     # --- PHASE 3: STANDARD FALLBACK ---
-    Write-Host "`n[FALLBACK] Starting streaming download..." -ForegroundColor Gray
+    Write-Host "      [FALLBACK] Using standard download stream..." -ForegroundColor Gray
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    
     $client = New-Object System.Net.Http.HttpClient
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
     if ($useHeaders -and $global:HEADERS) { 
-        foreach ($key in $global:HEADERS.Keys) { $client.DefaultRequestHeaders.TryAddWithoutValidation($key, $global:HEADERS[$key]) } 
+        foreach ($k in $global:HEADERS.Keys) { 
+            $client.DefaultRequestHeaders.TryAddWithoutValidation($k, $global:HEADERS[$k]) | Out-Null
+        } 
     }
 
     $existingOffset = 0
     if (-not $forceOverwrite -and (Test-Path $destination)) { $existingOffset = (Get-Item $destination).Length }
-    
-    # Only set Range header if we are actually resuming
     if ($existingOffset -gt 0) { 
         $client.DefaultRequestHeaders.Range = New-Object System.Net.Http.Headers.RangeHeaderValue($existingOffset, $null) 
     }
 
     try {
         $response = $client.GetAsync($url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
-        
-        # Handle 416 error in Fallback mode
-        if ($response.StatusCode -eq 416) {
-             Write-Host "      [INFO] Server rejected range. Resetting file..." -ForegroundColor Gray
-             $client.Dispose()
-             return Download-WithProgress $url $destination $useHeaders $true
+        if ($response.StatusCode -eq 416) { 
+            $client.Dispose()
+            return Download-WithProgress $url $destination $useHeaders $true 
         }
         
         if ($response.IsSuccessStatusCode) {
             $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-            # If we are resuming, Append. If not, Create.
             $fileMode = if ($existingOffset -gt 0 -and $response.StatusCode -eq 206) { [System.IO.FileMode]::Append } else { [System.IO.FileMode]::Create }
             $fileStream = [System.IO.File]::Open($destination, $fileMode)
-            
             $buffer = New-Object byte[] 1MB
-            while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-                $fileStream.Write($buffer, 0, $read)
-            }
-            $fileStream.Close(); $stream.Close();
+            while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) { $fileStream.Write($buffer, 0, $read) }
+            $fileStream.Close(); $stream.Close()
             return $true
         }
-    } catch {
-        Write-Host "      [ERROR] Fallback failed: $($_.Exception.Message)" -ForegroundColor Red
+    } catch { 
+        Write-Host "      [ERROR] Download failed: $($_.Exception.Message)" -ForegroundColor Red 
     } finally { 
         if ($client) { $client.Dispose() }
     }
@@ -3131,7 +3219,7 @@ while ($true) {
     }
 
     # REFRESH GAME PATH (Critical: After updates, the path may have changed)
-    $gameExe = Resolve-GamePath
+    $gameExe = Resolve-GamePath -NoPrompt
     if (-not $gameExe) {
         # If still not found, default to standard path
         $gameExe = Join-Path $localAppData "release\package\game\latest\Client\HytaleClient.exe"
@@ -3184,6 +3272,7 @@ while ($true) {
     } catch {
         Write-Host "[WARN] Update server unreachable." -ForegroundColor Yellow
     }
+    $ESC = [char]27
 
     # 3. Decision Tree
     if ((Safe-TestPath $gameExe) -and -not $global:forceShowMenu) {
@@ -3277,6 +3366,16 @@ while ($true) {
         }
 
         if ($choice -eq "1") {
+            # FIX: Clear previous menu output before drawing the second menu
+            # Move cursor back to the line before the "Available Actions" message and clear down.
+            if ($menu1StartRow -gt 0) {
+                [Console]::SetCursorPosition(0, $menu1StartRow)
+                [Console]::Write("$ESC[J")
+            } else {
+                Clear-Host # Fallback if row detection fails
+            }
+
+            
             # Ask for branch preference
             Write-Host "`n[BRANCH] Select default update channel:" -ForegroundColor Cyan
             $branchOps = @("Release (Stable)", "Pre-release (Experimental)")
