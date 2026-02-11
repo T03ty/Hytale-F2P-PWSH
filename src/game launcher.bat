@@ -2021,12 +2021,11 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
     if (Test-Path $localWget) {
         $wgetExe = [PSCustomObject]@{ Source = $localWget }
     }
-    
     if (-not $wgetExe) {
         try { $wgetExe = Get-Command wget.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1 } catch {}
     }
 
-    # --- PHASE 1.5: AUTO-PROVISION WGET 1.21.4 ---
+    # --- PHASE 1.5: AUTO-PROVISION WGET ---
     if (-not $wgetExe) {
         Write-Host "`n[SETUP] Compatible wget not found. Downloading v1.21.4..." -ForegroundColor Yellow
         $zipUrl = "https://eternallybored.org/misc/wget/releases/wget-1.21.4-win64.zip"
@@ -2047,6 +2046,19 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
         } catch { Write-Host "      [WARN] Failed to auto-install wget." -ForegroundColor Red }
     }
     
+    # --- INTELLIGENT USER-AGENT & HEADER SELECTION ---
+    # Logic: Only use Custom UA and Auth Token if communicating with our specific API.
+    # For everything else (Official Servers), use standard Chrome UA.
+    
+    $isApiTarget = $url -match "file\.hytaleapi\.online"
+    $chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    
+    if ($isApiTarget -and $global:HEADERS.ContainsKey('User-Agent')) {
+        $userAgent = $global:HEADERS['User-Agent']
+    } else {
+        $userAgent = $chromeUA
+    }
+
     # --- PHASE 2: TURBO ATTEMPT (wget) ---
     if ($wgetExe) {
         if (-not $global:hasShownTurboMsg) { 
@@ -2058,17 +2070,12 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
         $dir = Split-Path $destination
         if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory $dir -Force | Out-Null }
 
-        # FIXED ARGUMENT HANDLING:
-        # We combine the flag and the value into ONE string (e.g., --user-agent=VALUE).
-        # This prevents the shell from splitting the string at the spaces.
-        $userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        
         $wgetArgs = @(
             "--no-config",
             "--tries=3",
             "--timeout=20",
             "--no-check-certificate",
-            "--user-agent=$userAgent",
+            "--user-agent=`"$userAgent`"", 
             "--inet4-only",
             "--show-progress",
             "--progress=bar:force:noscroll"
@@ -2076,31 +2083,29 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
 
         if (-not $forceOverwrite) { $wgetArgs += "--continue" }
 
-        # FIXED HEADER HANDLING:
+        # FILTERED HEADERS
         if ($useHeaders -and $global:HEADERS) {
             foreach ($k in $global:HEADERS.Keys) {
+                # 1. Skip User-Agent (Handled by flag)
+                if ($k -eq 'User-Agent') { continue }
+                
+                # 2. Skip Auth Token if NOT targeting our API (Prevents 403s on official servers)
+                if ((-not $isApiTarget) -and ($k -eq 'X-Auth-Token')) { continue }
+
                 $val = $global:HEADERS[$k]
-                # Combine flag and value into a single item to prevent space-splitting
                 $wgetArgs += "--header=$($k): $($val)"
             }
         }
         
-        # Add output and URL
         $wgetArgs += "-O"
         $wgetArgs += $destination
         $wgetArgs += $url
 
         try {
-            # Use the Call Operator (&) which is much better than Start-Process 
-            # for passing arrays of arguments to native .exe files.
             & $exePath $wgetArgs
             
-            if ($LASTEXITCODE -eq 0) { 
-                return $true 
-            } 
-            elseif ($LASTEXITCODE -eq 8) { 
-                Write-Host "      [403] Server refused request. Falling back..." -ForegroundColor Yellow
-            }
+            if ($LASTEXITCODE -eq 0) { return $true } 
+            elseif ($LASTEXITCODE -eq 8) { Write-Host "      [403] Server refused request." -ForegroundColor Yellow }
         } catch {
             Write-Host "      [ERROR] Turbo process failed: $_" -ForegroundColor DarkGray
         }
@@ -2110,10 +2115,18 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
     Write-Host "      [FALLBACK] Using standard download stream..." -ForegroundColor Gray
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $client = New-Object System.Net.Http.HttpClient
-    $client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
+    # Set Calculated User-Agent
+    $client.DefaultRequestHeaders.UserAgent.TryParseAdd($userAgent) | Out-Null
     
     if ($useHeaders -and $global:HEADERS) { 
         foreach ($k in $global:HEADERS.Keys) { 
+            # 1. Skip User-Agent (Handled above)
+            if ($k -eq 'User-Agent') { continue }
+            
+            # 2. Skip Auth Token if NOT targeting our API
+            if ((-not $isApiTarget) -and ($k -eq 'X-Auth-Token')) { continue }
+
             $client.DefaultRequestHeaders.TryAddWithoutValidation($k, $global:HEADERS[$k]) | Out-Null
         } 
     }
@@ -2139,6 +2152,8 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
             while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) { $fileStream.Write($buffer, 0, $read) }
             $fileStream.Close(); $stream.Close()
             return $true
+        } else {
+             Write-Host "      [HTTP ERROR] Status: $($response.StatusCode)" -ForegroundColor Red
         }
     } catch { 
         Write-Host "      [ERROR] Download failed: $($_.Exception.Message)" -ForegroundColor Red 
@@ -2238,124 +2253,174 @@ function Install-HyFixes {
 
 function Get-LatestPatchVersion {
     param([string]$branch = "release")  # Support "release" or "pre-release"
-    
+
     $cacheFile = Join-Path $cacheDir "highest_version_$branch.txt"
     $versionFile = Join-Path $localAppData "current_version.txt"
     $api_url = "https://files.hytalef2p.com/api/patch_manifest"
     $version_api = "https://files.hytalef2p.com/api/version_client?branch=$branch"
     
+    # MIRROR API
+    $mirror_api = "$API_HOST/api/yarn/file" 
+    
     # 0. Detect Current Local Version
     $localVer = if (Test-Path $versionFile) { [int](Get-Content $versionFile) } else { 0 }
+    
+    # Reset Globals
     $global:RemotePatchUrl = $null
     $global:IsDeltaPatch = $false
-    $global:TargetBranch = $branch  # Store branch for later use
+    $global:TargetBranch = $branch
 
-    # --- 0.5. Try Branch-Specific Version API First ---
+    $latestVerCandidate = 0
+    $officialServerForbidden = $false
+
+    # ==============================================================================
+    # 1. CHECK OFFICIAL API
+    # ==============================================================================
     try {
         Write-Host "      [API] Fetching $branch client version..." -ForegroundColor Gray
-        $verRes = Invoke-RestMethod -Uri $version_api -Headers @{ 'User-Agent' = 'Hytale-F2P-Launcher' } -TimeoutSec 5
+        $verRes = Invoke-RestMethod -Uri $version_api -Headers $global:HEADERS -TimeoutSec 5
         
         if ($verRes -and $verRes.client_version) {
-            # Parse version number from "8.pwr" or "20.pwr"
             $pwrFile = $verRes.client_version
             if ($pwrFile -match "^(\d+)\.pwr$") {
-                $latestVer = [int]$Matches[1]
+                $latestVerCandidate = [int]$Matches[1]
+                $officialUrl = "$OFFICIAL_BASE/windows/amd64/$branch/0/$latestVerCandidate.pwr"
                 
-                # Build the PWR download URL
-                $global:RemotePatchUrl = "$OFFICIAL_BASE/windows/amd64/$branch/0/$latestVer.pwr"
-                $global:IsDeltaPatch = $false
-                $latestVer | Out-File $cacheFile
-                
-                Write-Host "      [SUCCESS] Target: v$latestVer ($branch branch)" -ForegroundColor Green
-                return $latestVer
+                # Check accessibility
+                try {
+                    $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Head, $officialUrl)
+                    $c = [System.Net.Http.HttpClient]::new(); $c.Timeout = [TimeSpan]::FromSeconds(3)
+                    $r = $c.SendAsync($req).GetAwaiter().GetResult()
+                    
+                    if ($r.StatusCode -eq [System.Net.HttpStatusCode]::Forbidden) {
+                         # CRITICAL FIX: Mark forbidden and ensure URL is NULL so we fallback to mirror
+                         $officialServerForbidden = $true
+                         $global:RemotePatchUrl = $null 
+                         Write-Host "      [WARN] Official Server 403 Forbidden. Switching to Mirror..." -ForegroundColor Yellow
+                    }
+                    elseif ($r.IsSuccessStatusCode) {
+                        $global:RemotePatchUrl = $officialUrl
+                        $latestVerCandidate | Out-File $cacheFile
+                        Write-Host "      [SUCCESS] Target: v$latestVerCandidate ($branch branch)" -ForegroundColor Green
+                        
+                        $r.Dispose(); $c.Dispose()
+                        return $latestVerCandidate
+                    } 
+                    else {
+                        Write-Host "      [WARN] Official Server Error ($($r.StatusCode)). Switching to Mirror..." -ForegroundColor Yellow
+                    }
+                    $r.Dispose(); $c.Dispose()
+                } catch {
+                    Write-Host "      [WARN] Official Server unreachable. Switching to Mirror..." -ForegroundColor Yellow
+                }
             }
         }
     } catch {
         Write-Host "      [WARN] Version API unavailable for $branch." -ForegroundColor Yellow
     }
 
-    # --- 1. Try API Manifest (Fallback) ---
-    try {
-        Write-Host "      [API] Fetching latest patch manifest..." -ForegroundColor Gray
-        $api_res = Invoke-RestMethod -Uri $api_url -Headers @{ 'User-Agent' = 'Hytale-F2P-Launcher' } -TimeoutSec 5
-        
-        if ($api_res -and $api_res.patches) {
-            $versions = $api_res.patches.PSObject.Properties.Name | ForEach-Object { [int]$_ }
-            $latestVer = ($versions | Measure-Object -Maximum).Maximum
-            $verKey = $latestVer.ToString()
-            $pData = $api_res.patches.$verKey
-
-            # DECISION LOGIC: Can we use a small patch or do we need the full file?
-            $checkUrls = @()
+    # ==============================================================================
+    # 2. CHECK MIRROR (Backup)
+    # Only runs if Official URL failed or was Forbidden
+    # ==============================================================================
+    if (-not $global:RemotePatchUrl) {
+        try {
+            Write-Host "      [Fallback] Contacting $API_HOST..." -ForegroundColor Magenta
             
-            # If we are only 1 version behind, try the Patch URL first (Delta)
-            if ($pData.from -eq $localVer.ToString() -and $pData.patch_url) {
-                $checkUrls += @{ Url = $pData.patch_url; IsDelta = $true }
-            }
+            # Use Global Headers for Auth
+            $mirrorJson = Invoke-RestMethod -Uri $mirror_api -Headers $global:HEADERS -TimeoutSec 8
             
-            # Always have the Original URL as the secondary choice (Full)
-            if ($pData.original_url) {
-                $checkUrls += @{ Url = $pData.original_url; IsDelta = $false }
-            }
+            if ($mirrorJson) {
+                # Handle "pre-release" key with quotes
+                $fileList = $mirrorJson."$branch"
+                
+                if ($fileList) {
+                    $maxVer = 0
+                    $bestUrl = $null
+                    $isDelta = $false
 
-            # --- URL VALIDATION (Is it downloadable?) ---
-            $httpClient = New-Object System.Net.Http.HttpClient
-            $httpClient.Timeout = [System.TimeSpan]::FromSeconds(3)
-
-            foreach ($entry in $checkUrls) {
-                try {
-                    $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Head, $entry.Url)
-                    $res = $httpClient.SendAsync($req).GetAwaiter().GetResult()
-                    
-                    if ($res.IsSuccessStatusCode) {
-                        $global:RemotePatchUrl = $entry.Url
-                        $global:IsDeltaPatch = $entry.IsDelta
-                        $latestVer | Out-File $cacheFile
-                        
-                        $type = if ($entry.IsDelta) { "Delta Patch (Small)" } else { "Full Build (Large)" }
-                        Write-Host "      [SUCCESS] Target: v$latestVer ($type)" -ForegroundColor Green
-                        $res.Dispose(); break
+                    foreach ($fileName in $fileList) {
+                        # Type A: Full Build
+                        if ($fileName -match "^v(\d+)-windows-amd64\.pwr$") {
+                            $v = [int]$Matches[1]
+                            if ($v -gt $localVer -and $v -gt $maxVer) {
+                                $maxVer = $v
+                                $bestUrl = "$mirror_api/$fileName" 
+                                $isDelta = $false
+                            }
+                        }
+                        # Type B: Delta Patch
+                        elseif ($fileName -match "^v(\d+)~(\d+)-windows-amd64\.pwr$") {
+                            $cntFrom = [int]$Matches[1]
+                            $cntTo = [int]$Matches[2]
+                            if ($cntFrom -eq $localVer -and $cntTo -gt $maxVer) {
+                                $maxVer = $cntTo
+                                $bestUrl = "$mirror_api/$fileName"
+                                $isDelta = $true
+                            }
+                        }
                     }
-                } catch { }
+
+                    if ($bestUrl) {
+                         # CRITICAL FIX: Set the global URL to the MIRROR URL
+                         $global:RemotePatchUrl = $bestUrl
+                         $global:IsDeltaPatch = $isDelta
+                         $maxVer | Out-File $cacheFile
+                         Write-Host "      [SUCCESS] Mirror Found v$maxVer (Source: ShipOfYarn)" -ForegroundColor Green
+                         return $maxVer
+                    }
+                }
             }
-            $httpClient.Dispose()
-            
-            if ($global:RemotePatchUrl) { return $latestVer }
+        } catch {
+            Write-Host "      [WARN] Mirror unavailable: $_" -ForegroundColor Yellow
         }
-    } catch {
-        Write-Host "      [WARN] Manifest API unavailable." -ForegroundColor Yellow
     }
 
-    # --- 2. Fallback: Manual CDN Probe (If API fails) ---
-    $client = New-Object System.Net.Http.HttpClient
-    $currentStart = if (Test-Path $cacheFile) { [int](Get-Content $cacheFile) } else { 0 }
-    $highestFound = $currentStart
-    $batchSize = 10 
-
-    Write-Host "      [PROBE] Scanning CDN for $branch updates..." -ForegroundColor Gray
-
-    while ($true) {
-        $tasks = New-Object System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]
-        $range = $currentStart..($currentStart + $batchSize)
-        foreach ($i in $range) {
-            $url = "$OFFICIAL_BASE/windows/amd64/$branch/0/$i.pwr"
-            $tasks.Add($client.SendAsync((New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Head, $url))))
-        }
-        try { [System.Threading.Tasks.Task]::WaitAll($tasks.ToArray()) } catch {}
-        $found = $false
-        for ($j = $batchSize; $j -ge 0; $j--) {
-            if ($tasks[$j].Status -eq 'RanToCompletion' -and $tasks[$j].Result.IsSuccessStatusCode) {
-                $highestFound = $range[$j]
-                $global:RemotePatchUrl = "$OFFICIAL_BASE/windows/amd64/$branch/0/$highestFound.pwr"
-                $global:IsDeltaPatch = $false
-                $found = $true; break
-            }
-        }
-        if (-not $found) { break } else { $currentStart += ($batchSize + 1) }
+    # ==============================================================================
+    # 3. MANUAL PROBE (Last Resort)
+    # ==============================================================================
+    
+    # CRITICAL FIX: If Official Server is Forbidden (403), the Probe will just fail/spam errors.
+    # We must skip the probe in this case.
+    if ($officialServerForbidden) {
+        Write-Host "      [SKIP] CDN Probe skipped (Server Forbidden)." -ForegroundColor Red
+        return 0
     }
-    $client.Dispose()
-    $highestFound | Out-File $cacheFile
-    return $highestFound
+
+    # Only run probe if we haven't found a URL yet
+    if (-not $global:RemotePatchUrl) {
+        $client = New-Object System.Net.Http.HttpClient
+        $currentStart = if (Test-Path $cacheFile) { [int](Get-Content $cacheFile) } else { 0 }
+        $highestFound = $currentStart
+        $batchSize = 10 
+
+        Write-Host "      [PROBE] Scanning CDN for $branch updates..." -ForegroundColor Gray
+
+        while ($true) {
+            $tasks = New-Object System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]
+            $range = $currentStart..($currentStart + $batchSize)
+            foreach ($i in $range) {
+                $url = "$OFFICIAL_BASE/windows/amd64/$branch/0/$i.pwr"
+                $tasks.Add($client.SendAsync((New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Head, $url))))
+            }
+            try { [System.Threading.Tasks.Task]::WaitAll($tasks.ToArray()) } catch {}
+            $found = $false
+            for ($j = $batchSize; $j -ge 0; $j--) {
+                if ($tasks[$j].Status -eq 'RanToCompletion' -and $tasks[$j].Result.IsSuccessStatusCode) {
+                    $highestFound = $range[$j]
+                    $global:RemotePatchUrl = "$OFFICIAL_BASE/windows/amd64/$branch/0/$highestFound.pwr"
+                    $global:IsDeltaPatch = $false
+                    $found = $true; break
+                }
+            }
+            if (-not $found) { break } else { $currentStart += ($batchSize + 1) }
+        }
+        $client.Dispose()
+        $highestFound | Out-File $cacheFile
+        return $highestFound
+    }
+    
+    return 0
 }
 
 function Find-OfficialPatch($version) {
@@ -2381,6 +2446,7 @@ function Find-OfficialPatch($version) {
 
     return $null
 }
+
 
 function Ensure-JRE($launcherRoot, $cacheDir) {
     $jreDir = Join-Path $launcherRoot "release\package\jre"
