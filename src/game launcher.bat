@@ -609,9 +609,11 @@ function Get-LatestLauncherInfo {
                 Url = $asset.browser_download_url;
                 Name = $asset.name
             }
+        } else {
+            Write-Host "      [WARN] Release found ($($release.tag_name)) but no .exe asset." -ForegroundColor Yellow
         }
     } catch {
-        Write-Host "      [WARN] Could not reach GitHub API." -ForegroundColor Yellow
+        Write-Host "      [WARN] Could not reach GitHub API: $($_.Exception.Message)" -ForegroundColor Yellow
     }
     return $null
 }
@@ -626,9 +628,10 @@ function Ensure-LauncherExe {
     if (Test-Path $installedFile) {
         $localVersionStr = (Get-Item $installedFile).VersionInfo.ProductVersion
         
-        # Clean strings (remove 'v')
-        $cleanRemote = if ($latest) { $latest.Version -replace 'v', '' } else { "0.0.0" }
-        $cleanLocal = $localVersionStr -replace 'v', ''
+        # Clean strings (Keep only numbers and dots)
+        # Regex [^0-9\.] matches any character that is NOT a number or a dot.
+        $cleanRemote = if ($latest) { $latest.Version -replace '[^0-9\.]', '' } else { "0.0.0" }
+        $cleanLocal = $localVersionStr -replace '[^0-9\.]', ''
 
         try {
             # FIX: Convert to [System.Version] objects.
@@ -636,10 +639,6 @@ function Ensure-LauncherExe {
             # [System.Version]"2.2.1.0" is EQUAL to [System.Version]"2.2.1"
             $vLocal = [System.Version]$cleanLocal
             $vRemote = [System.Version]$cleanRemote
-
-            Write-Host "      [DEBUG] Version Check:" -ForegroundColor Gray
-            Write-Host "              Local:  $vLocal" -ForegroundColor DarkGray
-            Write-Host "              Remote: $vRemote" -ForegroundColor DarkGray
 
             if ($vLocal -ge $vRemote) {
                 Write-Host "      [SUCCESS] Launcher is up to date." -ForegroundColor Green
@@ -651,6 +650,8 @@ function Ensure-LauncherExe {
         } catch {
             # Fallback to string comparison if version parsing fails
             Write-Host "      [WARN] Could not parse version numbers. Performing string match." -ForegroundColor Yellow
+            Write-Host "      [ERROR] Parsing Error: $($_.Exception.Message)" -ForegroundColor Red
+            
             if ($cleanLocal -eq $cleanRemote) { return } else { $needsUpdate = $true }
         }
     } else {
