@@ -202,9 +202,6 @@ function Set-QuickEditMode {
     }
 }
 
-# Disable Quick Edit at startup (prevents console freeze during automated operations)
-Set-QuickEditMode $false
-
 # --- Interactive Menu with Mouse Click Support ---
 # Works in Windows Terminal with mouse clicks, falls back to keyboard for legacy consoles
 
@@ -561,7 +558,6 @@ function Get-LauncherPath {
     # 5. Check Local AppData (User-only installs)
     if ($env:LOCALAPPDATA) { 
         $searchPaths.Add((Join-Path $env:LOCALAPPDATA "HytaleF2P\Launcher\$LAUNCHER_EXE_NAME"))
-        # Common user-level install path (AppData\Local\Programs)
         $searchPaths.Add((Join-Path $env:LOCALAPPDATA "Programs\Hytale F2P Launcher\$LAUNCHER_EXE_NAME"))
         $searchPaths.Add((Join-Path $env:LOCALAPPDATA "Programs\Hytale F2P\Hytale F2P Launcher\$LAUNCHER_EXE_NAME"))
     }
@@ -574,10 +570,32 @@ function Get-LauncherPath {
         }
     }
 
-    # Return the first one that actually exists
-    foreach ($path in $searchPaths) {
-        if (-not [string]::IsNullOrEmpty($path) -and (Test-Path $path)) { return $path }
+    # --- NEW LOGIC: FIND BEST VERSION ---
+    $foundLaunchers = New-Object System.Collections.Generic.List[PSCustomObject]
+
+    foreach ($path in ($searchPaths | Select-Object -Unique)) {
+        if (-not [string]::IsNullOrEmpty($path) -and (Test-Path $path)) {
+            try {
+                $rawVersion = (Get-Item $path).VersionInfo.ProductVersion
+                $cleanVer = $rawVersion -replace '[^0-9\.]', ''
+                # Ensure the version string is valid for [Version] cast
+                if ($cleanVer -match '^\d+(\.\d+){1,3}$') {
+                    $vObj = [System.Version]$cleanVer
+                    $foundLaunchers.Add([PSCustomObject]@{ Path = $path; Version = $vObj })
+                }
+            } catch {
+                # Fallback for executables without proper metadata
+                $foundLaunchers.Add([PSCustomObject]@{ Path = $path; Version = [System.Version]"0.0.0.0" })
+            }
+        }
     }
+
+    if ($foundLaunchers.Count -gt 0) {
+        # Sort by Version descending and pick the highest
+        $best = $foundLaunchers | Sort-Object Version -Descending | Select-Object -First 1
+        return $best.Path
+    }
+
     return $null
 }
 
@@ -596,108 +614,127 @@ if (-not $global:LAUNCHER_PATH) {
 
 function Get-LatestLauncherInfo {
     try {
-        Write-Host "      [CHECK] Querying GitHub for latest Launcher version..." -ForegroundColor Gray
+        Write-Host "      [CHECK] Querying GitHub for latest Launcher release..." -ForegroundColor Gray
         $uri = "https://api.github.com/repos/$GITHUB_REPO/releases/latest"
         $release = Invoke-RestMethod -Uri $uri -TimeoutSec 10
         
-        # Look for the asset containing "installer" or ".exe"
+        # Look for the .exe installer
         $asset = $release.assets | Where-Object { $_.name -match "\.exe$" } | Select-Object -First 1
         
         if ($asset) {
+            # Extract the SHA256 from the 'digest' field (format is usually "sha256:hexhash")
+            $rawHash = if ($asset.digest) { $asset.digest -replace 'sha256:', '' } else { "" }
+            
             return @{ 
                 Version = $release.tag_name; 
-                Url = $asset.browser_download_url;
-                Name = $asset.name
+                Url     = $asset.browser_download_url;
+                Name    = $asset.name;
+                Hash    = $rawHash.Trim()
             }
         } else {
-            Write-Host "      [WARN] Release found ($($release.tag_name)) but no .exe asset." -ForegroundColor Yellow
+            Write-Host "      [WARN] No .exe asset found in latest release." -ForegroundColor Yellow
         }
     } catch {
-        Write-Host "      [WARN] Could not reach GitHub API: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "      [WARN] Could not reach GitHub API." -ForegroundColor Yellow
     }
     return $null
 }
 
 function Ensure-LauncherExe {
     $latest = Get-LatestLauncherInfo
+    if (-not $latest) { return }
+
     $installedFile = $global:LAUNCHER_PATH
-    
+    $hashCacheFile = Join-Path $localAppData "launcher_install_hash.txt"
     $needsUpdate = $false
+
+    # 1. PRIMARY CHECK: SHA256 HASH (The "Bulletproof" Method)
+    # If the installer hash matches what we last installed, we are 100% up to date.
+    if (Test-Path $hashCacheFile) {
+        $lastInstalledHash = Get-Content $hashCacheFile -Raw
+        if ($latest.Hash -and ($lastInstalledHash.Trim() -eq $latest.Hash)) {
+            Write-Host "      [SUCCESS] Launcher hash matches latest release. Skipping update." -ForegroundColor Green
+            return
+        }
+    }
     
-    # --- VERSION CHECK ---
+    # 2. SECONDARY CHECK: VERSION METADATA (Standard Fallback)
     if (Test-Path $installedFile) {
         $localVersionStr = (Get-Item $installedFile).VersionInfo.ProductVersion
-        
-        # Clean strings (Keep only numbers and dots)
-        # Regex [^0-9\.] matches any character that is NOT a number or a dot.
-        $cleanRemote = if ($latest) { $latest.Version -replace '[^0-9\.]', '' } else { "0.0.0" }
-        $cleanLocal = $localVersionStr -replace '[^0-9\.]', ''
+        $cleanRemote = $latest.Version -replace '[^0-9\.]', ''
+        $cleanLocal  = $localVersionStr -replace '[^0-9\.]', ''
 
         try {
-            # FIX: Convert to [System.Version] objects.
-            # This handles the mismatch where Windows reports "2.2.1.0" but GitHub says "2.2.1".
-            # [System.Version]"2.2.1.0" is EQUAL to [System.Version]"2.2.1"
-            $vLocal = [System.Version]$cleanLocal
+            $vLocal  = [System.Version]$cleanLocal
             $vRemote = [System.Version]$cleanRemote
-
+            
             if ($vLocal -ge $vRemote) {
-                Write-Host "      [SUCCESS] Launcher is up to date." -ForegroundColor Green
-                return # Exit function early
+                Write-Host "      [SUCCESS] Internal version (v$vLocal) is up to date." -ForegroundColor Green
+                # Record the hash now so we don't check the version again next time
+                if ($latest.Hash) { $latest.Hash | Out-File $hashCacheFile -Force }
+                return 
             } else {
-                Write-Host "      [UPDATE] New version found ($vRemote)." -ForegroundColor Yellow
+                Write-Host "      [UPDATE] Newer version detected via metadata (v$vRemote)." -ForegroundColor Yellow
                 $needsUpdate = $true
             }
         } catch {
-            # Fallback to string comparison if version parsing fails
-            Write-Host "      [WARN] Could not parse version numbers. Performing string match." -ForegroundColor Yellow
-            Write-Host "      [ERROR] Parsing Error: $($_.Exception.Message)" -ForegroundColor Red
-            
-            if ($cleanLocal -eq $cleanRemote) { return } else { $needsUpdate = $true }
+            # If parsing fails but hashes didn't match earlier, we should update.
+            $needsUpdate = $true
         }
     } else {
         Write-Host "      [MISSING] Launcher not installed." -ForegroundColor Yellow
         $needsUpdate = $true
     }
 
-    if ($needsUpdate -and $latest) {
-        # --- PREPARE INSTALLER DOWNLOAD ---
+    # --- EXECUTE UPDATE ---
+    if ($needsUpdate) {
         $installerPath = Join-Path $env:TEMP "HytaleF2P_Setup_$($latest.Version).exe"
-        
         Write-Host "`n[DOWNLOAD] Fetching Installer ($($latest.Name))..." -ForegroundColor Cyan
         
         try {
+            # Download using your progress helper
             if (Get-Command "Download-WithProgress" -ErrorAction SilentlyContinue) {
-                # Pass $true for overwrite to ensure fresh installer
                 Download-WithProgress $latest.Url $installerPath $false $true
             } else {
                 Invoke-WebRequest -Uri $latest.Url -OutFile $installerPath -UseBasicParsing
             }
 
             if (Test-Path $installerPath) {
+                # Optional: Verify the hash of the downloaded file before running it
+                $downloadedFileHash = (Get-FileHash $installerPath -Algorithm SHA256).Hash
+                if ($latest.Hash -and ($downloadedFileHash -ne $latest.Hash)) {
+                    Write-Host "      [ERROR] Downloaded file hash mismatch! Security abort." -ForegroundColor Red
+                    return
+                }
+
                 Write-Host "      [INSTALL] Running Installer..." -ForegroundColor Cyan
-                Write-Host "      [INFO] Follow the on-screen instructions to update/install." -ForegroundColor Yellow
-                
-                # Run the installer and wait for it to close
                 $proc = Start-Process -FilePath $installerPath -Wait -PassThru
                 
-                Write-Host "      [SUCCESS] Installation process finished (Code: $($proc.ExitCode))." -ForegroundColor Green
+                if ($proc.ExitCode -eq 0) {
+                    Write-Host "      [SUCCESS] Installation successful." -ForegroundColor Green
+                    
+                    # --- CRITICAL: RECORD THE SUCCESSFUL INSTALLER HASH ---
+                    # This stops the update loop even if the .exe version info is still wrong.
+                    if ($latest.Hash) {
+                        $latest.Hash | Out-File $hashCacheFile -Force
+                    } else {
+                        # If GitHub didn't provide a digest, use the hash of the file we just ran
+                        $downloadedFileHash | Out-File $hashCacheFile -Force
+                    }
+                }
                 
-                # Cleanup the installer file
                 Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-                
-                # Re-check if the file exists now
-                if (Test-Path $installedFile) {
-                    Write-Host "      [READY] New version installed." -ForegroundColor Green
+                # Refresh launcher path
+                if (Get-Command "Get-LauncherPath" -ErrorAction SilentlyContinue) {
+                    $global:LAUNCHER_PATH = Get-LauncherPath
                 }
             }
         } catch {
-            Write-Host "      [ERROR] Failed to download or run installer: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "      [ERROR] Failed to update: $($_.Exception.Message)" -ForegroundColor Red
         }
     }
 }
 
-# Trigger Check
-Ensure-LauncherExe
 
 function Invoke-PathDialog {
     param(
@@ -829,13 +866,6 @@ function Resolve-GamePath {
     return $null
 }
 
-$gameExe = Resolve-GamePath
-if (-not $gameExe) {
-    Write-Host "[INFO] Game not found or selection skipped." -ForegroundColor Yellow
-    Write-Host "       Defaulting to standard path for fresh installation." -ForegroundColor Gray
-    $gameExe = Join-Path $localAppData "release\package\game\latest\Client\HytaleClient.exe"
-    $forceShowMenu = $true
-}
 
 
 # --- UI & Environment Setup ---
@@ -872,7 +902,7 @@ try {
 $needsSync = $false
 $timeDrift = 0
 try {
-    Write-Host "[INIT] Checking system clock synchronization..." -ForegroundColor DarkGray
+    Write-Host "      [INIT] Checking system clock synchronization..." -ForegroundColor DarkGray
     
     # We use Google's server because it's high-availability and accurate.
     # We perform a HEAD request to get the Date header without downloading content.
@@ -2007,6 +2037,7 @@ function Test-FileNeedsDownload($filePath, $fileName) {
 }
 
 function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOverwrite=$false) {
+    Set-QuickEditMode $false
     # --- PHASE 0: PRE-FLIGHT CLEANUP ---
     if ($forceOverwrite -and (Test-Path $destination)) {
         Remove-Item $destination -Force -ErrorAction SilentlyContinue
@@ -2072,6 +2103,7 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
         if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory $dir -Force | Out-Null }
 
         $wgetArgs = @(
+            "-q",
             "--no-config",
             "--tries=3",
             "--timeout=20",
@@ -2161,11 +2193,13 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
     } finally { 
         if ($client) { $client.Dispose() }
     }
+    Set-QuickEditMode $true
     
     return $false
 }
 
 function Copy-WithProgress($source, $destination) {
+    Set-QuickEditMode $false
     if (-not (Test-Path $source)) { return $false }
     try {
         $sourceFile = [System.IO.File]::OpenRead($source)
@@ -2185,6 +2219,7 @@ function Copy-WithProgress($source, $destination) {
             }
         }
         Write-Host ""
+        Set-QuickEditMode $true
         return $true
     } catch { return $false }
     finally { if ($sourceFile) { $sourceFile.Close() }; if ($destFile) { $destFile.Close() } }
@@ -2192,6 +2227,7 @@ function Copy-WithProgress($source, $destination) {
 
 
 function Expand-WithProgress($zipPath, $destPath) {
+    Set-QuickEditMode $false
     if (-not (Test-Path $zipPath)) { return $false }
     try {
         $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
@@ -2225,6 +2261,7 @@ function Expand-WithProgress($zipPath, $destPath) {
             }
         }
         $zip.Dispose()
+        Set-QuickEditMode $true
         Write-Host ""; return $true
     } catch {
         if ($zip) { $zip.Dispose() }
@@ -2261,7 +2298,8 @@ function Get-LatestPatchVersion {
     $version_api = "https://files.hytalef2p.com/api/version_client?branch=$branch"
     
     # MIRROR API
-    $mirror_api = "$API_HOST/api/yarn/file" 
+    $mirror_api = "https://thecute.cloud/ShipOfYarn/api.php" 
+    $mirror_api_legacy = "$API_HOST/api/yarn/file" # Secondary mirror
     
     # 0. Detect Current Local Version
     $localVer = if (Test-Path $versionFile) { [int](Get-Content $versionFile) } else { 0 }
@@ -2316,12 +2354,72 @@ function Get-LatestPatchVersion {
                 }
             }
         }
+        else {
+            Write-Host "      [WARN] Version API returned empty data. URL/Endpoint may be unavailable." -ForegroundColor Yellow
+        }
     } catch {
         Write-Host "      [WARN] Version API unavailable for $branch." -ForegroundColor Yellow
     }
 
+
+    # --- 1. SHIP OF YARN MIRROR FALLBACK ---
+    if (-not $global:RemotePatchUrl) {
+        try {
+            Write-Host "      [MIRROR] Contacting 'Ship of Yarn' Archive..." -ForegroundColor Magenta
+            # Increase timeout slightly for Mirror API
+            $mirrorJson = Invoke-RestMethod -Uri $mirror_api -Headers @{ 'User-Agent' = 'Hytale-Launcher' } -TimeoutSec 8
+            
+            if ($mirrorJson -and $mirrorJson.hytale) {
+                # Navigate JSON: hytale -> $branch -> windows
+                $node = $mirrorJson.hytale | Select-Object -ExpandProperty $branch -ErrorAction SilentlyContinue | Select-Object -ExpandProperty windows -ErrorAction SilentlyContinue 
+                
+                if ($node) {
+                    $maxVer = 0
+                    $bestUrl = $null
+                    $isDelta = $false
+
+                    # Iterate Properties to find Best Upgrade Path (Full and Delta)
+                    foreach ($prop in $node.PSObject.Properties) {
+                        $name = $prop.Name
+                        $val = $prop.Value
+                        
+                        # Type A: Full Build (e.g., v8-windows-amd64.pwr)
+                        if ($name -match "^v(\d+)-windows-amd64\.pwr$") {
+                            $v = [int]$Matches[1]
+                            # Only consider if it's an upgrade
+                            if ($v -gt $localVer -and $v -gt $maxVer) {
+                                $maxVer = $v; $bestUrl = $val; $isDelta = $false
+                            }
+                        }
+                        # Type B: Delta Patch (e.g., v19~20-windows-amd64.pwr)
+                        elseif ($name -match "^v(\d+)~(\d+)-windows-amd64\.pwr$") {
+                            $cntFrom = [int]$Matches[1]
+                            $cntTo = [int]$Matches[2]
+                            
+                            # Valid ONLY if it starts from our current version
+                            if ($cntFrom -eq $localVer) {
+                                if ($cntTo -gt $maxVer) {
+                                    $maxVer = $cntTo; $bestUrl = $val; $isDelta = $true
+                                }
+                            }
+                        }
+                    }
+
+                    if ($maxVer -gt 0) {
+                         $global:RemotePatchUrl = $bestUrl
+                         $global:IsDeltaPatch = $isDelta
+                         $maxVer | Out-File $cacheFile
+                         Write-Host "      [SUCCESS] Mirror Target: v$maxVer (Delta: $isDelta)" -ForegroundColor Green
+                         return $maxVer
+                    }
+                }
+            }
+        } catch {
+            Write-Host "      [WARN] Mirror Service unavailable." -ForegroundColor Yellow
+        }
+    }
     # ==============================================================================
-    # 2. CHECK MIRROR (Backup)
+    # 2. CHECK LEGACY MIRROR (Backup)
     # Only runs if Official URL failed or was Forbidden
     # ==============================================================================
     if (-not $global:RemotePatchUrl) {
@@ -2329,7 +2427,7 @@ function Get-LatestPatchVersion {
             Write-Host "      [Fallback] Contacting $API_HOST..." -ForegroundColor Magenta
             
             # Use Global Headers for Auth
-            $mirrorJson = Invoke-RestMethod -Uri $mirror_api -Headers $global:HEADERS -TimeoutSec 8
+            $mirrorJson = Invoke-RestMethod -Uri $mirror_api_legacy -Headers $global:HEADERS -TimeoutSec 8
             
             if ($mirrorJson) {
                 # Handle "pre-release" key with quotes
@@ -2346,7 +2444,7 @@ function Get-LatestPatchVersion {
                             $v = [int]$Matches[1]
                             if ($v -gt $localVer -and $v -gt $maxVer) {
                                 $maxVer = $v
-                                $bestUrl = "$mirror_api/$fileName" 
+                                $bestUrl = "$mirror_api_legacy/$fileName" 
                                 $isDelta = $false
                             }
                         }
@@ -2356,7 +2454,7 @@ function Get-LatestPatchVersion {
                             $cntTo = [int]$Matches[2]
                             if ($cntFrom -eq $localVer -and $cntTo -gt $maxVer) {
                                 $maxVer = $cntTo
-                                $bestUrl = "$mirror_api/$fileName"
+                                $bestUrl = "$mirror_api_legacy/$fileName"
                                 $isDelta = $true
                             }
                         }
@@ -2367,7 +2465,7 @@ function Get-LatestPatchVersion {
                          $global:RemotePatchUrl = $bestUrl
                          $global:IsDeltaPatch = $isDelta
                          $maxVer | Out-File $cacheFile
-                         Write-Host "      [SUCCESS] Mirror Found v$maxVer (Source: ShipOfYarn)" -ForegroundColor Green
+                         Write-Host "      [SUCCESS] Mirror Found v$maxVer (Source: ShipOfYarn-Legacy)" -ForegroundColor Green
                          return $maxVer
                     }
                 }
@@ -3210,7 +3308,19 @@ Write-Host "      UUID:    $global:pUuid" -ForegroundColor Gray
 
 
 
+# Disable Quick Edit at startup (prevents console freeze during automated operations)
+Set-QuickEditMode $true
 
+# Trigger Check
+Ensure-LauncherExe
+
+$gameExe = Resolve-GamePath
+if (-not $gameExe) {
+    Write-Host "[INFO] Game not found or selection skipped." -ForegroundColor Yellow
+    Write-Host "       Defaulting to standard path for fresh installation." -ForegroundColor Gray
+    $gameExe = Join-Path $localAppData "release\package\game\latest\Client\HytaleClient.exe"
+    $forceShowMenu = $true
+}
 
 
 
