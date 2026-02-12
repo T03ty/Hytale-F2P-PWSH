@@ -2038,7 +2038,6 @@ function Test-FileNeedsDownload($filePath, $fileName) {
 
 function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOverwrite=$false) {
     Set-QuickEditMode $false
-    # --- PHASE 0: PRE-FLIGHT CLEANUP ---
     if ($forceOverwrite -and (Test-Path $destination)) {
         Remove-Item $destination -Force -ErrorAction SilentlyContinue
     }
@@ -2047,102 +2046,97 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
     $localWget = Join-Path $toolDir "wget.exe"
     if (-not (Test-Path $toolDir)) { New-Item -ItemType Directory $toolDir -Force | Out-Null }
 
-    $wgetExe = $null
+    $wgetExePath = $null
 
-    # --- PHASE 1: CHECK FOR EXISTING WGET ---
+    # --- PHASE 1: STRICT CHECK FOR WGET BINARY ---
     if (Test-Path $localWget) {
-        $wgetExe = [PSCustomObject]@{ Source = $localWget }
-    }
-    if (-not $wgetExe) {
-        try { $wgetExe = Get-Command wget.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1 } catch {}
+        $wgetExePath = $localWget
+    } else {
+        # Search specifically for the .exe to avoid PowerShell's built-in 'wget' alias
+        $sysWget = Get-Command "wget.exe" -CommandType Application -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1
+        if ($sysWget) { $wgetExePath = $sysWget }
     }
 
-    # --- PHASE 1.5: AUTO-PROVISION WGET ---
-    if (-not $wgetExe) {
+    # --- PHASE 1.5: AUTO-PROVISION WGET (Fixed Download Logic) ---
+    if (-not $wgetExePath) {
         Write-Host "`n[SETUP] Compatible wget not found. Downloading v1.21.4..." -ForegroundColor Yellow
         $zipUrl = "https://eternallybored.org/misc/wget/releases/wget-1.21.4-win64.zip"
         $zipPath = "$env:TEMP\wget_temp.zip"
         $extractPath = "$env:TEMP\wget_extract"
+        
         try {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            $wc = New-Object System.Net.WebClient
-            $wc.Headers.Add("User-Agent", "Mozilla/5.0")
-            $wc.DownloadFile($zipUrl, $zipPath)
+            # Use HttpClient instead of WebClient (WebClient is often blocked by servers)
+            $setupClient = New-Object System.Net.Http.HttpClient
+            $setupClient.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            
+            $bytes = $setupClient.GetByteArrayAsync($zipUrl).GetAwaiter().GetResult()
+            [System.IO.File]::WriteAllBytes($zipPath, $bytes)
+            $setupClient.Dispose()
+
+            if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
             Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+            
             $foundExe = Get-ChildItem -Path $extractPath -Filter "wget.exe" -Recurse | Select-Object -First 1
             if ($foundExe) {
                 Move-Item -Path $foundExe.FullName -Destination $localWget -Force
-                $wgetExe = [PSCustomObject]@{ Source = $localWget }
+                $wgetExePath = $localWget
+                Write-Host "      [SUCCESS] wget installed to Tools directory." -ForegroundColor Green
             }
-            Remove-Item $zipPath, $extractPath -Recurse -Force -ErrorAction SilentlyContinue
-        } catch { Write-Host "      [WARN] Failed to auto-install wget." -ForegroundColor Red }
+        } catch { 
+            Write-Host "      [WARN] wget auto-provision failed: $($_.Exception.Message)" -ForegroundColor Red 
+        } finally {
+            if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+            if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+        }
     }
     
-    # --- INTELLIGENT USER-AGENT & HEADER SELECTION ---
-    # Logic: Only use Custom UA and Auth Token if communicating with our specific API.
-    # For everything else (Official Servers), use standard Chrome UA.
-    
+    # --- INTELLIGENT USER-AGENT ---
     $isApiTarget = $url -match "file\.hytaleapi\.online"
     $chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    
-    if ($isApiTarget -and $global:HEADERS.ContainsKey('User-Agent')) {
-        $userAgent = $global:HEADERS['User-Agent']
-    } else {
-        $userAgent = $chromeUA
-    }
+    $userAgent = if ($isApiTarget -and $global:HEADERS.ContainsKey('User-Agent')) { $global:HEADERS['User-Agent'] } else { $chromeUA }
 
     # --- PHASE 2: TURBO ATTEMPT (wget) ---
-    if ($wgetExe) {
+    if ($wgetExePath) {
         if (-not $global:hasShownTurboMsg) { 
-            Write-Host "      [TURBO] High-speed transfer enabled." -ForegroundColor Green
+            Write-Host "      [TURBO] High-speed transfer enabled (wget)." -ForegroundColor Green
             $global:hasShownTurboMsg = $true
         }
         
-        $exePath = $wgetExe.Source
         $dir = Split-Path $destination
         if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory $dir -Force | Out-Null }
 
+        # Arguments must be exactly formatted for the binary
         $wgetArgs = @(
-            "-q",
-            "--no-config",
+            "--quiet",
+            "--show-progress",
+            "--progress=bar:force:noscroll",
+            "--no-check-certificate",
             "--tries=3",
             "--timeout=20",
-            "--no-check-certificate",
-            "--user-agent=`"$userAgent`"", 
-            "--inet4-only",
-            "--show-progress",
-            "--progress=bar:force:noscroll"
+            "--user-agent=`"$userAgent`"",
+            "--output-document=`"$destination`""
         )
 
         if (-not $forceOverwrite) { $wgetArgs += "--continue" }
 
-        # FILTERED HEADERS
         if ($useHeaders -and $global:HEADERS) {
             foreach ($k in $global:HEADERS.Keys) {
-                # 1. Skip User-Agent (Handled by flag)
                 if ($k -eq 'User-Agent') { continue }
-                
-                # 2. Skip Auth Token if NOT targeting our API (Prevents 403s on official servers)
                 if ((-not $isApiTarget) -and ($k -eq 'X-Auth-Token')) { continue }
-
-                $val = $global:HEADERS[$k]
-                $wgetArgs += "--header=$($k): $($val)"
+                $wgetArgs += "--header=`"$($k): $($global:HEADERS[$k])`""
             }
         }
-        
-        $wgetArgs += "-O"
-        $wgetArgs += $destination
-        $wgetArgs += $url
+        $wgetArgs += "`"$url`""
 
         try {
-            & $exePath $wgetArgs
-            
-            if ($LASTEXITCODE -eq 0) { return $true } 
-            elseif ($LASTEXITCODE -eq 8) { Write-Host "      [403] Server refused request." -ForegroundColor Yellow }
+            $process = Start-Process -FilePath $wgetExePath -ArgumentList $wgetArgs -Wait -PassThru -NoNewWindow
+            if ($process.ExitCode -eq 0) { return $true }
         } catch {
-            Write-Host "      [ERROR] Turbo process failed: $_" -ForegroundColor DarkGray
+            Write-Host "      [ERROR] Turbo process failed to start." -ForegroundColor DarkGray
         }
     }
+
 
     # --- PHASE 3: STANDARD FALLBACK ---
     Write-Host "      [FALLBACK] Using standard download stream..." -ForegroundColor Gray
