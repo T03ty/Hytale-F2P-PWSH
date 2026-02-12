@@ -4426,6 +4426,7 @@ if (Test-Path $gameExe) {
                 TimeSync = @()           # Time desync
                 IpBlock = @()            # Network blocked
                 IssuerMismatch = @()     # Wrong auth URL
+                AgentPathError = @()
                 JwtValidation = @()      # Server JWT issues
                 ModLock = @()            # Mod file locked/permission denied
                 SaveVersionMismatch = @() # Save created with newer game version
@@ -4446,6 +4447,9 @@ if (Test-Path $gameExe) {
                 # TokenMismatch - but exclude session termination failures (those are IP blocks)
                 elseif (($err -match "username mismatch" -or $err -match "Token validation failed.*expired.*tampered" -or $err -match "UUID mismatch") -and $err -notmatch "terminate session") {
                     $errorCategories.TokenMismatch += $err
+                }
+                elseif ($err -match "Error opening zip file" -or $err -match "agent library failed Agent_OnLoad") {
+                    $errorCategories.AgentPathError += $err
                 }
                 elseif ($err -match "Identity token was issued in the future") {
                     $errorCategories.TimeSync += $err
@@ -4500,6 +4504,11 @@ if (Test-Path $gameExe) {
             if ($errorCategories.TokenMismatch.Count -gt 0) {
                 $rootCause = "TokenMismatch"
                 $rootCauseErrors = $errorCategories.TokenMismatch
+            }
+            # Priority 1.5: Agent Path Error
+            elseif ($errorCategories.AgentPathError.Count -gt 0) {
+                $rootCause = "AgentPathError"
+                $rootCauseErrors = $errorCategories.AgentPathError
             }
             # Priority 2: Time Sync Issues
             elseif ($errorCategories.TimeSync.Count -gt 0) {
@@ -4564,6 +4573,29 @@ if (Test-Path $gameExe) {
                 Write-Host "      [EVIDENCE] $($rootCauseErrors[0].Substring(0, [Math]::Min(100, $rootCauseErrors[0].Length)))..." -ForegroundColor Gray
                 
                 switch ($rootCause) {
+                    "AgentPathError" {
+                        Write-Host "      -> [FIX] Space/Special Characters detected in Windows Path!" -ForegroundColor Red
+                        Write-Host "      -> [CAUSE] Java cannot load the auth-agent because of the spaces in '$env:USERNAME'." -ForegroundColor Yellow
+                        Write-Host "      -> [ACTION] Converting agent path to Short-Path (8.3) format..." -ForegroundColor Cyan
+                        
+                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                        
+                        # Apply the 8.3 Path Fix
+                        $agentPath = Join-Path $appDir "Server\dualauth-agent.jar"
+                        try {
+                            $fso = New-Object -ComObject Scripting.FileSystemObject
+                            $shortPath = $fso.GetFile($agentPath).ShortPath
+                            $global:FIXED_AGENT_PATH = $shortPath
+                            Write-Host "      -> [SUCCESS] Short path resolved: $shortPath" -ForegroundColor Green
+                        } catch {
+                            Write-Host "      -> [FALLBACK] Short path failed. Copying agent to C:\Temp..." -ForegroundColor Yellow
+                            if (-not (Test-Path "C:\Temp")) { New-Item -ItemType Directory -Path "C:\Temp" -Force | Out-Null }
+                            Copy-Item $agentPath "C:\Temp\dualauth-agent.jar" -Force
+                            $global:FIXED_AGENT_PATH = "C:\Temp\dualauth-agent.jar"
+                        }
+                        
+                        $global:forceRestart = $true; $stable = $false; break
+                    }
                     "TokenMismatch" {
                         Write-Host "      -> [FIX] Token Mismatch Detected!" -ForegroundColor Red
                         
