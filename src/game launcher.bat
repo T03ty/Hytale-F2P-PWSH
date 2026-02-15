@@ -563,10 +563,22 @@ function Get-LauncherPath {
     }
 
     # 6. Check Registry for known install locations
-    $regPaths = @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*")
+    $regPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
     foreach ($reg in $regPaths) {
-        Get-ItemProperty $reg -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match "Hytale F2P" } | ForEach-Object {
-            if ($_.InstallLocation) { $searchPaths.Add((Join-Path $_.InstallLocation $LAUNCHER_EXE_NAME)) }
+        try {
+            if (-not (Test-Path $reg)) { continue }
+            Get-ChildItem $reg -ErrorAction SilentlyContinue | ForEach-Object {
+                $displayName = ($_ | Get-ItemPropertyValue -Name "DisplayName" -ErrorAction SilentlyContinue)
+                if ($displayName -match "Hytale F2P") {
+                    $installLoc = ($_ | Get-ItemPropertyValue -Name "InstallLocation" -ErrorAction SilentlyContinue)
+                    if ($installLoc) { $searchPaths.Add((Join-Path $installLoc $LAUNCHER_EXE_NAME)) }
+                }
+            }
+        } catch {
+            # Skip registry hive if entirely unreadable
         }
     }
 
