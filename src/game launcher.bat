@@ -3140,6 +3140,18 @@ function Show-LatestLogs($logDir, $lineCount=15, $filterErrors=$false) {
 }
 
 function Invoke-OfficialUpdate($latestVer, $skipServerSync=$false) {
+    # Check for HytaleClient process first to prevent Butler failure
+    $procName = "HytaleClient"
+    if (Get-Process $procName -ErrorAction SilentlyContinue) {
+        Write-Host "      [INFO] Hytale is already running. Closing for rerun..." -ForegroundColor Yellow
+        try {
+            taskkill /F /IM "${procName}.exe" /T 2>$null | Out-Null
+            # Also clean up Java if it's stuck
+            taskkill /F /IM "java.exe" /T 2>$null | Out-Null
+            Start-Sleep -Seconds 2 
+        } catch {}
+    }
+
     # Kill any running Java processes to prevent file locks
     # Specifically target 'java', 'javaw', and 'javaa' (renamed binary)
     Write-Host "      [INIT] Cleaning up running Java processes..." -ForegroundColor Gray
@@ -3758,7 +3770,7 @@ while ($true) {
 
             # --- FALLBACK ---
             if (-not $authSuccess) {
-                $idToken = New-HytaleJWT $global:pUuid $global:pName "https://sessions.sanasol.ws"
+                $idToken = New-HytaleJWT $global:pUuid $global:pName $global:AUTH_URL_CURRENT
                 $ssToken = $idToken
                 Write-Host "      [OFFLINE] Using local fallback tokens." -ForegroundColor Yellow
             }
@@ -3766,7 +3778,7 @@ while ($true) {
     }
     else {
         Write-Host "`n[3/4] Skipped Authentication (Offline Mode)" -ForegroundColor Magenta
-        $idToken = New-HytaleJWT $global:pUuid $global:pName "https://sessions.sanasol.ws"
+        $idToken = New-HytaleJWT $global:pUuid $global:pName $global:AUTH_URL_CURRENT
         $ssToken = $idToken
     }
 
@@ -4271,7 +4283,7 @@ $launchArgs = @(
 if (-not $global:offlineMode) {
     # Generate tokens if not already present
     if (-not $idToken) {
-        $idToken = New-HytaleJWT $global:pUuid $global:pName "https://sessions.sanasol.ws"
+        $idToken = New-HytaleJWT $global:pUuid $global:pName $global:AUTH_URL_CURRENT
         $ssToken = $idToken
     }
     # Append token args to launch args
@@ -4408,7 +4420,7 @@ if (Test-Path $gameExe) {
         # === ERROR MONITORING LOOP ===
         foreach ($nl in $newLogs) {
             $logContent = Get-Content $nl.FullName -Raw -ErrorAction SilentlyContinue
-            $allErrors = Get-Content $nl.FullName | Where-Object { $_ -match "\|ERROR\||\|FATAL\||\|WARN\||\|SEVERE\|" -or $_ -match "VM Initialization Error" -or $_ -match "Server failed to boot" -or $_ -match "World default already exists" -or $_ -match "Failed to decode asset" -or $_ -match "ALPN mismatch" -or $_ -match "username mismatch" -or $_ -match "Token validation failed" -or $_ -match "HTTP 403" }
+            $allErrors = Get-Content $nl.FullName | Where-Object { $_ -match "\|ERROR\||\|FATAL\||\|WARN\||\|SEVERE\|" -or $_ -match "VM Initialization Error" -or $_ -match "Server failed to boot" -or $_ -match "World default already exists" -or $_ -match "Failed to decode asset" -or $_ -match "ALPN mismatch" -or $_ -match "username mismatch" -or $_ -match "Token validation failed" -or $_ -match "HTTP 403" -or $_ -match "Invalid or corrupt jarfile" }
             
             # Skip if no new errors
             $newErrors = $allErrors | Where-Object { $reportedErrors -notcontains $_ }
@@ -4442,7 +4454,7 @@ if (Test-Path $gameExe) {
                 elseif (($err -match "username mismatch" -or $err -match "Token validation failed.*expired.*tampered" -or $err -match "UUID mismatch") -and $err -notmatch "terminate session") {
                     $errorCategories.TokenMismatch += $err
                 }
-                elseif ($err -match "Error opening zip file" -or $err -match "agent library failed Agent_OnLoad") {
+                elseif ($err -match "Error opening zip file" -or $err -match "agent library failed Agent_OnLoad" -or $err -match "Invalid or corrupt jarfile") {
                     $errorCategories.AgentPathError += $err
                 }
                 elseif ($err -match "Identity token was issued in the future") {
@@ -4469,7 +4481,7 @@ if (Test-Path $gameExe) {
                 elseif ($err -match "World default already exists") {
                     $errorCategories.WorldCorruption += $err
                 }
-                elseif ($err -match "Failed to decode asset" -or $err -match "ALPN mismatch" -or $err -match "client outdated" -or $err -match "CodecException") {
+                elseif ($err -match "Failed to decode asset" -or $err -match "ALPN mismatch" -or $err -match "client outdated" -or $err -match "CodecException" -or $err -match "Asset validation FAILED") {
                     $errorCategories.AssetMismatch += $err
                 }
                 elseif ($err -match "Server failed to boot") {
@@ -4569,23 +4581,57 @@ if (Test-Path $gameExe) {
                 switch ($rootCause) {
                     "AgentPathError" {
                         Write-Host "      -> [FIX] Space/Special Characters detected in Windows Path!" -ForegroundColor Red
-                        Write-Host "      -> [CAUSE] Java cannot load the auth-agent because of the spaces in '$env:USERNAME'." -ForegroundColor Yellow
-                        Write-Host "      -> [ACTION] Converting agent path to Short-Path (8.3) format..." -ForegroundColor Cyan
+                        Write-Host "      -> [CAUSE] Java cannot load JARs because of spaces in the path ('$env:USERNAME')." -ForegroundColor Yellow
+                        Write-Host "      -> [ACTION] Converting JAR paths to Short-Path (8.3) format..." -ForegroundColor Cyan
                         
                         Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
                         
-                        # Apply the 8.3 Path Fix
+                        # Check if this is a corrupt/invalid jarfile error (server JAR)
+                        $isCorruptJar = $rootCauseErrors | Where-Object { $_ -match "Invalid or corrupt jarfile" }
+                        
+                        if ($isCorruptJar) {
+                            # Could be spaces in path OR actually corrupt - handle both
+                            $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
+                            
+                            if ($appDir -match ' ') {
+                                # Path has spaces - convert to 8.3 short path
+                                Write-Host "      -> [DETECT] Spaces found in game path. Converting..." -ForegroundColor Cyan
+                                try {
+                                    $fso = New-Object -ComObject Scripting.FileSystemObject
+                                    $shortAppDir = $fso.GetFolder($appDir).ShortPath
+                                    $global:FIXED_APP_DIR = $shortAppDir
+                                    Write-Host "      -> [SUCCESS] Short app path: $shortAppDir" -ForegroundColor Green
+                                } catch {
+                                    Write-Host "      -> [WARN] 8.3 names unavailable for app dir." -ForegroundColor Yellow
+                                }
+                            }
+                            
+                            # Also redownload JAR in case it's actually corrupt
+                            if (Test-Path $serverJarPath) {
+                                $jarSize = (Get-Item $serverJarPath).Length
+                                if ($jarSize -lt 1MB) {
+                                    Write-Host "      -> [DETECT] Server JAR too small ($([math]::Round($jarSize/1KB))KB). Likely corrupt." -ForegroundColor Yellow
+                                    Remove-Item $serverJarPath -Force -ErrorAction SilentlyContinue
+                                    Write-Host "      -> [FIX] Removed corrupt JAR. Will redownload on restart." -ForegroundColor Green
+                                    $global:autoRepairTriggered = $true
+                                }
+                            }
+                        }
+                        
+                        # Apply the 8.3 Path Fix for auth-agent (always)
                         $agentPath = Join-Path $appDir "Server\dualauth-agent.jar"
-                        try {
-                            $fso = New-Object -ComObject Scripting.FileSystemObject
-                            $shortPath = $fso.GetFile($agentPath).ShortPath
-                            $global:FIXED_AGENT_PATH = $shortPath
-                            Write-Host "      -> [SUCCESS] Short path resolved: $shortPath" -ForegroundColor Green
-                        } catch {
-                            Write-Host "      -> [FALLBACK] Short path failed. Copying agent to C:\Temp..." -ForegroundColor Yellow
-                            if (-not (Test-Path "C:\Temp")) { New-Item -ItemType Directory -Path "C:\Temp" -Force | Out-Null }
-                            Copy-Item $agentPath "C:\Temp\dualauth-agent.jar" -Force
-                            $global:FIXED_AGENT_PATH = "C:\Temp\dualauth-agent.jar"
+                        if (Test-Path $agentPath) {
+                            try {
+                                $fso = New-Object -ComObject Scripting.FileSystemObject
+                                $shortPath = $fso.GetFile($agentPath).ShortPath
+                                $global:FIXED_AGENT_PATH = $shortPath
+                                Write-Host "      -> [SUCCESS] Agent short path: $shortPath" -ForegroundColor Green
+                            } catch {
+                                Write-Host "      -> [FALLBACK] Short path failed. Copying agent to C:\Temp..." -ForegroundColor Yellow
+                                if (-not (Test-Path "C:\Temp")) { New-Item -ItemType Directory -Path "C:\Temp" -Force | Out-Null }
+                                Copy-Item $agentPath "C:\Temp\dualauth-agent.jar" -Force
+                                $global:FIXED_AGENT_PATH = "C:\Temp\dualauth-agent.jar"
+                            }
                         }
                         
                         $global:forceRestart = $true; $stable = $false; break
