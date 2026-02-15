@@ -37,7 +37,35 @@ Because I use a compiler to turn the script into an `.exe`, and because the scri
 
 ---
 
-## 🌟 Latest Cool Updates (v2.4)
+## 🌟 Latest Cool Updates (v2.5)
+
+### 🔁 Fix Loop Prevention (Anti-Infinite Loop)
+All **14 auto-fix handlers** now share a unified attempt tracker (`$global:fixAttempts`). Each fix is capped at **2 attempts** — if the same error persists after 2 tries, the launcher stops auto-restarting and tells the user to contact the developer. All counters reset on successful game launch.
+
+Affected handlers: `AgentPathError`, `TokenMismatch`, `TimeSync`, `IpBlock`, `IssuerMismatch`, `JwtValidation`, `ModLock`, `SaveVersionMismatch`, `AssetMismatch`, `WorldCorruption`, `JavaBoot`, `AppMainMenu`, `GpuCrash`, `ServerCodecError`, `VersionMismatch`.
+
+### 🛡️ ServerCodecError False Positive Fix
+- `DocumentContainingCodec` warnings are **no longer treated as crashes** — they're harmless server log noise.
+- The error now only triggers on an actual `Disconnected during loading` event with codec context.
+- A priority gate checks if the server actually stayed running before flagging the error.
+- Worlds already backed up (`_corrupt_TIMESTAMP` suffix) are not re-fixed.
+
+### 🌐 Internet Connection Check
+A multi-tiered `Test-InternetConnection` function checks connectivity before network operations:
+1. **TCP ping** to Cloudflare DNS (`1.1.1.1:53`) and Google DNS (`8.8.8.8:53`)
+2. **HTTPS fallback** if TCP fails
+3. **30-second cache** to avoid repeated checks
+
+Integrated into `Get-RemoteHash`, `Patch-HytaleServer`, `Register-PlayerSession`, and `Download-WithProgress`.
+
+### 🖥️ Loader Robustness
+- **8.3 Short Path Fix:** `$env:TEMP` no longer fails on systems where the short path doesn't exist.
+- **Error-Tolerant Cleanup:** Temp `.ps1` file cleanup no longer halts the launcher on failure.
+- **Robust Temp Path:** Falls back to `$env:LOCALAPPDATA` or current directory if `$env:TEMP` is unusable.
+
+---
+
+## 🌟 Cool Updates (v2.4)
 
 ### 🔄 Bidirectional Version Sync
 - **Server <-> Client Sync:** Changing the Server Version (Release/Pre-release) now automatically updates your Client to match, and vice-versa. No more version mismatches!
@@ -129,7 +157,7 @@ The script looks at the logs in real-time and fixes these things while the game 
 - **World Exists Error?** Clears the corrupted world data automatically.
 - **Protocol Error?** Updates the Server protocol to match the Client.
 
-If it happens 3 times and still fails? **LOOP DETECTED**. It stops so it doesn't crash your PC forever.
+If it happens 2 times and still fails? **LOOP DETECTED**. It stops so it doesn't crash your PC forever.
 
 ---
 
