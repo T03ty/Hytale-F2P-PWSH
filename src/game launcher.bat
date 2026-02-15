@@ -58,8 +58,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$i = $t.IndexOf($m); " ^
     "if($i -lt 0) { Write-Host 'Marker not found!' -ForegroundColor Red; exit 1 } " ^
     "$s = $t.Substring($i + $m.Length); " ^
-    "$ps1 = Join-Path $env:TEMP 'hytale_launcher.ps1'; " ^
-    "if(Test-Path $ps1){ Remove-Item $ps1 -Force }; " ^
+    "$td = try{(Get-Item $env:TEMP -EA Stop).FullName}catch{try{(Get-Item $env:LOCALAPPDATA -EA Stop).FullName}catch{$PWD.Path}}; " ^
+    "$ps1 = Join-Path $td 'hytale_launcher.ps1'; " ^
+    "if(Test-Path $ps1){ Remove-Item $ps1 -Force -EA SilentlyContinue }; " ^
     "\"`$ErrorActionPreference = 'Stop'`n`$f = '$($f -replace \"'\",\"''\")'`n\" + $s | Out-File $ps1 -Encoding UTF8 -Force; " ^
     "& $ps1"
 if errorlevel 1 pause
@@ -1050,9 +1051,66 @@ function New-HytaleJWT($uuid, $name, $issuer) {
     } catch { return "offline-$uuid" }
 }
 
+# --- INTERNET CONNECTIVITY CHECK ---
+function Test-InternetConnection {
+    <# Fast, cached internet check. Returns $true if online, $false if offline.
+       Uses a 30-second cache to avoid repeated checks. #>
+    
+    # Cache: avoid hammering connectivity checks
+    if ($global:_internetCacheTime -and ((Get-Date) - $global:_internetCacheTime).TotalSeconds -lt 30) {
+        return $global:_internetCacheResult
+    }
+    
+    $online = $false
+    
+    # Tier 1: Fast TCP ping to Cloudflare DNS (1.1.1.1:443) - ~50ms
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $ar = $tcp.BeginConnect('1.1.1.1', 443, $null, $null)
+        $waited = $ar.AsyncWaitHandle.WaitOne(2000, $false)
+        if ($waited -and $tcp.Connected) { $online = $true }
+        $tcp.Close()
+    } catch {}
+    
+    # Tier 2: Fallback to Google DNS if Cloudflare blocked
+    if (-not $online) {
+        try {
+            $tcp2 = New-Object System.Net.Sockets.TcpClient
+            $ar2 = $tcp2.BeginConnect('8.8.8.8', 443, $null, $null)
+            $waited2 = $ar2.AsyncWaitHandle.WaitOne(2000, $false)
+            if ($waited2 -and $tcp2.Connected) { $online = $true }
+            $tcp2.Close()
+        } catch {}
+    }
+    
+    # Tier 3: Full HTTPS check (handles DNS-level blocks)
+    if (-not $online) {
+        try {
+            $req = [System.Net.HttpWebRequest]::Create('https://www.msftconnecttest.com/connecttest.txt')
+            $req.Timeout = 3000
+            $req.Method = 'HEAD'
+            $resp = $req.GetResponse()
+            $online = ($resp.StatusCode -eq 'OK')
+            $resp.Close()
+        } catch {}
+    }
+    
+    # Cache the result
+    $global:_internetCacheTime = Get-Date
+    $global:_internetCacheResult = $online
+    return $online
+}
+
 # --- PLAYER STATS & ISP CHECK ---
 function Register-PlayerSession($uuid, $name) {
     if ($global:offlineMode) { return }
+    
+    # Quick connectivity gate
+    if (-not (Test-InternetConnection)) {
+        Write-Host "      [OFFLINE] No internet connection detected. Skipping registration." -ForegroundColor Yellow
+        $global:offlineMode = $true
+        return
+    }
     $apiUrl = "https://api.hytalef2p.com/api"
     $regEndpoint = "$apiUrl/players/register"
     $statsEndpoint = "$apiUrl/players/stats"
@@ -1697,6 +1755,13 @@ function Patch-HytaleClient($clientPath) {
 }
 
 function Patch-HytaleServer($serverJarPath, $branch="release", $force=$false, $skipClientSync=$false) {
+    # Connectivity gate - can't download patches without internet
+    if (-not (Test-InternetConnection)) {
+        Write-Host "      [OFFLINE] No internet connection. Cannot download server patch." -ForegroundColor Yellow
+        Write-Host "      [TIP] Connect to the internet and try again." -ForegroundColor Gray
+        return $false
+    }
+    
     $serverDir = Split-Path $serverJarPath
     if (-not (Test-Path $serverDir)) { 
         New-Item -ItemType Directory $serverDir -Force | Out-Null 
@@ -1976,6 +2041,13 @@ function Safe-TestPath($path) {
 
 function Get-RemoteHash {
     param($fileName)
+    
+    # Quick connectivity gate
+    if (-not (Test-InternetConnection)) {
+        Write-Host "      [OFFLINE] No internet - skipping remote hash check." -ForegroundColor DarkGray
+        return $null
+    }
+    
     try {
         # Encode filename for URL (converts spaces to %20)
         $encodedName = [uri]::EscapeDataString($fileName)
@@ -2050,6 +2122,15 @@ function Test-FileNeedsDownload($filePath, $fileName) {
 
 function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOverwrite=$false) {
     Set-QuickEditMode $false
+    
+    # Connectivity gate - fail fast instead of hanging on timeouts
+    if (-not (Test-InternetConnection)) {
+        Write-Host "      [OFFLINE] No internet connection detected." -ForegroundColor Red
+        Write-Host "      [TIP] Check your network and try again." -ForegroundColor Yellow
+        Set-QuickEditMode $true
+        return $false
+    }
+    
     if ($forceOverwrite -and (Test-Path $destination)) {
         Remove-Item $destination -Force -ErrorAction SilentlyContinue
     }
@@ -3176,6 +3257,32 @@ function Invoke-OfficialUpdate($latestVer, $skipServerSync=$false) {
     $pwrName = "$latestVer.pwr"
     $pwrPath = Join-Path $localAppData "cache\$pwrName"
 
+    # === CACHE REUSE: Skip if game is already installed with matching version ===
+    $assetsZipPath = Join-Path $appDir "Assets.zip"
+    $clientExePath = Join-Path $appDir "Client\HytaleClient.exe"
+    
+    if ((Test-Path $assetsZipPath) -and (Test-Path $clientExePath)) {
+        # Game files exist - check if version matches
+        $currentHash = Get-LocalSha1 $clientExePath
+        if ($global:pwrVersion -eq $latestVer -and $global:pwrHash -eq $currentHash -and $currentHash -ne "MISSING") {
+            Write-Host "      [CACHE] Game is already installed (v$latestVer). Skipping patch." -ForegroundColor Green
+            Write-Host "      [CACHE] Hash: $($currentHash.Substring(0, 12))..." -ForegroundColor DarkGray
+            
+            # Still sync server JAR if needed
+            if (-not $skipServerSync) {
+                Write-Host "[SYNC] Verifying Server JAR..." -ForegroundColor Cyan
+                $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
+                $serverDir = Split-Path $serverJarPath
+                if (-not (Test-Path $serverDir)) { New-Item -ItemType Directory $serverDir -Force | Out-Null }
+                $branch = if ($global:TargetBranch) { $global:TargetBranch } else { "release" }
+                if (-not (Patch-HytaleServer $serverJarPath $branch $false $true)) {
+                    Write-Host "      [WARN] Server patch failed. You might need to update it manually via menu." -ForegroundColor Yellow
+                }
+            }
+            return $true
+        }
+    }
+
     # OFFICIAL DOWNLOAD LOGIC
     if (-not (Test-Path "$localAppData\butler\butler.exe")) {
         Write-Host "[SETUP] Downloading Butler..." -ForegroundColor Yellow
@@ -3219,13 +3326,30 @@ function Invoke-OfficialUpdate($latestVer, $skipServerSync=$false) {
         }
     }
 
-    # [PATCH INTEGRITY] Verify existing patch before applying
+    # [PATCH INTEGRITY] Verify existing cached patch before applying (hash + size check)
     if (Test-Path $pwrPath) {
         $stats = Get-Item $pwrPath
         $sizeMB = [math]::Round($stats.Length / 1MB, 2)
+        
+        # Size check: PWR files should be at least 1500 MB
         if ($sizeMB -lt 1500) {
             Write-Host "      [WARN] Cached patch appears incomplete ($sizeMB MB < 1500 MB). Redownloading..." -ForegroundColor Yellow
             Remove-Item $pwrPath -Force
+        } else {
+            # Hash validation: check if cached PWR matches a known good hash
+            $pwrHashFile = "$pwrPath.sha1"
+            if (Test-Path $pwrHashFile) {
+                $savedHash = (Get-Content $pwrHashFile -Raw).Trim()
+                $currentPwrHash = (Get-FileHash $pwrPath -Algorithm SHA1).Hash
+                if ($savedHash -ne $currentPwrHash) {
+                    Write-Host "      [WARN] Cached patch hash mismatch (corrupted). Redownloading..." -ForegroundColor Yellow
+                    Write-Host "      [HASH] Expected: $($savedHash.Substring(0,12))... Got: $($currentPwrHash.Substring(0,12))..." -ForegroundColor DarkGray
+                    Remove-Item $pwrPath -Force
+                    Remove-Item $pwrHashFile -Force -ErrorAction SilentlyContinue
+                } else {
+                    Write-Host "      [CACHE] PWR patch validated (hash match: $($savedHash.Substring(0,12))...)" -ForegroundColor Green
+                }
+            }
         }
     }
 
@@ -3238,6 +3362,13 @@ function Invoke-OfficialUpdate($latestVer, $skipServerSync=$false) {
             Write-Host "      [ERROR] Official patch download failed." -ForegroundColor Red
             return $false
         }
+        
+        # Save hash of freshly downloaded PWR for future cache validation
+        try {
+            $freshHash = (Get-FileHash $pwrPath -Algorithm SHA1).Hash
+            $freshHash | Out-File "$pwrPath.sha1" -Encoding UTF8
+            Write-Host "      [CACHE] PWR hash saved for future validation." -ForegroundColor DarkGray
+        } catch {}
     }
     
     # Prepare local staging
@@ -3256,8 +3387,68 @@ function Invoke-OfficialUpdate($latestVer, $skipServerSync=$false) {
         # If Butler failed, checking if it was a file corruption
         Write-Host "      [SAFETY] Patch might be corrupt. Deleting for redownload." -ForegroundColor Yellow
         Remove-Item $pwrPath -Force -ErrorAction SilentlyContinue
+        Remove-Item "$pwrPath.sha1" -Force -ErrorAction SilentlyContinue
         Remove-Item $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
         pause; return $false
+    }
+    
+    # Clean up staging directory
+    if (Test-Path $stagingDir) { Remove-Item $stagingDir -Recurse -Force -ErrorAction SilentlyContinue }
+    
+    # === POST-PATCH: Verify and fix Assets.zip location ===
+    $assetsZipExpected = Join-Path $appDir "Assets.zip"
+    
+    if (-not (Test-Path $assetsZipExpected)) {
+        Write-Host "      [WARN] Assets.zip not found at expected location!" -ForegroundColor Yellow
+        Write-Host "      [SEARCH] Scanning for Assets.zip in game directory..." -ForegroundColor Cyan
+        
+        # Search recursively for Assets.zip in appDir and subdirectories
+        $foundAssets = Get-ChildItem -Path $appDir -Filter "Assets.zip" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        
+        if ($foundAssets) {
+            Write-Host "      [FOUND] Assets.zip at: $($foundAssets.FullName)" -ForegroundColor Green
+            Write-Host "      [MOVE] Relocating to: $assetsZipExpected" -ForegroundColor Cyan
+            try {
+                Move-Item -Path $foundAssets.FullName -Destination $assetsZipExpected -Force -ErrorAction Stop
+                Write-Host "      [SUCCESS] Assets.zip moved to correct location." -ForegroundColor Green
+            } catch {
+                Write-Host "      [WARN] Move failed, trying copy..." -ForegroundColor Yellow
+                try {
+                    Copy-Item -Path $foundAssets.FullName -Destination $assetsZipExpected -Force -ErrorAction Stop
+                    Remove-Item $foundAssets.FullName -Force -ErrorAction SilentlyContinue
+                    Write-Host "      [SUCCESS] Assets.zip copied to correct location." -ForegroundColor Green
+                } catch {
+                    Write-Host "      [ERROR] Could not relocate Assets.zip: $($_.Exception.Message)" -ForegroundColor Red
+                }
+            }
+        } else {
+            # Also check cache directory and staging
+            $cacheAssets = Get-ChildItem -Path $cacheDir -Filter "Assets.zip" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($cacheAssets) {
+                Write-Host "      [FOUND] Assets.zip in cache: $($cacheAssets.FullName)" -ForegroundColor Green
+                Copy-Item -Path $cacheAssets.FullName -Destination $assetsZipExpected -Force -ErrorAction SilentlyContinue
+                Write-Host "      [SUCCESS] Assets.zip restored from cache." -ForegroundColor Green
+            } else {
+                Write-Host "      [ERROR] Assets.zip not found anywhere! Game client may crash." -ForegroundColor Red
+                Write-Host "      [TIP] Try running Repair (option 3) to redownload." -ForegroundColor Yellow
+            }
+        }
+    } else {
+        $assetsSize = [math]::Round((Get-Item $assetsZipExpected).Length / 1MB, 1)
+        Write-Host "      [VERIFY] Assets.zip present ($assetsSize MB)" -ForegroundColor Green
+    }
+    
+    # === POST-PATCH: Also verify Client exe exists ===
+    $clientExeCheck = Join-Path $appDir "Client\HytaleClient.exe"
+    if (-not (Test-Path $clientExeCheck)) {
+        # Search for it in subdirectories
+        $foundExe = Get-ChildItem -Path $appDir -Filter "HytaleClient.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($foundExe) {
+            $clientDir = Join-Path $appDir "Client"
+            if (-not (Test-Path $clientDir)) { New-Item -ItemType Directory $clientDir -Force | Out-Null }
+            Move-Item -Path $foundExe.FullName -Destination $clientExeCheck -Force -ErrorAction SilentlyContinue
+            Write-Host "      [FIX] HytaleClient.exe relocated to Client\ folder." -ForegroundColor Green
+        }
     }
     
     Write-Host "`n[APPLY] Official patch application finished." -ForegroundColor Green
@@ -3290,6 +3481,69 @@ function Invoke-OfficialUpdate($latestVer, $skipServerSync=$false) {
     }
     Write-Host "`n[COMPLETE] Conversion finished. Hytale is ready." -ForegroundColor Green
     return $true
+}
+
+# --- GPU DETECTION ---
+function Get-GpuInfo {
+    $gpuList = @()
+    
+    # Try Get-CimInstance first (modern), fallback to Get-WmiObject (legacy)
+    try {
+        $adapters = Get-CimInstance Win32_VideoController -ErrorAction Stop
+    } catch {
+        try {
+            $adapters = Get-WmiObject Win32_VideoController -ErrorAction Stop
+        } catch {
+            Write-Host "      [WARN] Could not detect GPUs." -ForegroundColor Yellow
+            return @()
+        }
+    }
+    
+    foreach ($adapter in $adapters) {
+        $name = $adapter.Name
+        if (-not $name) { continue }
+        
+        $lowerName = $name.ToLower()
+        $vramMB = if ($adapter.AdapterRAM) { [math]::Round($adapter.AdapterRAM / 1MB) } else { 0 }
+        
+        # Detect vendor and type
+        $isNvidia = $lowerName -match "nvidia"
+        $isAmd = $lowerName -match "amd|radeon"
+        $isIntelArc = $lowerName -match "arc" -and $lowerName -match "intel"
+        $isDedicated = $isNvidia -or $isAmd -or $isIntelArc
+        
+        $vendor = if ($isNvidia) { "NVIDIA" } 
+                  elseif ($isAmd) { "AMD" } 
+                  elseif ($isIntelArc) { "Intel Arc" }
+                  elseif ($lowerName -match "intel|iris|uhd") { "Intel" }
+                  else { "Other" }
+        
+        $type = if ($isDedicated) { "Dedicated" } else { "Integrated" }
+        
+        $gpuList += [PSCustomObject]@{
+            Name   = $name
+            Vendor = $vendor
+            Type   = $type
+            VRAM   = $vramMB
+            ID     = $adapter.DeviceID
+        }
+    }
+    
+    return $gpuList
+}
+
+
+function Set-GpuPreference($exePath, $preference) {
+    <# Sets Windows Graphics Performance Preference for an executable.
+       0 = System default, 1 = Power saving (integrated), 2 = High performance (dedicated) #>
+    try {
+        $regPath = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
+        if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+        Set-ItemProperty -Path $regPath -Name $exePath -Value "GpuPreference=$preference;" -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
 }
 
 # --- Auto-Detect Logic ---
@@ -3851,6 +4105,14 @@ while ($true) {
             $menuOptions += "Change Game Installation Path"
             $menuOptions += "Profile Manager (Change Name/UUID)"
             
+            # Option 8: GPU Settings
+            $gpuLabel = "GPU Settings"
+            $quickGpus = @(Get-GpuInfo)
+            if ($quickGpus.Count -gt 0) {
+                $gpuLabel = "GPU Settings [$($quickGpus[0].Name)]"
+            }
+            $menuOptions += $gpuLabel
+            
             # Smart default: if offline, default to option 5 (index 4), else 1 (index 0)
             $defaultIdx = if ($global:offlineMode) { 4 } else { 0 }
             
@@ -4056,6 +4318,116 @@ while ($true) {
             "7" {
                 Show-ProfileMenu
             }
+            "8" {
+                # --- GPU SETTINGS SUBMENU ---
+                Clear-Host
+                Write-Host "==========================================" -ForegroundColor Magenta
+                Write-Host "          GPU SETTINGS" -ForegroundColor Magenta
+                Write-Host "==========================================" -ForegroundColor Magenta
+                
+                $allGpus = @(Get-GpuInfo)
+                $dGpus = @($allGpus | Where-Object { $_.Type -eq "Dedicated" })
+                $iGpus = @($allGpus | Where-Object { $_.Type -eq "Integrated" })
+                
+                if ($allGpus.Count -eq 0) {
+                    Write-Host "`n      [WARN] No GPUs detected." -ForegroundColor Yellow
+                    Write-Host "`nPress any key to return..."
+                    [void][System.Console]::ReadKey($true)
+                } else {
+                    Write-Host "`n      Detected GPUs:" -ForegroundColor Cyan
+                    Write-Host "      -----------------------------------------" -ForegroundColor DarkGray
+                    foreach ($g in $allGpus) {
+                        $vramStr = if ($g.VRAM -gt 0) { "$($g.VRAM)MB VRAM" } else { "VRAM N/A" }
+                        $typeColor = if ($g.Type -eq "Dedicated") { "Green" } else { "Yellow" }
+                        Write-Host "      [$($g.Type)] " -NoNewline -ForegroundColor $typeColor
+                        Write-Host "$($g.Name) " -NoNewline -ForegroundColor White
+                        Write-Host "($vramStr)" -ForegroundColor DarkGray
+                    }
+                    Write-Host "      -----------------------------------------" -ForegroundColor DarkGray
+                    
+                    # Check if dual-GPU system
+                    $hasBothTypes = ($dGpus.Count -gt 0 -and $iGpus.Count -gt 0)
+                    
+                    if (-not $hasBothTypes) {
+                        # Single GPU type - no switching possible
+                        $onlyType = if ($dGpus.Count -gt 0) { "Dedicated" } else { "Integrated" }
+                        Write-Host "`n      [INFO] Only $onlyType GPU(s) detected." -ForegroundColor Cyan
+                        Write-Host "      GPU switching requires both Dedicated + Integrated GPUs." -ForegroundColor Gray
+                        Write-Host "      (Common on laptops with Intel + NVIDIA/AMD)" -ForegroundColor DarkGray
+                        
+                        # Still allow setting system preference
+                        $gpuOptions = @(
+                            "Set as High Performance (recommended)",
+                            "Set as System Default",
+                            "Back to Main Menu"
+                        )
+                        
+                        $gpuIdx = Show-InteractiveMenu -Options $gpuOptions -Title "GPU preference for Hytale:" -Default 0
+                        
+                        switch ($gpuIdx) {
+                            0 {
+                                $global:gpuPreference = "dedicated"
+                                Set-GpuPreference $gameExe 2 | Out-Null
+                                Write-Host "`n      [SUCCESS] GPU set to High Performance" -ForegroundColor Green
+                                Save-Config
+                                Start-Sleep -Seconds 2
+                            }
+                            1 {
+                                $global:gpuPreference = "default"
+                                Set-GpuPreference $gameExe 0 | Out-Null
+                                Write-Host "`n      [SUCCESS] GPU set to System Default" -ForegroundColor Green
+                                Save-Config
+                                Start-Sleep -Seconds 2
+                            }
+                        }
+                    } else {
+                        # Dual GPU system - full selection available
+                        $currentMode = switch ($global:gpuPreference) {
+                            "integrated" { "Power Saving ($($iGpus[0].Name))" }
+                            "dedicated"  { "High Performance ($($dGpus[0].Name))" }
+                            default      { "System Default" }
+                        }
+                        Write-Host "`n      Current Mode: $currentMode" -ForegroundColor Cyan
+                        
+                        $gpuOptions = @(
+                            "High Performance ($($dGpus[0].Name))",
+                            "Power Saving ($($iGpus[0].Name))",
+                            "System Default (Let Windows Decide)",
+                            "Back to Main Menu"
+                        )
+                        
+                        $gpuIdx = Show-InteractiveMenu -Options $gpuOptions -Title "Select GPU for Hytale:" -Default 0
+                        
+                        switch ($gpuIdx) {
+                            0 {
+                                $global:gpuPreference = "dedicated"
+                                Set-GpuPreference $gameExe 2 | Out-Null
+                                # Extra enforcement for NVIDIA Optimus
+                                $env:SHIM_MCCOMPAT = "0x800000001"
+                                Write-Host "`n      [SUCCESS] GPU set to: $($dGpus[0].Name)" -ForegroundColor Green
+                                Save-Config
+                                Start-Sleep -Seconds 2
+                            }
+                            1 {
+                                $global:gpuPreference = "integrated"
+                                Set-GpuPreference $gameExe 1 | Out-Null
+                                $env:SHIM_MCCOMPAT = $null
+                                Write-Host "`n      [SUCCESS] GPU set to: $($iGpus[0].Name)" -ForegroundColor Green
+                                Save-Config
+                                Start-Sleep -Seconds 2
+                            }
+                            2 {
+                                $global:gpuPreference = "default"
+                                Set-GpuPreference $gameExe 0 | Out-Null
+                                $env:SHIM_MCCOMPAT = $null
+                                Write-Host "`n      [SUCCESS] GPU set to System Default" -ForegroundColor Green
+                                Save-Config
+                                Start-Sleep -Seconds 2
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -4098,8 +4470,62 @@ if ([string]::IsNullOrWhiteSpace($gameExe)) {
     continue
 }
 
-# Patch Client
-Patch-HytaleClient $gameExe | Out-Null
+# Patch Client (with EPERM retry logic)
+$patchSuccess = $false
+$patchRetries = 0
+$maxPatchRetries = 3
+
+while (-not $patchSuccess -and $patchRetries -lt $maxPatchRetries) {
+    # Check if exe is locked by another process before patching
+    $exeLocked = $false
+    try {
+        $fs = [System.IO.File]::Open($gameExe, 'Open', 'ReadWrite', 'None')
+        $fs.Close()
+    } catch {
+        $exeLocked = $true
+    }
+    
+    if ($exeLocked) {
+        $patchRetries++
+        Write-Host "      [WARN] HytaleClient.exe is locked by another process! (Attempt $patchRetries/$maxPatchRetries)" -ForegroundColor Yellow
+        Write-Host "      [ACTION] Killing processes that may hold the lock..." -ForegroundColor Cyan
+        
+        # Kill any HytaleClient or java processes that could be locking the exe
+        try {
+            Get-Process -Name "HytaleClient" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Get-Process -Name "java" -ErrorAction SilentlyContinue | Where-Object {
+                $_.MainModule.FileName -like "*HytaleF2P*" -or $_.MainModule.FileName -like "*Hytale*"
+            } | Stop-Process -Force -ErrorAction SilentlyContinue
+        } catch {}
+        
+        # Also try handle-level release via taskkill
+        taskkill /F /IM "HytaleClient.exe" /T 2>$null | Out-Null
+        
+        Start-Sleep -Seconds (2 * $patchRetries)  # Increasing delay
+        Write-Host "      [RETRY] Retrying patch..." -ForegroundColor Cyan
+    }
+    
+    # Attempt the patch
+    $patchOutput = Patch-HytaleClient $gameExe 2>&1 | Out-String
+    
+    # Check if patch output contains EPERM error
+    if ($patchOutput -match "EPERM" -or $patchOutput -match "operation not permitted") {
+        $patchRetries++
+        if ($patchRetries -lt $maxPatchRetries) {
+            Write-Host "      [WARN] Patch failed: EPERM - file is locked. (Attempt $patchRetries/$maxPatchRetries)" -ForegroundColor Yellow
+            
+            # Force kill everything
+            taskkill /F /IM "HytaleClient.exe" /T 2>$null | Out-Null
+            taskkill /F /IM "java.exe" /T 2>$null | Out-Null
+            Start-Sleep -Seconds (2 * $patchRetries)
+        } else {
+            Write-Host "      [ERROR] Patch failed after $maxPatchRetries attempts. Game may not connect to custom server." -ForegroundColor Red
+            Write-Host "      [TIP] Close ALL game windows and processes, then try again." -ForegroundColor Yellow
+        }
+    } else {
+        $patchSuccess = $true
+    }
+}
 
 # Update persistence so we don't ask to update again
 $global:pwrHash = Get-LocalSha1 $gameExe
@@ -4265,9 +4691,41 @@ public class Win32 {
 }
 # ----------------------------------------
 
+
 $dispJava = if ($global:javaPath) { $global:javaPath } else { $javaExe }
 Write-Host "      Java:     $dispJava" -ForegroundColor Gray
 Write-Host "      User:     $global:pName" -ForegroundColor Cyan
+
+# --- GPU SELECTION ---
+$detectedGpus = @(Get-GpuInfo)
+$dedicatedGpus = @($detectedGpus | Where-Object { $_.Type -eq "Dedicated" })
+$integratedGpus = @($detectedGpus | Where-Object { $_.Type -eq "Integrated" })
+
+if ($detectedGpus.Count -gt 0) {
+    # Show detected GPUs
+    $primaryGpu = if ($dedicatedGpus) { $dedicatedGpus[0] } else { $integratedGpus[0] }
+    $gpuVramStr = if ($primaryGpu.VRAM -gt 0) { " ($($primaryGpu.VRAM)MB)" } else { "" }
+    Write-Host "      GPU:      $($primaryGpu.Name)$gpuVramStr" -ForegroundColor Gray
+
+    # Only show selection if user has BOTH integrated and dedicated
+    if ($dedicatedGpus -and $integratedGpus -and -not $global:gpuSelected) {
+        # Auto-select dedicated by default, but allow override
+        if (-not $global:gpuPreference) { $global:gpuPreference = "dedicated" }
+        
+        # Apply GPU preference to game executable
+        if ($global:gpuPreference -eq "dedicated") {
+            Set-GpuPreference $gameExe 2 | Out-Null
+            Write-Host "      GPU Mode: High Performance (Dedicated)" -ForegroundColor Green
+        } else {
+            Set-GpuPreference $gameExe 1 | Out-Null
+            Write-Host "      GPU Mode: Power Saving (Integrated)" -ForegroundColor Yellow
+        }
+    } elseif ($dedicatedGpus) {
+        Set-GpuPreference $gameExe 2 | Out-Null
+    }
+} else {
+    Write-Host "      GPU:      Unknown" -ForegroundColor DarkGray
+}
 
 # Auth mode selection based on user choice
 # NOTE: Client ALWAYS requires --identity-token and --session-token for authenticated mode
@@ -4402,37 +4860,46 @@ if (Test-Path $gameExe) {
                     
                     # Compare and fix if mismatched
                     if ($serverBranch -ne "unknown" -and $serverBranch -ne "missing" -and $clientPatchline -ne $serverBranch) {
-                        Write-Host "      [VERSION] Mismatch detected!" -ForegroundColor Yellow
-                        Write-Host "             Client Patchline: $clientPatchline" -ForegroundColor Cyan
-                        Write-Host "             Server JAR Branch: $serverBranch" -ForegroundColor Cyan
-                        Write-Host "      -> [FIX] Downloading '$clientPatchline' server JAR to match client..." -ForegroundColor Magenta
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['VersionMismatch']) { $global:fixAttempts['VersionMismatch'] = 0 }
+                        $global:fixAttempts['VersionMismatch']++
                         
-                        # Stop the game
-                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                        Start-Sleep -Seconds 2
-                        
-                        # Re-patch server with correct branch
-                        $patchResult = Patch-HytaleServer $serverJarPath $clientPatchline $true
-                        
-                        if ($patchResult) {
-                            Write-Host "      -> [SUCCESS] Server JAR updated to '$clientPatchline'. Restarting game..." -ForegroundColor Green
+                        if ($global:fixAttempts['VersionMismatch'] -gt 2) {
+                            Write-Host "      -> [STOP] Version mismatch fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [CONTACT] Please report this to the developer." -ForegroundColor Cyan
                         } else {
-                            Write-Host "      -> [WARN] Patch may have failed. Attempting restart anyway..." -ForegroundColor Yellow
+                            Write-Host "      [VERSION] Mismatch detected! (Attempt $($global:fixAttempts['VersionMismatch'])/2)" -ForegroundColor Yellow
+                            Write-Host "             Client Patchline: $clientPatchline" -ForegroundColor Cyan
+                            Write-Host "             Server JAR Branch: $serverBranch" -ForegroundColor Cyan
+                            Write-Host "      -> [FIX] Downloading '$clientPatchline' server JAR to match client..." -ForegroundColor Magenta
+                            
+                            # Stop the game
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                            Start-Sleep -Seconds 2
+                            
+                            # Re-patch server with correct branch
+                            $patchResult = Patch-HytaleServer $serverJarPath $clientPatchline $true
+                            
+                            if ($patchResult) {
+                                Write-Host "      -> [SUCCESS] Server JAR updated to '$clientPatchline'. Restarting game..." -ForegroundColor Green
+                            } else {
+                                Write-Host "      -> [WARN] Patch may have failed. Attempting restart anyway..." -ForegroundColor Yellow
+                            }
+                            
+                            Start-Sleep -Seconds 2
+                            $global:forceRestart = $true; $stable = $false
                         }
-                        
-                        Start-Sleep -Seconds 2
-                        $global:forceRestart = $true; $stable = $false
                     }
                     break  # Exit the foreach after finding patchline
                 }
             }
         }
-        if ($global:forceRestart) { break }  # Exit the for loop to restart
+        if ($global:forceRestart) { pause; break }  # Exit the for loop to restart
         
         # === ERROR MONITORING LOOP ===
         foreach ($nl in $newLogs) {
             $logContent = Get-Content $nl.FullName -Raw -ErrorAction SilentlyContinue
-            $allErrors = Get-Content $nl.FullName | Where-Object { $_ -match "\|ERROR\||\|FATAL\||\|WARN\||\|SEVERE\|" -or $_ -match "VM Initialization Error" -or $_ -match "Server failed to boot" -or $_ -match "World default already exists" -or $_ -match "Failed to decode asset" -or $_ -match "ALPN mismatch" -or $_ -match "username mismatch" -or $_ -match "Token validation failed" -or $_ -match "HTTP 403" -or $_ -match "Invalid or corrupt jarfile" }
+            $allErrors = Get-Content $nl.FullName | Where-Object { $_ -match "\|ERROR\||\|FATAL\||\|WARN\||\|SEVERE\|" -or $_ -match "VM Initialization Error" -or $_ -match "Server failed to boot" -or $_ -match "World default already exists" -or $_ -match "Failed to decode asset" -or $_ -match "ALPN mismatch" -or $_ -match "username mismatch" -or $_ -match "Token validation failed" -or $_ -match "HTTP 403" -or $_ -match "Invalid or corrupt jarfile" -or $_ -match "D3D11" -or $_ -match "DXGI" -or $_ -match "GPU.*crash" -or $_ -match "GraphicsDevice" -or $_ -match "RenderThread.*Exception" -or $_ -match "out of video memory" -or $_ -match "Disconnected during loading" }
             
             # Skip if no new errors
             $newErrors = $allErrors | Where-Object { $reportedErrors -notcontains $_ }
@@ -4452,7 +4919,9 @@ if (Test-Path $gameExe) {
                 JavaBoot = @()           # JRE issues
                 WorldCorruption = @()    # Save issues
                 AssetMismatch = @()      # Asset decode issues
+                ServerCodecError = @()   # Server JSON decode failure (corrupt world/config)
                 ServerBoot = @()         # Generic server boot (symptom, not cause)
+                GpuCrash = @()           # GPU/DirectX/rendering issues
                 Other = @()              # Unknown errors
             }
             
@@ -4496,8 +4965,20 @@ if (Test-Path $gameExe) {
                 elseif ($err -match "Failed to decode asset" -or $err -match "ALPN mismatch" -or $err -match "client outdated" -or $err -match "CodecException" -or $err -match "Asset validation FAILED") {
                     $errorCategories.AssetMismatch += $err
                 }
+                elseif ($err -match "Disconnected during loading" -and $err -match "network") {
+                    # Only flag as ServerCodecError if the full log ALSO has codec evidence
+                    # DocumentContainingCodec alone is just a harmless server boot warning
+                    if ($logContent -match "DocumentContainingCodec" -or $logContent -match "decodeJson.*codec" -or $logContent -match "QuicException.*Connection aborted") {
+                        $errorCategories.ServerCodecError += $err
+                    } else {
+                        $errorCategories.Other += $err
+                    }
+                }
                 elseif ($err -match "Server failed to boot") {
                     $errorCategories.ServerBoot += $err
+                }
+                elseif ($err -match "D3D11" -or $err -match "DXGI" -or $err -match "GPU.*crash" -or $err -match "GraphicsDevice" -or $err -match "RenderThread.*Exception" -or $err -match "out of video memory" -or $err -match "BackendRendererD3D" -or $err -match "GPU hung") {
+                    $errorCategories.GpuCrash += $err
                 }
                 else {
                     $errorCategories.Other += $err
@@ -4578,6 +5059,21 @@ if (Test-Path $gameExe) {
                 $rootCause = "AppMainMenu"
                 $rootCauseErrors = $errorCategories.AppMainMenu
             }
+            # Priority 10: GPU/Rendering Crash
+            elseif ($errorCategories.GpuCrash.Count -gt 0) {
+                $rootCause = "GpuCrash"
+                $rootCauseErrors = $errorCategories.GpuCrash
+            }
+            # Priority 11: Server Codec Error (QUIC disconnect during loading with codec context)
+            elseif ($errorCategories.ServerCodecError.Count -gt 0) {
+                # Only treat as root cause if the server didn't actually stay running
+                # (i.e., no "Listening on" after the codec warning, which means it was harmless)
+                $serverStillRunning = $logContent -match "Singleplayer server is ready" -and $logContent -match "Quic Stream connected" -and -not ($logContent -match "Disconnected during loading")
+                if (-not $serverStillRunning) {
+                    $rootCause = "ServerCodecError"
+                    $rootCauseErrors = $errorCategories.ServerCodecError
+                }
+            }
             # Priority LAST: Server Boot (this is usually a SYMPTOM, not a cause)
             elseif ($errorCategories.ServerBoot.Count -gt 0 -and $errorCategories.Other.Count -eq 0) {
                 # Only treat as root cause if there are no other clues
@@ -4592,144 +5088,171 @@ if (Test-Path $gameExe) {
                 
                 switch ($rootCause) {
                     "AgentPathError" {
-                        Write-Host "      -> [FIX] Space/Special Characters detected in Windows Path!" -ForegroundColor Red
-                        Write-Host "      -> [CAUSE] Java cannot load JARs because of spaces in the path ('$env:USERNAME')." -ForegroundColor Yellow
-                        Write-Host "      -> [ACTION] Converting JAR paths to Short-Path (8.3) format..." -ForegroundColor Cyan
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['AgentPathError']) { $global:fixAttempts['AgentPathError'] = 0 }
+                        $global:fixAttempts['AgentPathError']++
                         
-                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                        
-                        # Check if this is a corrupt/invalid jarfile error (server JAR)
-                        $isCorruptJar = $rootCauseErrors | Where-Object { $_ -match "Invalid or corrupt jarfile" }
-                        
-                        if ($isCorruptJar) {
-                            # Could be spaces in path OR actually corrupt - handle both
-                            $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
-                            
-                            if ($appDir -match ' ') {
-                                # Path has spaces - convert to 8.3 short path
-                                Write-Host "      -> [DETECT] Spaces found in game path. Converting..." -ForegroundColor Cyan
-                                try {
-                                    $fso = New-Object -ComObject Scripting.FileSystemObject
-                                    $shortAppDir = $fso.GetFolder($appDir).ShortPath
-                                    $global:FIXED_APP_DIR = $shortAppDir
-                                    Write-Host "      -> [SUCCESS] Short app path: $shortAppDir" -ForegroundColor Green
-                                } catch {
-                                    Write-Host "      -> [WARN] 8.3 names unavailable for app dir." -ForegroundColor Yellow
-                                }
-                            }
-                            
-                            # Also redownload JAR in case it's actually corrupt
-                            if (Test-Path $serverJarPath) {
-                                $jarSize = (Get-Item $serverJarPath).Length
-                                if ($jarSize -lt 1MB) {
-                                    Write-Host "      -> [DETECT] Server JAR too small ($([math]::Round($jarSize/1KB))KB). Likely corrupt." -ForegroundColor Yellow
-                                    Remove-Item $serverJarPath -Force -ErrorAction SilentlyContinue
-                                    Write-Host "      -> [FIX] Removed corrupt JAR. Will redownload on restart." -ForegroundColor Green
-                                    $global:autoRepairTriggered = $true
-                                }
-                            }
-                        }
-                        
-                        # Apply the 8.3 Path Fix for auth-agent (always)
-                        $agentPath = Join-Path $appDir "Server\dualauth-agent.jar"
-                        if (Test-Path $agentPath) {
-                            try {
-                                $fso = New-Object -ComObject Scripting.FileSystemObject
-                                $shortPath = $fso.GetFile($agentPath).ShortPath
-                                $global:FIXED_AGENT_PATH = $shortPath
-                                Write-Host "      -> [SUCCESS] Agent short path: $shortPath" -ForegroundColor Green
-                            } catch {
-                                Write-Host "      -> [FALLBACK] Short path failed. Copying agent to C:\Temp..." -ForegroundColor Yellow
-                                if (-not (Test-Path "C:\Temp")) { New-Item -ItemType Directory -Path "C:\Temp" -Force | Out-Null }
-                                Copy-Item $agentPath "C:\Temp\dualauth-agent.jar" -Force
-                                $global:FIXED_AGENT_PATH = "C:\Temp\dualauth-agent.jar"
-                            }
-                        }
-                        
-                        $global:forceRestart = $true; $stable = $false; break
-                    }
-                    "TokenMismatch" {
-                        Write-Host "      -> [FIX] Token Mismatch Detected!" -ForegroundColor Red
-                        
-                        # Check if this is specifically a UUID mismatch
-                        $uuidMismatchError = $rootCauseErrors | Where-Object { $_ -match "UUID mismatch.*token has ([a-f0-9\-]{36})" }
-                        
-                        if ($uuidMismatchError) {
-                            # Extract the correct UUID from the token
-                            if ($uuidMismatchError -match "token has ([a-f0-9\-]{36})") {
-                                $correctUuid = $Matches[1]
-                                Write-Host "      -> [CAUSE] Your profile UUID does not match your authentication token." -ForegroundColor Yellow
-                                Write-Host "      -> [DETECTED] Token UUID: $correctUuid" -ForegroundColor Cyan
-                                Write-Host "      -> [CURRENT] Profile UUID: $global:pUuid" -ForegroundColor Gray
-                                
-                                # 1. Stop the game immediately
-                                Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                                
-                                # 2. Update the Launcher's global variables
-                                $oldUuid = $global:pUuid
-                                $global:pUuid = $correctUuid
-                                
-                                # 3. Permanently save the new UUID to config files
-                                if (Get-Command "Save-Config" -ErrorAction SilentlyContinue) {
-                                    Save-Config
-                                    Write-Host "      -> [CONFIG] Launcher profile updated to match token." -ForegroundColor Green
-                                }
-
-                                # 4. Update World Saves (Migrate items/stats from old UUID to new UUID)
-                                # We use the $userDir which is already calculated at the start of the launch block
-                                $uDir = $userDir 
-                                if (-not (Test-Path $uDir)) {
-                                    # Fallback discovery logic
-                                    $lRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $env:LOCALAPPDATA }
-                                    $uDir = Join-Path $lRoot "release\package\game\latest\Client\UserData"
-                                }
-
-                                if (Test-Path $uDir) {
-                                    Write-Host "      -> [SYNC] Migrating player data in world saves..." -ForegroundColor Cyan
-                                    # Use your existing function to rename .json files and update internal metadata
-                                    Update-PlayerIdentityInSaves -userDataPath $uDir -newUuid $correctUuid -newName $global:pName
-                                }
-                                
-                                Write-Host "      -> [READY] Identity synced! Restarting game..." -ForegroundColor Green
-                                Start-Sleep -Seconds 2
-                                $global:forceRestart = $true; $stable = $false; break
-                            }
+                        if ($global:fixAttempts['AgentPathError'] -gt 2) {
+                            Write-Host "      -> [STOP] AgentPath fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [CONTACT] Please report this to the developer." -ForegroundColor Cyan
                         } else {
-                            # Generic token mismatch (username, expired, etc.)
-                            Write-Host "      -> [CAUSE] Cached tokens have wrong username or are expired." -ForegroundColor Yellow
-                            Write-Host "      -> [ACTION] Clearing auth cache and refreshing tokens..." -ForegroundColor Cyan
+                            Write-Host "      -> [FIX] Space/Special Characters detected in Windows Path! (Attempt $($global:fixAttempts['AgentPathError'])/2)" -ForegroundColor Red
+                            Write-Host "      -> [CAUSE] Java cannot load JARs because of spaces in the path ('$env:USERNAME')." -ForegroundColor Yellow
+                            Write-Host "      -> [ACTION] Converting JAR paths to Short-Path (8.3) format..." -ForegroundColor Cyan
                             
                             Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
                             
-                            # Clear auth cache
-                            $authCacheFile = Join-Path $localAppData "auth_cache.json"
-                            if (Test-Path $authCacheFile) { Remove-Item $authCacheFile -Force -ErrorAction SilentlyContinue }
-                            $publicAuthCache = Join-Path (Join-Path $env:PUBLIC "HytaleF2P") "auth_cache.json"
-                            if (Test-Path $publicAuthCache) { Remove-Item $publicAuthCache -Force -ErrorAction SilentlyContinue }
-                            $global:idToken = $null; $global:ssToken = $null
+                            $isCorruptJar = $rootCauseErrors | Where-Object { $_ -match "Invalid or corrupt jarfile" }
                             
-                            Write-Host "      -> [CLEARED] Auth cache deleted. Restarting..." -ForegroundColor Green
-                            Start-Sleep -Seconds 2
+                            if ($isCorruptJar) {
+                                $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
+                                
+                                if ($appDir -match ' ') {
+                                    Write-Host "      -> [DETECT] Spaces found in game path. Converting..." -ForegroundColor Cyan
+                                    try {
+                                        $fso = New-Object -ComObject Scripting.FileSystemObject
+                                        $shortAppDir = $fso.GetFolder($appDir).ShortPath
+                                        $global:FIXED_APP_DIR = $shortAppDir
+                                        Write-Host "      -> [SUCCESS] Short app path: $shortAppDir" -ForegroundColor Green
+                                    } catch {
+                                        Write-Host "      -> [WARN] 8.3 names unavailable for app dir." -ForegroundColor Yellow
+                                    }
+                                }
+                                
+                                if (Test-Path $serverJarPath) {
+                                    $jarSize = (Get-Item $serverJarPath).Length
+                                    if ($jarSize -lt 1MB) {
+                                        Write-Host "      -> [DETECT] Server JAR too small ($([math]::Round($jarSize/1KB))KB). Likely corrupt." -ForegroundColor Yellow
+                                        Remove-Item $serverJarPath -Force -ErrorAction SilentlyContinue
+                                        Write-Host "      -> [FIX] Removed corrupt JAR. Will redownload on restart." -ForegroundColor Green
+                                        $global:autoRepairTriggered = $true
+                                    }
+                                }
+                            }
+                            
+                            $agentPath = Join-Path $appDir "Server\dualauth-agent.jar"
+                            if (Test-Path $agentPath) {
+                                try {
+                                    $fso = New-Object -ComObject Scripting.FileSystemObject
+                                    $shortPath = $fso.GetFile($agentPath).ShortPath
+                                    $global:FIXED_AGENT_PATH = $shortPath
+                                    Write-Host "      -> [SUCCESS] Agent short path: $shortPath" -ForegroundColor Green
+                                } catch {
+                                    Write-Host "      -> [FALLBACK] Short path failed. Copying agent to C:\Temp..." -ForegroundColor Yellow
+                                    if (-not (Test-Path "C:\Temp")) { New-Item -ItemType Directory -Path "C:\Temp" -Force | Out-Null }
+                                    Copy-Item $agentPath "C:\Temp\dualauth-agent.jar" -Force
+                                    $global:FIXED_AGENT_PATH = "C:\Temp\dualauth-agent.jar"
+                                }
+                            }
+                            
                             $global:forceRestart = $true; $stable = $false; break
                         }
                     }
+                    "TokenMismatch" {
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['TokenMismatch']) { $global:fixAttempts['TokenMismatch'] = 0 }
+                        $global:fixAttempts['TokenMismatch']++
+                        
+                        if ($global:fixAttempts['TokenMismatch'] -gt 2) {
+                            Write-Host "      -> [STOP] Token mismatch fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [CONTACT] Please report this to the developer." -ForegroundColor Cyan
+                        } else {
+                            Write-Host "      -> [FIX] Token Mismatch Detected! (Attempt $($global:fixAttempts['TokenMismatch'])/2)" -ForegroundColor Red
+                            
+                            $uuidMismatchError = $rootCauseErrors | Where-Object { $_ -match "UUID mismatch.*token has ([a-f0-9\-]{36})" }
+                            
+                            if ($uuidMismatchError) {
+                                if ($uuidMismatchError -match "token has ([a-f0-9\-]{36})") {
+                                    $correctUuid = $matches[1]
+                                    Write-Host "      -> [CAUSE] Your profile UUID does not match your authentication token." -ForegroundColor Yellow
+                                    Write-Host "      -> [DETECTED] Token UUID: $correctUuid" -ForegroundColor Cyan
+                                    Write-Host "      -> [CURRENT] Profile UUID: $global:pUuid" -ForegroundColor Gray
+                                    
+                                    Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                                    
+                                    $oldUuid = $global:pUuid
+                                    $global:pUuid = $correctUuid
+                                    
+                                    if (Get-Command "Save-Config" -ErrorAction SilentlyContinue) {
+                                        Save-Config
+                                        Write-Host "      -> [CONFIG] Launcher profile updated to match token." -ForegroundColor Green
+                                    }
+
+                                    $uDir = $userDir 
+                                    if (-not (Test-Path $uDir)) {
+                                        $lRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $env:LOCALAPPDATA }
+                                        $uDir = Join-Path $lRoot "release\package\game\latest\Client\UserData"
+                                    }
+
+                                    if (Test-Path $uDir) {
+                                        Write-Host "      -> [SYNC] Migrating player data in world saves..." -ForegroundColor Cyan
+                                        Update-PlayerIdentityInSaves -userDataPath $uDir -newUuid $correctUuid -newName $global:pName
+                                    }
+                                    
+                                    Write-Host "      -> [READY] Identity synced! Restarting game..." -ForegroundColor Green
+                                    Start-Sleep -Seconds 2
+                                    $global:forceRestart = $true; $stable = $false; break
+                                }
+                            } else {
+                                Write-Host "      -> [CAUSE] Cached tokens have wrong username or are expired." -ForegroundColor Yellow
+                                Write-Host "      -> [ACTION] Clearing auth cache and refreshing tokens..." -ForegroundColor Cyan
+                                
+                                Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                                
+                                $authCacheFile = Join-Path $localAppData "auth_cache.json"
+                                if (Test-Path $authCacheFile) { Remove-Item $authCacheFile -Force -ErrorAction SilentlyContinue }
+                                $publicAuthCache = Join-Path (Join-Path $env:PUBLIC "HytaleF2P") "auth_cache.json"
+                                if (Test-Path $publicAuthCache) { Remove-Item $publicAuthCache -Force -ErrorAction SilentlyContinue }
+                                $global:idToken = $null; $global:ssToken = $null
+                                
+                                Write-Host "      -> [CLEARED] Auth cache deleted. Restarting..." -ForegroundColor Green
+                                Start-Sleep -Seconds 2
+                                $global:forceRestart = $true; $stable = $false; break
+                            }
+                        }
+                    }
                     "TimeSync" {
-                        Write-Host "      -> [FIX] System Time Desync Detected!" -ForegroundColor Red
-                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                        if ($isAdmin) { Sync-SystemTime } else { $global:autoRepairTriggered = $true }
-                        $global:forceRestart = $true; $stable = $false; break
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['TimeSync']) { $global:fixAttempts['TimeSync'] = 0 }
+                        $global:fixAttempts['TimeSync']++
+                        
+                        if ($global:fixAttempts['TimeSync'] -gt 2) {
+                            Write-Host "      -> [STOP] Time sync fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [CONTACT] Please report this to the developer." -ForegroundColor Cyan
+                        } else {
+                            Write-Host "      -> [FIX] System Time Desync Detected! (Attempt $($global:fixAttempts['TimeSync'])/2)" -ForegroundColor Red
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                            if ($isAdmin) { Sync-SystemTime } else { $global:autoRepairTriggered = $true }
+                            $global:forceRestart = $true; $stable = $false; break
+                        }
                     }
                     "IpBlock" {
-                        Write-Host "      -> [BLOCK] Network Connection Denied!" -ForegroundColor Red
-                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                        Safe-ReadHost "Press Enter to continue..." | Out-Null
-                        Show-NetworkFixMenu
-                        $global:forceRestart = $true; $stable = $false; break
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['IpBlock']) { $global:fixAttempts['IpBlock'] = 0 }
+                        $global:fixAttempts['IpBlock']++
+                        
+                        if ($global:fixAttempts['IpBlock'] -gt 2) {
+                            Write-Host "      -> [STOP] Network fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [CONTACT] Please report this to the developer." -ForegroundColor Cyan
+                        } else {
+                            Write-Host "      -> [BLOCK] Network Connection Denied! (Attempt $($global:fixAttempts['IpBlock'])/2)" -ForegroundColor Red
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                            Safe-ReadHost "Press Enter to continue..." | Out-Null
+                            Show-NetworkFixMenu
+                            $global:forceRestart = $true; $stable = $false; break
+                        }
                     }
                     "IssuerMismatch" {
-                        if ($rootCauseErrors[0] -match "expected (https?://[^\s,]+)") {
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['IssuerMismatch']) { $global:fixAttempts['IssuerMismatch'] = 0 }
+                        $global:fixAttempts['IssuerMismatch']++
+                        
+                        if ($global:fixAttempts['IssuerMismatch'] -gt 2) {
+                            Write-Host "      -> [STOP] Issuer mismatch fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [CONTACT] Please report this to the developer." -ForegroundColor Cyan
+                        } elseif ($rootCauseErrors[0] -match "expected (https?://[^\s,]+)") {
                             $expectedUrl = $matches[1].TrimEnd('/')
-                            Write-Host "      -> [FIX] Updating auth URL to: $expectedUrl" -ForegroundColor Yellow
+                            Write-Host "      -> [FIX] Updating auth URL to: $expectedUrl (Attempt $($global:fixAttempts['IssuerMismatch'])/2)" -ForegroundColor Yellow
                             $global:AUTH_URL_CURRENT = $expectedUrl; Save-Config
                             Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
                             Start-Sleep -Seconds 2
@@ -4737,166 +5260,317 @@ if (Test-Path $gameExe) {
                         }
                     }
                     "JwtValidation" {
-                        Write-Host "      -> [FIX] Downloading pre-patched server..." -ForegroundColor Yellow
-                        $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
-                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                        Start-Sleep -Seconds 1
-                        if (Patch-HytaleServer $serverJarPath "release" $true) {
-                            Write-Host "      -> [SUCCESS] Server patched!" -ForegroundColor Green
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['JwtValidation']) { $global:fixAttempts['JwtValidation'] = 0 }
+                        $global:fixAttempts['JwtValidation']++
+                        
+                        if ($global:fixAttempts['JwtValidation'] -gt 2) {
+                            Write-Host "      -> [STOP] JWT validation fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [CONTACT] Please report this to the developer." -ForegroundColor Cyan
+                        } else {
+                            Write-Host "      -> [FIX] Downloading pre-patched server... (Attempt $($global:fixAttempts['JwtValidation'])/2)" -ForegroundColor Yellow
+                            $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                            Start-Sleep -Seconds 1
+                            if (Patch-HytaleServer $serverJarPath "release" $true) {
+                                Write-Host "      -> [SUCCESS] Server patched!" -ForegroundColor Green
+                            }
+                            Start-Sleep -Seconds 2
+                            $global:forceRestart = $true; $stable = $false; break
                         }
-                        Start-Sleep -Seconds 2
-                        $global:forceRestart = $true; $stable = $false; break
                     }
                     "ModLock" {
-                        Write-Host "      -> [FIX] Mod File Locked! Moving problematic mod to quarantine..." -ForegroundColor Yellow
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['ModLock']) { $global:fixAttempts['ModLock'] = 0 }
+                        $global:fixAttempts['ModLock']++
                         
-                        # Extract mod name from error (e.g., "Failed to remove BetterZoom from central mods: EPERM")
-                        $modName = $null
-                        foreach ($modErr in $rootCauseErrors) {
-                            if ($modErr -match "Failed to remove (\w+) from" -or $modErr -match "\\Mods\\([^'\\]+)" -or $modErr -match "unlink '.*\\Mods\\([^'\\]+)'") {
-                                $modName = $Matches[1]
-                                break
-                            }
-                        }
-                        
-                        if ($modName) {
-                            Write-Host "      -> [DETECTED] Problematic mod: $modName" -ForegroundColor Cyan
+                        if ($global:fixAttempts['ModLock'] -gt 2) {
+                            Write-Host "      -> [STOP] Mod lock fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [CONTACT] Please report this to the developer." -ForegroundColor Cyan
+                        } else {
+                            Write-Host "      -> [FIX] Mod File Locked! Moving problematic mod to quarantine... (Attempt $($global:fixAttempts['ModLock'])/2)" -ForegroundColor Yellow
                             
-                            # Define paths
-                            $modsDir = Join-Path $env:LOCALAPPDATA "HytaleSaves\Mods"
-                            $quarantineDir = Join-Path $env:LOCALAPPDATA "HytaleSaves\ModsQuarantine"
-                            $modPath = Join-Path $modsDir $modName
-                            
-                            # Create quarantine folder if needed
-                            if (-not (Test-Path $quarantineDir)) {
-                                New-Item -ItemType Directory -Path $quarantineDir -Force | Out-Null
+                            $modName = $null
+                            foreach ($modErr in $rootCauseErrors) {
+                                if ($modErr -match "Failed to remove (\w+) from" -or $modErr -match "\\Mods\\([^'\\]+)" -or $modErr -match "unlink '.*\\Mods\\([^'\\]+)'") {
+                                    $modName = $Matches[1]
+                                    break
+                                }
                             }
                             
-                            # Try to move the mod
-                            if (Test-Path $modPath) {
-                                try {
-                                    $destPath = Join-Path $quarantineDir $modName
-                                    if (Test-Path $destPath) { Remove-Item $destPath -Recurse -Force -ErrorAction SilentlyContinue }
-                                    Move-Item -Path $modPath -Destination $destPath -Force -ErrorAction Stop
-                                    Write-Host "      -> [MOVED] Mod quarantined to: $destPath" -ForegroundColor Green
-                                } catch {
-                                    # If move fails, try to force delete
-                                    Write-Host "      -> [WARN] Move failed, attempting force delete..." -ForegroundColor Yellow
+                            if ($modName) {
+                                Write-Host "      -> [DETECTED] Problematic mod: $modName" -ForegroundColor Cyan
+                                
+                                $modsDir = Join-Path $env:LOCALAPPDATA "HytaleSaves\Mods"
+                                $quarantineDir = Join-Path $env:LOCALAPPDATA "HytaleSaves\ModsQuarantine"
+                                $modPath = Join-Path $modsDir $modName
+                                
+                                if (-not (Test-Path $quarantineDir)) {
+                                    New-Item -ItemType Directory -Path $quarantineDir -Force | Out-Null
+                                }
+                                
+                                if (Test-Path $modPath) {
                                     try {
-                                        Remove-Item -Path $modPath -Recurse -Force -ErrorAction Stop
-                                        Write-Host "      -> [DELETED] Mod removed from Mods folder." -ForegroundColor Green
+                                        $destPath = Join-Path $quarantineDir $modName
+                                        if (Test-Path $destPath) { Remove-Item $destPath -Recurse -Force -ErrorAction SilentlyContinue }
+                                        Move-Item -Path $modPath -Destination $destPath -Force -ErrorAction Stop
+                                        Write-Host "      -> [MOVED] Mod quarantined to: $destPath" -ForegroundColor Green
                                     } catch {
-                                        Write-Host "      -> [ERROR] Could not remove mod. Try closing any programs using it." -ForegroundColor Red
+                                        Write-Host "      -> [WARN] Move failed, attempting force delete..." -ForegroundColor Yellow
+                                        try {
+                                            Remove-Item -Path $modPath -Recurse -Force -ErrorAction Stop
+                                            Write-Host "      -> [DELETED] Mod removed from Mods folder." -ForegroundColor Green
+                                        } catch {
+                                            Write-Host "      -> [ERROR] Could not remove mod. Try closing any programs using it." -ForegroundColor Red
+                                        }
                                     }
+                                } else {
+                                    Write-Host "      -> [INFO] Mod not found at: $modPath" -ForegroundColor Gray
                                 }
                             } else {
-                                Write-Host "      -> [INFO] Mod not found at: $modPath" -ForegroundColor Gray
+                                Write-Host "      -> [INFO] Could not identify specific mod from error." -ForegroundColor Yellow
                             }
-                        } else {
-                            Write-Host "      -> [INFO] Could not identify specific mod from error." -ForegroundColor Yellow
+                            
+                            Start-Sleep -Seconds 2
+                            $global:forceRestart = $true; $stable = $false; break
                         }
-                        
-                        Start-Sleep -Seconds 2
-                        $global:forceRestart = $true; $stable = $false; break
                     }
                     "SaveVersionMismatch" {
-                        Write-Host "      -> [FIX] Save Version Incompatible! Attempting to downgrade config..." -ForegroundColor Yellow
-                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['SaveVersionMismatch']) { $global:fixAttempts['SaveVersionMismatch'] = 0 }
+                        $global:fixAttempts['SaveVersionMismatch']++
                         
-                        # Extract expected version from error (e.g., "Version 4 is newer than expected version 3")
-                        $expectedVersion = 3  # Default fallback
-                        foreach ($verr in $rootCauseErrors) {
-                            if ($verr -match "Version \d+ is newer than expected version (\d+)") {
-                                $expectedVersion = [int]$Matches[1]
-                                break
-                            }
-                        }
-                        
-                        # Try to find which world was being loaded from logs
-                        $worldName = $null
-                        if ($logContent -match 'Connecting to singleplayer world "([^"\\]+)') {
-                            $worldName = $Matches[1].TrimEnd('\')
-                        }
-                        
-                        $userDataDir = Join-Path $appDir "Client\UserData"
-                        $configFixed = $false
-                        
-                        if ($worldName) {
-                            Write-Host "      -> [DETECTED] Incompatible world: $worldName" -ForegroundColor Cyan
-                            Write-Host "      -> [TARGET] Downgrading to version $expectedVersion..." -ForegroundColor Gray
+                        if ($global:fixAttempts['SaveVersionMismatch'] -gt 2) {
+                            Write-Host "      -> [STOP] Save version fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [CONTACT] Please report this to the developer." -ForegroundColor Cyan
+                        } else {
+                            Write-Host "      -> [FIX] Save Version Incompatible! Attempting to downgrade config... (Attempt $($global:fixAttempts['SaveVersionMismatch'])/2)" -ForegroundColor Yellow
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
                             
-                            $targetSave = Join-Path $userDataDir "Saves\$worldName"
-                            
-                            # Find all config.json files in the world folder
-                            $configFiles = Get-ChildItem -Path $targetSave -Filter "config.json" -Recurse -ErrorAction SilentlyContinue
-                            
-                            foreach ($cfg in $configFiles) {
-                                try {
-                                    # Create backup
-                                    $backupPath = "$($cfg.FullName).backup"
-                                    Copy-Item $cfg.FullName -Destination $backupPath -Force -ErrorAction Stop
-                                    
-                                    # Read and modify JSON
-                                    $jsonContent = Get-Content $cfg.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
-                                    
-                                    if ($jsonContent.Version -and $jsonContent.Version -gt $expectedVersion) {
-                                        $oldVersion = $jsonContent.Version
-                                        $jsonContent.Version = $expectedVersion
-                                        
-                                        # Write back
-                                        $jsonContent | ConvertTo-Json -Depth 20 | Out-File $cfg.FullName -Encoding UTF8 -Force
-                                        
-                                        $relPath = $cfg.FullName.Replace($targetSave, "").TrimStart("\")
-                                        Write-Host "      -> [PATCHED] $relPath : v$oldVersion -> v$expectedVersion" -ForegroundColor Green
-                                        $configFixed = $true
-                                    }
-                                } catch {
-                                    Write-Host "      -> [WARN] Failed to patch: $($cfg.Name)" -ForegroundColor Yellow
+                            $expectedVersion = 3
+                            foreach ($verr in $rootCauseErrors) {
+                                if ($verr -match "Version \d+ is newer than expected version (\d+)") {
+                                    $expectedVersion = [int]$Matches[1]
+                                    break
                                 }
                             }
                             
-                            if ($configFixed) {
-                                Write-Host "      -> [SUCCESS] Config downgraded! Backups saved as config.json.backup" -ForegroundColor Green
-                            } else {
-                                Write-Host "      -> [INFO] No config files needed patching." -ForegroundColor Gray
+                            $worldName = $null
+                            if ($logContent -match 'Connecting to singleplayer world "([^"\\]+)') {
+                                $worldName = $Matches[1].TrimEnd('\')
                             }
-                        } else {
-                            Write-Host "      -> [INFO] Could not identify specific world from logs." -ForegroundColor Yellow
+                            
+                            $userDataDir = Join-Path $appDir "Client\UserData"
+                            $configFixed = $false
+                            
+                            if ($worldName) {
+                                Write-Host "      -> [DETECTED] Incompatible world: $worldName" -ForegroundColor Cyan
+                                Write-Host "      -> [TARGET] Downgrading to version $expectedVersion..." -ForegroundColor Gray
+                                
+                                $targetSave = Join-Path $userDataDir "Saves\$worldName"
+                                $configFiles = Get-ChildItem -Path $targetSave -Filter "config.json" -Recurse -ErrorAction SilentlyContinue
+                                
+                                foreach ($cfg in $configFiles) {
+                                    try {
+                                        $backupPath = "$($cfg.FullName).backup"
+                                        Copy-Item $cfg.FullName -Destination $backupPath -Force -ErrorAction Stop
+                                        
+                                        $jsonContent = Get-Content $cfg.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
+                                        
+                                        if ($jsonContent.Version -and $jsonContent.Version -gt $expectedVersion) {
+                                            $oldVersion = $jsonContent.Version
+                                            $jsonContent.Version = $expectedVersion
+                                            $jsonContent | ConvertTo-Json -Depth 20 | Out-File $cfg.FullName -Encoding UTF8 -Force
+                                            
+                                            $relPath = $cfg.FullName.Replace($targetSave, "").TrimStart("\")
+                                            Write-Host "      -> [PATCHED] $relPath : v$oldVersion -> v$expectedVersion" -ForegroundColor Green
+                                            $configFixed = $true
+                                        }
+                                    } catch {
+                                        Write-Host "      -> [WARN] Failed to patch: $($cfg.Name)" -ForegroundColor Yellow
+                                    }
+                                }
+                                
+                                if ($configFixed) {
+                                    Write-Host "      -> [SUCCESS] Config downgraded! Backups saved as config.json.backup" -ForegroundColor Green
+                                } else {
+                                    Write-Host "      -> [INFO] No config files needed patching." -ForegroundColor Gray
+                                }
+                            } else {
+                                Write-Host "      -> [INFO] Could not identify specific world from logs." -ForegroundColor Yellow
+                            }
+                            
+                            Start-Sleep -Seconds 2
+                            $global:forceRestart = $true; $stable = $false; break
                         }
-                        
-                        Start-Sleep -Seconds 2
-                        $global:forceRestart = $true; $stable = $false; break
                     }
                     "AssetMismatch" {
-                        Write-Host "      -> [FIX] Asset Mismatch! Removing server JAR..." -ForegroundColor Yellow
-                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                        $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
-                        if (Test-Path $serverJarPath) { Remove-Item $serverJarPath -Force -ErrorAction SilentlyContinue }
-                        $global:forceRestart = $true; $global:autoRepairTriggered = $true; $stable = $false; break
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['AssetMismatch']) { $global:fixAttempts['AssetMismatch'] = 0 }
+                        $global:fixAttempts['AssetMismatch']++
+                        
+                        if ($global:fixAttempts['AssetMismatch'] -gt 2) {
+                            Write-Host "      -> [STOP] Asset mismatch fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [CONTACT] Please report this to the developer." -ForegroundColor Cyan
+                        } else {
+                            Write-Host "      -> [FIX] Asset Mismatch! Removing server JAR... (Attempt $($global:fixAttempts['AssetMismatch'])/2)" -ForegroundColor Yellow
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                            $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
+                            if (Test-Path $serverJarPath) { Remove-Item $serverJarPath -Force -ErrorAction SilentlyContinue }
+                            $global:forceRestart = $true; $global:autoRepairTriggered = $true; $stable = $false; break
+                        }
                     }
                     "WorldCorruption" {
-                        Write-Host "      -> [FIX] World Corruption! Backing up and clearing..." -ForegroundColor Yellow
-                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                        $userDataDir = Join-Path $appDir "Client\UserData"
-                        Backup-WorldSaves $userDataDir
-                        $targetSave = Join-Path $userDataDir "Saves\default"
-                        if (Test-Path $targetSave) { Remove-Item $targetSave -Recurse -Force -ErrorAction SilentlyContinue }
-                        $global:forceRestart = $true; $global:autoRepairTriggered = $true; $stable = $false; break
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['WorldCorruption']) { $global:fixAttempts['WorldCorruption'] = 0 }
+                        $global:fixAttempts['WorldCorruption']++
+                        
+                        if ($global:fixAttempts['WorldCorruption'] -gt 2) {
+                            Write-Host "      -> [STOP] World corruption fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [CONTACT] Please report this to the developer." -ForegroundColor Cyan
+                        } else {
+                            Write-Host "      -> [FIX] World Corruption! Backing up and clearing... (Attempt $($global:fixAttempts['WorldCorruption'])/2)" -ForegroundColor Yellow
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                            $userDataDir = Join-Path $appDir "Client\UserData"
+                            Backup-WorldSaves $userDataDir
+                            $targetSave = Join-Path $userDataDir "Saves\default"
+                            if (Test-Path $targetSave) { Remove-Item $targetSave -Recurse -Force -ErrorAction SilentlyContinue }
+                            $global:forceRestart = $true; $global:autoRepairTriggered = $true; $stable = $false; break
+                        }
                     }
                     "JavaBoot" {
-                        Write-Host "      -> [FIX] JRE Corruption! Purging and redownloading..." -ForegroundColor Yellow
-                        Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                        $global:forceApiJre = $true
-                        $jreDir = Join-Path $launcherRoot "release\package\jre\latest"
-                        if (Test-Path $jreDir) { Remove-Item $jreDir -Recurse -Force -ErrorAction SilentlyContinue }
-                        $global:forceRestart = $true; $global:autoRepairTriggered = $true; $stable = $false; break
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['JavaBoot']) { $global:fixAttempts['JavaBoot'] = 0 }
+                        $global:fixAttempts['JavaBoot']++
+                        
+                        if ($global:fixAttempts['JavaBoot'] -gt 2) {
+                            Write-Host "      -> [STOP] JRE fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [CONTACT] Please report this to the developer." -ForegroundColor Cyan
+                        } else {
+                            Write-Host "      -> [FIX] JRE Corruption! Purging and redownloading... (Attempt $($global:fixAttempts['JavaBoot'])/2)" -ForegroundColor Yellow
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                            $global:forceApiJre = $true
+                            $jreDir = Join-Path $launcherRoot "release\package\jre\latest"
+                            if (Test-Path $jreDir) { Remove-Item $jreDir -Recurse -Force -ErrorAction SilentlyContinue }
+                            $global:forceRestart = $true; $global:autoRepairTriggered = $true; $stable = $false; break
+                        }
                     }
                     "AppMainMenu" {
-                        $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
-                        if (-not (Test-Path $serverJarPath)) {
-                            Write-Host "      -> [FIX] Server missing! Downloading..." -ForegroundColor Yellow
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['AppMainMenu']) { $global:fixAttempts['AppMainMenu'] = 0 }
+                        $global:fixAttempts['AppMainMenu']++
+                        
+                        if ($global:fixAttempts['AppMainMenu'] -gt 2) {
+                            Write-Host "      -> [STOP] Server install fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [CONTACT] Please report this to the developer." -ForegroundColor Cyan
+                        } else {
+                            $serverJarPath = Join-Path $appDir "Server\HytaleServer.jar"
+                            if (-not (Test-Path $serverJarPath)) {
+                                Write-Host "      -> [FIX] Server missing! Downloading... (Attempt $($global:fixAttempts['AppMainMenu'])/2)" -ForegroundColor Yellow
+                                Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                                if (Patch-HytaleServer $serverJarPath) { Write-Host "      -> [SUCCESS] Server installed!" -ForegroundColor Green }
+                                Start-Sleep -Seconds 2
+                                $global:forceRestart = $true; $stable = $false; break
+                            }
+                        }
+                    }
+                    "GpuCrash" {
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['GpuCrash']) { $global:fixAttempts['GpuCrash'] = 0 }
+                        $global:fixAttempts['GpuCrash']++
+                        
+                        if ($global:fixAttempts['GpuCrash'] -gt 2) {
+                            Write-Host "      -> [STOP] GPU crash fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [TIP] Try updating your GPU drivers manually." -ForegroundColor Cyan
+                            Write-Host "      -> [CONTACT] Please report this to the developer." -ForegroundColor Cyan
+                        } else {
+                            Write-Host "      -> [FIX] GPU/Rendering Error Detected! (Attempt $($global:fixAttempts['GpuCrash'])/2)" -ForegroundColor Red
+                            
+                            $isOOM = $rootCauseErrors | Where-Object { $_ -match "out of video memory" }
+                            $gpus = @(Get-GpuInfo)
+                            $hasDedicated = @($gpus | Where-Object { $_.Type -eq "Dedicated" }).Count -gt 0
+                            
+                            if ($isOOM) {
+                                Write-Host "      -> [CAUSE] GPU ran out of video memory (VRAM)." -ForegroundColor Yellow
+                                Write-Host "      -> [TIP] Close other GPU-heavy apps (browsers, games, editors)." -ForegroundColor Cyan
+                                foreach ($g in $gpus) {
+                                    $vramStr = if ($g.VRAM -gt 0) { "$($g.VRAM)MB" } else { "N/A" }
+                                    Write-Host "      ->        $($g.Name) - VRAM: $vramStr" -ForegroundColor Gray
+                                }
+                            } elseif ($hasDedicated -and $global:gpuPreference -ne "dedicated") {
+                                Write-Host "      -> [CAUSE] Game may be running on integrated GPU instead of dedicated." -ForegroundColor Yellow
+                                Write-Host "      -> [ACTION] Switching to High Performance (Dedicated GPU)..." -ForegroundColor Cyan
+                                $global:gpuPreference = "dedicated"
+                                Set-GpuPreference $gameExe 2 | Out-Null
+                                Save-Config
+                                Write-Host "      -> [SUCCESS] GPU preference set to High Performance." -ForegroundColor Green
+                            } else {
+                                Write-Host "      -> [CAUSE] DirectX/GPU rendering crash." -ForegroundColor Yellow
+                                Write-Host "      -> [TIP] Try updating your GPU drivers or switching GPU mode in the menu." -ForegroundColor Cyan
+                                foreach ($g in $gpus) {
+                                    Write-Host "      ->        $($g.Name) ($($g.Vendor))" -ForegroundColor Gray
+                                }
+                            }
+                            
                             Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
-                            if (Patch-HytaleServer $serverJarPath) { Write-Host "      -> [SUCCESS] Server installed!" -ForegroundColor Green }
+                            Start-Sleep -Seconds 3
+                            $global:forceRestart = $true; $stable = $false; break
+                        }
+                    }
+                    "ServerCodecError" {
+                        if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
+                        if (-not $global:fixAttempts['ServerCodecError']) { $global:fixAttempts['ServerCodecError'] = 0 }
+                        $global:fixAttempts['ServerCodecError']++
+                        
+                        if ($global:fixAttempts['ServerCodecError'] -gt 2) {
+                            Write-Host "      -> [STOP] Server Codec fix attempted 2 times without success." -ForegroundColor Red
+                            Write-Host "      -> [INFO] This appears to be a persistent issue, not a corrupted world save." -ForegroundColor Yellow
+                            Write-Host "      -> [CONTACT] Please report this to the developer with the log file at:" -ForegroundColor Cyan
+                            Write-Host "         $logPath" -ForegroundColor White
+                            Write-Host "      -> [TIP] The DocumentContainingCodec error may be a server-side bug, not a local issue." -ForegroundColor Gray
+                        } else {
+                            Write-Host "      -> [FIX] Server Codec Error - QUIC Connection Aborted (Attempt $($global:fixAttempts['ServerCodecError'])/2)" -ForegroundColor Red
+                            Write-Host "      -> [CAUSE] The server disconnected during world loading." -ForegroundColor Yellow
+                            
+                            Stop-Process -Id $currentProc.Id -Force -ErrorAction SilentlyContinue
+                            
+                            $corruptWorld = $null
+                            if ($logContent -match 'Connecting to singleplayer world "([^"\\]+)') {
+                                $corruptWorld = $Matches[1].TrimEnd('\')
+                            }
+                            
+                            $userDataDir = Join-Path $appDir "Client\UserData"
+                            
+                            if ($corruptWorld) {
+                                if ($corruptWorld -match '_corrupt_\d{8}_\d{6}$') {
+                                    Write-Host "      -> [SKIP] World '$corruptWorld' is already a backup from a previous fix. Not re-fixing." -ForegroundColor Yellow
+                                    Write-Host "      -> [TIP] Try creating a new world instead." -ForegroundColor Cyan
+                                } else {
+                                    Write-Host "      -> [DETECTED] Affected world: $corruptWorld" -ForegroundColor Cyan
+                                    $worldSavePath = Join-Path $userDataDir "Saves\$corruptWorld"
+                                    
+                                    if (Test-Path $worldSavePath) {
+                                        $backupName = "${corruptWorld}_corrupt_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+                                        $backupDest = Join-Path $userDataDir "Saves\$backupName"
+                                        try {
+                                            Copy-Item -Path $worldSavePath -Destination $backupDest -Recurse -Force -ErrorAction Stop
+                                            Write-Host "      -> [BACKUP] World backed up to: $backupName" -ForegroundColor Green
+                                        } catch {
+                                            Write-Host "      -> [WARN] Backup failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                                        }
+                                        
+                                        try {
+                                            Remove-Item -Path $worldSavePath -Recurse -Force -ErrorAction Stop
+                                            Write-Host "      -> [CLEARED] World removed. A fresh world will be created on restart." -ForegroundColor Green
+                                        } catch {
+                                            Write-Host "      -> [ERROR] Could not remove world: $($_.Exception.Message)" -ForegroundColor Red
+                                        }
+                                    }
+                                }
+                            } else {
+                                Write-Host "      -> [INFO] Could not identify specific world from logs." -ForegroundColor Yellow
+                            }
+                            
                             Start-Sleep -Seconds 2
                             $global:forceRestart = $true; $stable = $false; break
                         }
@@ -4909,9 +5583,9 @@ if (Test-Path $gameExe) {
                     }
                 }
             }
-            if ($global:forceRestart) { break }
+            if ($global:forceRestart) { pause; break }
         }
-        if ($global:forceRestart) { break }
+        if ($global:forceRestart) { pause; break }
 
         # === SUCCESS DETECTION: Player Joined Server ===
         # Check if the player has successfully joined the server (server is listening & player connected)
@@ -4924,6 +5598,8 @@ if (Test-Path $gameExe) {
                 
                 if ($serverReady) {
                     Write-Host "`n[SUCCESS] Player joined the server! Closing launcher." -ForegroundColor Green
+                    # Clear ALL fix attempt counters on success - game is working fine
+                    $global:fixAttempts = @{}
                     $stable = $true
                     break
                 }
@@ -5008,7 +5684,7 @@ if (Test-Path $gameExe) {
                             }
                         }
                     }
-                    if ($global:forceRestart) { break }
+                    if ($global:forceRestart) { pause; break }
                 }
                 Write-Host "`r      [SUCCESS] Game Window Detected! Listening for errors..." -ForegroundColor Green
                 Write-Host "`r      [SUCCESS] Hytale is running successfully!" -ForegroundColor Green
