@@ -2224,7 +2224,48 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
 
         try {
             $process = Start-Process -FilePath $wgetExePath -ArgumentList $wgetArgs -Wait -PassThru -NoNewWindow
-            if ($process.ExitCode -eq 0) { return $true }
+            if ($process.ExitCode -eq 0) { 
+                 # --- VALIDATION (WGET) ---
+                 if (Test-Path $destination) {
+                    try {
+                        $firstBytes = Get-Content $destination -TotalCount 5 -Encoding Byte -ErrorAction SilentlyContinue
+                        $contentStr = [System.Text.Encoding]::UTF8.GetString($firstBytes)
+                        if ($contentStr -match "<!DOC" -or $contentStr -match "<html" -or $contentStr -match "<body") {
+                            Write-Host "      [WARN] Link returned a webpage instead of a file." -ForegroundColor Yellow
+                            Remove-Item $destination -Force
+                            
+                            Write-Host "`n      [ACTION] Opening browser for manual download..." -ForegroundColor Cyan
+                            Start-Process "$url"
+                            
+                            Write-Host "      ----------------------------------------------------------------" -ForegroundColor White
+                            Write-Host "      PLEASE DOWNLOAD THE FILE MANUALLY!" -ForegroundColor Yellow
+                            Write-Host "      1. Save the file to: " -NoNewline; Write-Host "$destination" -ForegroundColor Green
+                            Write-Host "      2. Ensure the filename matches exactly." -ForegroundColor Gray
+                            Write-Host "      ----------------------------------------------------------------" -ForegroundColor White
+                            
+                            Write-Host "      Press any key when the file is ready..."
+                            [void][System.Console]::ReadKey($true)
+                            
+                            if (Test-Path $destination) {
+                                $nBytes = Get-Content $destination -TotalCount 5 -Encoding Byte -ErrorAction SilentlyContinue
+                                $nStr = [System.Text.Encoding]::UTF8.GetString($nBytes)
+                                if ($nStr -notmatch "<!DOC" -and $nStr -notmatch "<html") {
+                                    Write-Host "      [SUCCESS] Manual download verified." -ForegroundColor Green
+                                    return $true
+                                } else {
+                                    Write-Host "      [ERROR] File still appears to be a webpage. Aborting." -ForegroundColor Red
+                                    return $false
+                                }
+                            } else {
+                                 Write-Host "      [ERROR] File not found. Aborting." -ForegroundColor Red
+                                 return $false
+                            }
+                        }
+                        return $true
+                    } catch { return $true }
+                 }
+                 return $true
+            }
         } catch {
             Write-Host "      [ERROR] Turbo process failed to start." -ForegroundColor DarkGray
         }
@@ -2271,6 +2312,46 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
             $buffer = New-Object byte[] 1MB
             while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) { $fileStream.Write($buffer, 0, $read) }
             $fileStream.Close(); $stream.Close()
+            
+            # --- VALIDATION (HTTP) ---
+             if (Test-Path $destination) {
+                try {
+                    $firstBytes = Get-Content $destination -TotalCount 5 -Encoding Byte -ErrorAction SilentlyContinue
+                    $contentStr = [System.Text.Encoding]::UTF8.GetString($firstBytes)
+                    if ($contentStr -match "<!DOC" -or $contentStr -match "<html" -or $contentStr -match "<body") {
+                        Write-Host "      [WARN] Link returned a webpage instead of a file." -ForegroundColor Yellow
+                        Remove-Item $destination -Force
+                        
+                        Write-Host "`n      [ACTION] Opening browser for manual download..." -ForegroundColor Cyan
+                        Start-Process "$url"
+                        
+                        Write-Host "      ----------------------------------------------------------------" -ForegroundColor White
+                        Write-Host "      PLEASE DOWNLOAD THE FILE MANUALLY!" -ForegroundColor Yellow
+                        Write-Host "      1. Save the file to: " -NoNewline; Write-Host "$destination" -ForegroundColor Green
+                        Write-Host "      2. Ensure the filename matches exactly." -ForegroundColor Gray
+                        Write-Host "      ----------------------------------------------------------------" -ForegroundColor White
+                        
+                        Write-Host "      Press any key when the file is ready..."
+                        [void][System.Console]::ReadKey($true)
+                        
+                        if (Test-Path $destination) {
+                            $nBytes = Get-Content $destination -TotalCount 5 -Encoding Byte -ErrorAction SilentlyContinue
+                            $nStr = [System.Text.Encoding]::UTF8.GetString($nBytes)
+                            if ($nStr -notmatch "<!DOC" -and $nStr -notmatch "<html") {
+                                Write-Host "      [SUCCESS] Manual download verified." -ForegroundColor Green
+                                return $true
+                            } else {
+                                Write-Host "      [ERROR] File still appears to be a webpage. Aborting." -ForegroundColor Red
+                                return $false
+                            }
+                        } else {
+                             Write-Host "      [ERROR] File not found. Aborting." -ForegroundColor Red
+                             return $false
+                        }
+                    }
+                    return $true
+                } catch { return $true }
+            }
             return $true
         } else {
              Write-Host "      [HTTP ERROR] Status: $($response.StatusCode)" -ForegroundColor Red
