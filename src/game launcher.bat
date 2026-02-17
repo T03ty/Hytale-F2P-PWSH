@@ -3,6 +3,7 @@
 title HYTALE F2P - AUTO-PILOT LAUNCHER
 chcp 65001 >nul
 
+
 :: =========================================================
 :: 1. ROBUST ARGUMENT DETECTION (Batch Side)
 :: =========================================================
@@ -399,7 +400,11 @@ function Show-InteractiveMenu {
         # 2. Strict Cursor Positioning (Overwrite Mode)
         # We move to the start, but we DO NOT clear the screen ($ESC[J). 
         # Clearing causing the flicker. Overwriting is instant.
-        [Console]::SetCursorPosition(0, $startRow)
+        try {
+            if ($startRow -ge 0 -and $startRow -lt [Console]::BufferHeight) {
+                 [Console]::SetCursorPosition(0, $startRow)
+            }
+        } catch { }
         
         Write-Host ""
         Write-Host "  $Title" -ForegroundColor Cyan
@@ -652,14 +657,28 @@ function Get-LatestLauncherInfo {
     }
     return $null
 }
-
 function Ensure-LauncherExe {
+    param (
+        [switch]$Force
+    )
+
     $latest = Get-LatestLauncherInfo
     if (-not $latest) { return }
 
     $installedFile = $global:LAUNCHER_PATH
     $hashCacheFile = Join-Path $localAppData "launcher_install_hash.txt"
+    $skipUpdateFile = Join-Path $localAppData "skip_launcher_update.txt"
     $needsUpdate = $false
+    
+    # 0. CHECK SKIPPED VERSION
+    # We only check this if $Force is NOT present
+    if (-not $Force -and (Test-Path $skipUpdateFile)) {
+        $skippedVer = Get-Content $skipUpdateFile -Raw
+        if ($skippedVer.Trim() -eq $latest.Version.Trim()) {
+            Write-Host "      [INFO] Update available (v$($latest.Version)), but you chose to skip it." -ForegroundColor Gray
+            return
+        }
+    }
 
     # 1. PRIMARY CHECK: SHA256 HASH (The "Bulletproof" Method)
     # If the installer hash matches what we last installed, we are 100% up to date.
@@ -702,25 +721,37 @@ function Ensure-LauncherExe {
     # --- EXECUTE UPDATE ---
     if ($needsUpdate) {
         $installerPath = Join-Path $env:TEMP "HytaleF2P_Setup_$($latest.Version).exe"
-        Write-Host "`n[DOWNLOAD] Fetching Installer ($($latest.Name))..." -ForegroundColor Cyan
         
-        try {
-            # Download using your progress helper
-            if (Get-Command "Download-WithProgress" -ErrorAction SilentlyContinue) {
-                Download-WithProgress $latest.Url $installerPath $false $true
-            } else {
-                Invoke-WebRequest -Uri $latest.Url -OutFile $installerPath -UseBasicParsing
-            }
-
-            if (Test-Path $installerPath) {
-                # Optional: Verify the hash of the downloaded file before running it
-                $downloadedFileHash = (Get-FileHash $installerPath -Algorithm SHA256).Hash
-                if ($latest.Hash -and ($downloadedFileHash -ne $latest.Hash)) {
-                    Write-Host "      [ERROR] Downloaded file hash mismatch! Security abort." -ForegroundColor Red
-                    return
+        # SKIP DOWNLOAD IF EXISTS
+        if (-not (Test-Path $installerPath)) {
+            Write-Host "`n[DOWNLOAD] Fetching Installer ($($latest.Name))..." -ForegroundColor Cyan
+            try {
+                # Download using your progress helper
+                if (Get-Command "Download-WithProgress" -ErrorAction SilentlyContinue) {
+                    if (-not (Download-WithProgress $latest.Url $installerPath $false $true)) { return }
+                } else {
+                    Invoke-WebRequest -Uri $latest.Url -OutFile $installerPath -UseBasicParsing
                 }
+            } catch {
+                Write-Host "      [ERROR] Failed to download: $($_.Exception.Message)" -ForegroundColor Red
+                return
+            }
+        } else {
+            Write-Host "      [CACHE] Using existing installer: $installerPath" -ForegroundColor Green
+        }
 
-                Write-Host "      [INSTALL] Running Installer..." -ForegroundColor Cyan
+        if (Test-Path $installerPath) {
+            # Optional: Verify the hash of the downloaded file before running it
+            # $downloadedFileHash = (Get-FileHash $installerPath -Algorithm SHA256).Hash
+            # if ($latest.Hash -and ($downloadedFileHash -ne $latest.Hash)) {
+            #    Write-Host "      [ERROR] Downloaded file hash mismatch! Security abort." -ForegroundColor Red
+            #    return
+            # }
+
+            Write-Host "      [INSTALL] Running Installer..." -ForegroundColor Cyan
+            Write-Host "      [NOTE] Please complete the installation manually." -ForegroundColor Gray
+            
+            try {
                 $proc = Start-Process -FilePath $installerPath -Wait -PassThru
                 
                 if ($proc.ExitCode -eq 0) {
@@ -728,22 +759,32 @@ function Ensure-LauncherExe {
                     
                     # --- CRITICAL: RECORD THE SUCCESSFUL INSTALLER HASH ---
                     # This stops the update loop even if the .exe version info is still wrong.
-                    if ($latest.Hash) {
-                        $latest.Hash | Out-File $hashCacheFile -Force
-                    } else {
-                        # If GitHub didn't provide a digest, use the hash of the file we just ran
-                        $downloadedFileHash | Out-File $hashCacheFile -Force
+                    $finalHash = if ($latest.Hash) { $latest.Hash } else { (Get-FileHash $installerPath -Algorithm SHA256).Hash }
+                    $finalHash | Out-File $hashCacheFile -Force
+
+                    # Remove the skip file if it exists, since we successfully updated
+                    if (Test-Path $skipUpdateFile) { Remove-Item $skipUpdateFile -Force -ErrorAction SilentlyContinue }
+                    
+                    # Remove installer on success
+                    Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+                    
+                    # Refresh launcher path
+                    if (Get-Command "Get-LauncherPath" -ErrorAction SilentlyContinue) {
+                        $global:LAUNCHER_PATH = Get-LauncherPath
                     }
+                } else {
+                     # USER CANCELLED or FAILED
+                     Write-Host "      [WARN] Installer exited with code $($proc.ExitCode). Assuming cancelled." -ForegroundColor Yellow
+                     Write-Host "      [INFO] Remembering your choice to skip this version." -ForegroundColor Gray
+                     
+                     # Write skipped version to file so we don't ask again
+                     $latest.Version | Out-File $skipUpdateFile -Force
+                     
+                     # DO NOT DELETE INSTALLER - Keeps it in cache if they change their mind later
                 }
-                
-                Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-                # Refresh launcher path
-                if (Get-Command "Get-LauncherPath" -ErrorAction SilentlyContinue) {
-                    $global:LAUNCHER_PATH = Get-LauncherPath
-                }
+            } catch {
+                 Write-Host "      [ERROR] Failed to run installer: $($_.Exception.Message)" -ForegroundColor Red
             }
-        } catch {
-            Write-Host "      [ERROR] Failed to update: $($_.Exception.Message)" -ForegroundColor Red
         }
     }
 }
@@ -2120,18 +2161,21 @@ function Test-FileNeedsDownload($filePath, $fileName) {
     }
 }
 
-function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOverwrite=$false) {
+function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOverwrite=$false, $checkOnly=$false) {
     Set-QuickEditMode $false
     
+
     # Connectivity gate - fail fast instead of hanging on timeouts
     if (-not (Test-InternetConnection)) {
-        Write-Host "      [OFFLINE] No internet connection detected." -ForegroundColor Red
-        Write-Host "      [TIP] Check your network and try again." -ForegroundColor Yellow
+        if (-not $checkOnly) {
+            Write-Host "      [OFFLINE] No internet connection detected." -ForegroundColor Red
+            Write-Host "      [TIP] Check your network and try again." -ForegroundColor Yellow
+        }
         Set-QuickEditMode $true
         return $false
     }
     
-    if ($forceOverwrite -and (Test-Path $destination)) {
+    if (-not $forceOverwrite -and $destination -and (Test-Path $destination) -and -not $checkOnly) {
         Remove-Item $destination -Force -ErrorAction SilentlyContinue
     }
 
@@ -2152,6 +2196,8 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
 
     # --- PHASE 1.5: AUTO-PROVISION WGET (Fixed Download Logic) ---
     if (-not $wgetExePath) {
+        if ($checkOnly) { return $false } # Skip provisioning if just checking
+        
         Write-Host "`n[SETUP] Compatible wget not found. Downloading v1.21.4..." -ForegroundColor Yellow
         $zipUrl = "https://eternallybored.org/misc/wget/releases/wget-1.21.4-win64.zip"
         $zipPath = "$env:TEMP\wget_temp.zip"
@@ -2188,30 +2234,41 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
     $isApiTarget = $url -match "file\.hytaleapi\.online"
     $chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     $userAgent = if ($isApiTarget -and $global:HEADERS.ContainsKey('User-Agent')) { $global:HEADERS['User-Agent'] } else { $chromeUA }
+    
+
 
     # --- PHASE 2: TURBO ATTEMPT (wget) ---
-    if ($wgetExePath) {
-        if (-not $global:hasShownTurboMsg) { 
+    # Disable wget for CHECK-ONLY mode to ensure strict Content-Length validation via HttpClient
+    if ($wgetExePath -and -not $checkOnly) {
+        if (-not $global:hasShownTurboMsg -and -not $checkOnly) { 
             Write-Host "      [TURBO] High-speed transfer enabled (wget)." -ForegroundColor Green
             $global:hasShownTurboMsg = $true
         }
         
-        $dir = Split-Path $destination
-        if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory $dir -Force | Out-Null }
+        $dir = $null
+        if ($destination) {
+            $dir = Split-Path $destination
+            if ($dir -and -not (Test-Path $dir) -and -not $checkOnly) { New-Item -ItemType Directory $dir -Force | Out-Null }
+        }
 
         # Arguments must be exactly formatted for the binary
         $wgetArgs = @(
             "--quiet",
-            "--show-progress",
-            "--progress=bar:force:noscroll",
             "--no-check-certificate",
             "--tries=3",
             "--timeout=20",
-            "--user-agent=`"$userAgent`"",
-            "--output-document=`"$destination`""
+            "--user-agent=`"$userAgent`""
         )
-
-        if (-not $forceOverwrite) { $wgetArgs += "--continue" }
+        
+        if ($checkOnly) {
+           # [DISABLED] strict check logic moved to HttpClient fallback
+           $wgetArgs += "--spider"
+        } else {
+            $wgetArgs += "--show-progress"
+            $wgetArgs += "--progress=bar:force:noscroll"
+            $wgetArgs += "--output-document=`"$destination`""
+             if (-not $forceOverwrite) { $wgetArgs += "--continue" }
+        }
 
         if ($useHeaders -and $global:HEADERS) {
             foreach ($k in $global:HEADERS.Keys) {
@@ -2225,55 +2282,67 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
         try {
             $process = Start-Process -FilePath $wgetExePath -ArgumentList $wgetArgs -Wait -PassThru -NoNewWindow
             if ($process.ExitCode -eq 0) { 
+                 if ($checkOnly) { return $true }
+                 
                  # --- VALIDATION (WGET) ---
-                 if (Test-Path $destination) {
-                    try {
-                        $firstBytes = Get-Content $destination -TotalCount 5 -Encoding Byte -ErrorAction SilentlyContinue
-                        $contentStr = [System.Text.Encoding]::UTF8.GetString($firstBytes)
-                        if ($contentStr -match "<!DOC" -or $contentStr -match "<html" -or $contentStr -match "<body") {
-                            Write-Host "      [WARN] Link returned a webpage instead of a file." -ForegroundColor Yellow
-                            Remove-Item $destination -Force
-                            
-                            Write-Host "`n      [ACTION] Opening browser for manual download..." -ForegroundColor Cyan
-                            Start-Process "$url"
-                            
-                            Write-Host "      ----------------------------------------------------------------" -ForegroundColor White
-                            Write-Host "      PLEASE DOWNLOAD THE FILE MANUALLY!" -ForegroundColor Yellow
-                            Write-Host "      1. Save the file to: " -NoNewline; Write-Host "$destination" -ForegroundColor Green
-                            Write-Host "      2. Ensure the filename matches exactly." -ForegroundColor Gray
-                            Write-Host "      ----------------------------------------------------------------" -ForegroundColor White
-                            
-                            Write-Host "      Press any key when the file is ready..."
-                            [void][System.Console]::ReadKey($true)
-                            
-                            if (Test-Path $destination) {
-                                $nBytes = Get-Content $destination -TotalCount 5 -Encoding Byte -ErrorAction SilentlyContinue
-                                $nStr = [System.Text.Encoding]::UTF8.GetString($nBytes)
-                                if ($nStr -notmatch "<!DOC" -and $nStr -notmatch "<html") {
-                                    Write-Host "      [SUCCESS] Manual download verified." -ForegroundColor Green
-                                    return $true
+                 if ($destination -and (Test-Path $destination)) {
+                    # 1. Size Check
+                    $fLen = (Get-Item $destination).Length
+                    if ($fLen -lt 100) {
+                        Write-Host "      [ERROR] Downloaded file is too small ($fLen bytes). Likely invalid." -ForegroundColor Red
+                        Remove-Item $destination -Force
+                        # Fallback to standard download
+                    } else {
+                        # 2. Content Check
+                        try {
+                            $firstBytes = Get-Content $destination -TotalCount 5 -Encoding Byte -ErrorAction SilentlyContinue
+                            $contentStr = [System.Text.Encoding]::UTF8.GetString($firstBytes)
+                            if ($contentStr -match "<!DOC" -or $contentStr -match "<html" -or $contentStr -match "<body") {
+                                Write-Host "      [WARN] Link returned a webpage instead of a file." -ForegroundColor Yellow
+                                Remove-Item $destination -Force
+                                
+                                Write-Host "`n      [ACTION] Opening browser for manual download..." -ForegroundColor Cyan
+                                Start-Process "$url"
+                                
+                                Write-Host "      ----------------------------------------------------------------" -ForegroundColor White
+                                Write-Host "      PLEASE DOWNLOAD THE FILE MANUALLY!" -ForegroundColor Yellow
+                                Write-Host "      1. Save the file to: " -NoNewline; Write-Host "$destination" -ForegroundColor Green
+                                Write-Host "      2. Ensure the filename matches exactly." -ForegroundColor Gray
+                                Write-Host "      ----------------------------------------------------------------" -ForegroundColor White
+                                
+                                Write-Host "      Press any key when the file is ready..."
+                                [void][System.Console]::ReadKey($true)
+                                
+                                if (Test-Path $destination) {
+                                    $nBytes = Get-Content $destination -TotalCount 5 -Encoding Byte -ErrorAction SilentlyContinue
+                                    $nStr = [System.Text.Encoding]::UTF8.GetString($nBytes)
+                                    if ($nStr -notmatch "<!DOC" -and $nStr -notmatch "<html") {
+                                        Write-Host "      [SUCCESS] Manual download verified." -ForegroundColor Green
+                                        return $true
+                                    } else {
+                                        Write-Host "      [ERROR] File still appears to be a webpage. Aborting." -ForegroundColor Red
+                                        return $false
+                                    }
                                 } else {
-                                    Write-Host "      [ERROR] File still appears to be a webpage. Aborting." -ForegroundColor Red
-                                    return $false
+                                     Write-Host "      [ERROR] File not found. Aborting." -ForegroundColor Red
+                                     return $false
                                 }
-                            } else {
-                                 Write-Host "      [ERROR] File not found. Aborting." -ForegroundColor Red
-                                 return $false
                             }
-                        }
-                        return $true
-                    } catch { return $true }
+                            return $true
+                        } catch { return $true }
+                    }
                  }
-                 return $true
+            } else {
+                 # [DEBUG] Wget failure code
             }
         } catch {
-            Write-Host "      [ERROR] Turbo process failed to start." -ForegroundColor DarkGray
+            if (-not $checkOnly) { Write-Host "      [ERROR] Turbo process failed to start." -ForegroundColor DarkGray }
         }
     }
 
 
     # --- PHASE 3: STANDARD FALLBACK ---
-    Write-Host "      [FALLBACK] Using standard download stream..." -ForegroundColor Gray
+    if (-not $checkOnly) { Write-Host "      [FALLBACK] Using standard download stream..." -ForegroundColor Gray }
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $client = New-Object System.Net.Http.HttpClient
     
@@ -2293,14 +2362,34 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
     }
 
     $existingOffset = 0
-    if (-not $forceOverwrite -and (Test-Path $destination)) { $existingOffset = (Get-Item $destination).Length }
+    if (-not $forceOverwrite -and $destination -and (Test-Path $destination) -and -not $checkOnly) { $existingOffset = (Get-Item $destination).Length }
     if ($existingOffset -gt 0) { 
         $client.DefaultRequestHeaders.Range = New-Object System.Net.Http.Headers.RangeHeaderValue($existingOffset, $null) 
     }
 
     try {
-        $response = $client.GetAsync($url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        $reqMsg = New-Object System.Net.Http.HttpRequestMessage
+        $reqMsg.RequestUri = $url
+        $reqMsg.Method = if ($checkOnly) { [System.Net.Http.HttpMethod]::Head } else { [System.Net.Http.HttpMethod]::Get }
+        
+        $response = $client.SendAsync($reqMsg, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        
+        if ($checkOnly) {
+            $isOk = $response.IsSuccessStatusCode
+            # STRICT VALIDATION: Reject 0-byte or tiny files (broken mirrors often send 200 OK + 0 bytes)
+            if ($isOk) {
+                 if ($response.Content.Headers.ContentLength -ne $null -and $response.Content.Headers.ContentLength -lt 100) {
+                      # [DEBUG] Content too small (< 100 bytes)
+                      $isOk = $false
+                 }
+            }
+            $client.Dispose()
+            return $isOk
+        }
+
         if ($response.StatusCode -eq 416) { 
+            # [DEBUG] Range Error
+            Write-Host "      [DEBUG] HTTP 416 Range Not Satisfiable. Restarting download." -ForegroundColor DarkGray
             $client.Dispose()
             return Download-WithProgress $url $destination $useHeaders $true 
         }
@@ -2315,6 +2404,13 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
             
             # --- VALIDATION (HTTP) ---
              if (Test-Path $destination) {
+                $fLen = (Get-Item $destination).Length
+                if ($fLen -lt 100) {
+                     Write-Host "      [ERROR] File too small ($fLen bytes)." -ForegroundColor Red
+                     Remove-Item $destination -Force
+                     return $false
+                }
+
                 try {
                     $firstBytes = Get-Content $destination -TotalCount 5 -Encoding Byte -ErrorAction SilentlyContinue
                     $contentStr = [System.Text.Encoding]::UTF8.GetString($firstBytes)
@@ -2357,7 +2453,7 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
              Write-Host "      [HTTP ERROR] Status: $($response.StatusCode)" -ForegroundColor Red
         }
     } catch { 
-        Write-Host "      [ERROR] Download failed: $($_.Exception.Message)" -ForegroundColor Red 
+        if (-not $checkOnly) { Write-Host "      [ERROR] Download failed: $($_.Exception.Message)" -ForegroundColor Red }
     } finally { 
         if ($client) { $client.Dispose() }
     }
@@ -2365,7 +2461,6 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
     
     return $false
 }
-
 function Copy-WithProgress($source, $destination) {
     Set-QuickEditMode $false
     if (-not (Test-Path $source)) { return $false }
@@ -2459,7 +2554,7 @@ function Install-HyFixes {
 
 function Get-LatestPatchVersion {
     param([string]$branch = "release")  # Support "release" or "pre-release"
-
+    if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "release" }
     $cacheFile = Join-Path $cacheDir "highest_version_$branch.txt"
     $versionFile = Join-Path $localAppData "current_version.txt"
     $api_url = "https://files.hytalef2p.com/api/patch_manifest"
@@ -2467,7 +2562,8 @@ function Get-LatestPatchVersion {
     
     # MIRROR API
     $mirror_api = "https://thecute.cloud/ShipOfYarn/api.php" 
-    $mirror_api_legacy = "$API_HOST/api/yarn/file" # Secondary mirror
+    # CRITICAL FIX: The legacy mirror (file.hytaleapi.online) serves the manifest at /api/yarn, NOT /api/yarn/file
+    $mirror_api_legacy = "$API_HOST/api/yarn" # Secondary mirror
     
     # 0. Detect Current Local Version
     $localVer = if (Test-Path $versionFile) { [int](Get-Content $versionFile) } else { 0 }
@@ -2481,52 +2577,35 @@ function Get-LatestPatchVersion {
     $officialServerForbidden = $false
 
     # ==============================================================================
-    # 1. CHECK OFFICIAL API
+    # 1. CHECK COBYLOBBYHT API (Primary)
     # ==============================================================================
     try {
-        Write-Host "      [API] Fetching $branch client version..." -ForegroundColor Gray
-        $verRes = Invoke-RestMethod -Uri $version_api -Headers $global:HEADERS -TimeoutSec 5
+        Write-Host "      [API] Querying CobyLobbyHT ($branch)..." -ForegroundColor Gray
+        $cobyApi = "https://cobylobbyht.store/launcher/patches/$branch/latest?os_name=windows&arch=amd64"
+        $verRes = Invoke-RestMethod -Uri $cobyApi -Headers $global:HEADERS -TimeoutSec 5
         
-        if ($verRes -and $verRes.client_version) {
-            $pwrFile = $verRes.client_version
-            if ($pwrFile -match "^(\d+)\.pwr$") {
-                $latestVerCandidate = [int]$Matches[1]
-                $officialUrl = "$OFFICIAL_BASE/windows/amd64/$branch/0/$latestVerCandidate.pwr"
-                
-                # Check accessibility
-                try {
-                    $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Head, $officialUrl)
-                    $c = [System.Net.Http.HttpClient]::new(); $c.Timeout = [TimeSpan]::FromSeconds(3)
-                    $r = $c.SendAsync($req).GetAwaiter().GetResult()
-                    
-                    if ($r.StatusCode -eq [System.Net.HttpStatusCode]::Forbidden) {
-                         # CRITICAL FIX: Mark forbidden and ensure URL is NULL so we fallback to mirror
-                         $officialServerForbidden = $true
-                         $global:RemotePatchUrl = $null 
-                         Write-Host "      [WARN] Official Server 403 Forbidden. Switching to Mirror..." -ForegroundColor Yellow
-                    }
-                    elseif ($r.IsSuccessStatusCode) {
-                        $global:RemotePatchUrl = $officialUrl
-                        $latestVerCandidate | Out-File $cacheFile
-                        Write-Host "      [SUCCESS] Target: v$latestVerCandidate ($branch branch)" -ForegroundColor Green
-                        
-                        $r.Dispose(); $c.Dispose()
-                        return $latestVerCandidate
-                    } 
-                    else {
-                        Write-Host "      [WARN] Official Server Error ($($r.StatusCode)). Switching to Mirror..." -ForegroundColor Yellow
-                    }
-                    $r.Dispose(); $c.Dispose()
-                } catch {
-                    Write-Host "      [WARN] Official Server unreachable. Switching to Mirror..." -ForegroundColor Yellow
-                }
+        $v = $null
+        if ($verRes -is [int] -or $verRes -is [string]) { $v = [int]$verRes }
+        elseif ($verRes.version) { $v = [int]$verRes.version }
+        elseif ($verRes.latest) { $v = [int]$verRes.latest }
+        
+        if ($v -gt 0) {
+            $latestVerCandidate = $v
+            $newUrl = "https://cobylobbyht.store/launcher/patches/windows/amd64/$branch/0/$latestVerCandidate.pwr"
+            
+            # Use Download-WithProgress in CHECK-ONLY mode
+            # Download-WithProgress($url, $destination, $useHeaders, $forceOverwrite, $checkOnly)
+            if (Download-WithProgress $newUrl $null $true $false $true) {
+                $global:RemotePatchUrl = $newUrl
+                $latestVerCandidate | Out-File $cacheFile
+                Write-Host "      [SUCCESS] Target: v$latestVerCandidate ($branch branch) via CobyLobbyHT" -ForegroundColor Green
+                return $latestVerCandidate
+            } else {
+                Write-Host "      [WARN] CobyLobbyHT URL unreachable. Switching to Mirror..." -ForegroundColor Yellow
             }
         }
-        else {
-            Write-Host "      [WARN] Version API returned empty data. URL/Endpoint may be unavailable." -ForegroundColor Yellow
-        }
     } catch {
-        Write-Host "      [WARN] Version API unavailable for $branch." -ForegroundColor Yellow
+        Write-Host "      [WARN] CobyLobbyHT API unavailable. Switching to Mirror..." -ForegroundColor Yellow
     }
 
 
@@ -2542,32 +2621,45 @@ function Get-LatestPatchVersion {
                 $node = $mirrorJson.hytale | Select-Object -ExpandProperty $branch -ErrorAction SilentlyContinue | Select-Object -ExpandProperty windows -ErrorAction SilentlyContinue 
                 
                 if ($node) {
+                    # Flatten candidates (patch, base, and node itself)
+                    $candidates = @($node)
+                    if ($node.patch) { $candidates += $node.patch }
+                    if ($node.base)  { $candidates += $node.base }
+
                     $maxVer = 0
                     $bestUrl = $null
                     $isDelta = $false
 
-                    # Iterate Properties to find Best Upgrade Path (Full and Delta)
-                    foreach ($prop in $node.PSObject.Properties) {
-                        $name = $prop.Name
-                        $val = $prop.Value
-                        
-                        # Type A: Full Build (e.g., v8-windows-amd64.pwr)
-                        if ($name -match "^v(\d+)-windows-amd64\.pwr$") {
-                            $v = [int]$Matches[1]
-                            # Only consider if it's an upgrade
-                            if ($v -gt $localVer -and $v -gt $maxVer) {
-                                $maxVer = $v; $bestUrl = $val; $isDelta = $false
-                            }
-                        }
-                        # Type B: Delta Patch (e.g., v19~20-windows-amd64.pwr)
-                        elseif ($name -match "^v(\d+)~(\d+)-windows-amd64\.pwr$") {
-                            $cntFrom = [int]$Matches[1]
-                            $cntTo = [int]$Matches[2]
-                            
-                            # Valid ONLY if it starts from our current version
-                            if ($cntFrom -eq $localVer) {
-                                if ($cntTo -gt $maxVer) {
-                                    $maxVer = $cntTo; $bestUrl = $val; $isDelta = $true
+                    # Iterate all candidate nodes to find Best Upgrade Path (Full and Delta)
+                    foreach ($c in $candidates) {
+                        # Ensure we operate on an object (PSCustomObject)
+                        if ($c -is [System.Collections.IDictionary] -or $c -is [PSCustomObject]) {
+                            foreach ($prop in $c.PSObject.Properties) {
+                                $name = $prop.Name
+                                $val = $prop.Value
+                                
+                                # Skip known sub-object keys if we are iterating the parent
+                                if ($name -eq 'patch' -or $name -eq 'base') { continue }
+
+                                # Type A: Full Build (e.g., v8-windows-amd64.pwr)
+                                if ($name -match "^v(\d+)-windows-amd64\.pwr$") {
+                                    $v = [int]$Matches[1]
+                                    # Only consider if it's an upgrade
+                                    if ($v -gt $localVer -and $v -gt $maxVer) {
+                                        $maxVer = $v; $bestUrl = $val; $isDelta = $false
+                                    }
+                                }
+                                # Type B: Delta Patch (e.g., v19~20-windows-amd64.pwr)
+                                elseif ($name -match "^v(\d+)~(\d+)-windows-amd64\.pwr$") {
+                                    $cntFrom = [int]$Matches[1]
+                                    $cntTo = [int]$Matches[2]
+                                    
+                                    # Valid ONLY if it starts from our current version
+                                    if ($cntFrom -eq $localVer) {
+                                        if ($cntTo -gt $maxVer) {
+                                            $maxVer = $cntTo; $bestUrl = $val; $isDelta = $true
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2587,7 +2679,7 @@ function Get-LatestPatchVersion {
         }
     }
     # ==============================================================================
-    # 2. CHECK LEGACY MIRROR (Backup)
+    # 2. CHECK LEGACY MIRROR (Backup - Now supports Nested Structure)
     # Only runs if Official URL failed or was Forbidden
     # ==============================================================================
     if (-not $global:RemotePatchUrl) {
@@ -2597,44 +2689,108 @@ function Get-LatestPatchVersion {
             # Use Global Headers for Auth
             $mirrorJson = Invoke-RestMethod -Uri $mirror_api_legacy -Headers $global:HEADERS -TimeoutSec 8
             
+            # DEBUG: Print Raw JSON Structure
+            Write-Host "      [DEBUG] Raw JSON Type: $($mirrorJson.GetType().Name)" -ForegroundColor DarkGray
+            
             if ($mirrorJson) {
-                # Handle "pre-release" key with quotes
-                $fileList = $mirrorJson."$branch"
-                
-                if ($fileList) {
+                # Attempt to navigate Nested Structure: hytale -> $branch -> windows
+                $node = $null
+                # First try root-level (Old behavior)
+                if ($mirrorJson."$branch") { 
+                    $node = $mirrorJson."$branch" # Old way: array or dict
+                    Write-Host "      [DEBUG] Found older '$branch' structure." -ForegroundColor DarkGray
+                }
+                # Then try nested way (New behavior from hytaleapi.online)
+                elseif ($mirrorJson.hytale) {
+                    # Use direct property access which is more reliable than Select-Object -ExpandProperty
+                    # PowerShell allows string keys for properties
+                    $hytaleNode = $mirrorJson.hytale
+                    if ($hytaleNode) {
+                        $branchNode = $hytaleNode."$branch"
+                        if ($branchNode) {
+                            $node = $branchNode.windows
+                            Write-Host "      [DEBUG] Found nested 'hytale.$branch.windows' structure." -ForegroundColor DarkGray
+                        } else {
+                            Write-Host "      [DEBUG] 'hytale' found, but '$branch' missing." -ForegroundColor DarkGray
+                        }
+                    }
+                } else {
+                    Write-Host "      [DEBUG] Neither '$branch' nor 'hytale' found in root." -ForegroundColor DarkGray
+                }
+
+                if ($node) {
+                     # Collect candidates (base, patch, and root node)
+                     $candidates = @()
+                     
+                     if ($node -is [System.Collections.IDictionary] -or $node -is [PSCustomObject]) {
+                        # Add Patch and Base sub-keys if they exist
+                        if ($node.patch) { $candidates += $node.patch }
+                        if ($node.base)  { $candidates += $node.base }
+                        # Also add the node itself in case it has direct files (mixed mode)
+                        $candidates += $node
+                     } elseif ($node -is [System.Array]) {
+                        $candidates += $node
+                     }
+
                     $maxVer = 0
                     $bestUrl = $null
                     $isDelta = $false
 
-                    foreach ($fileName in $fileList) {
-                        # Type A: Full Build
-                        if ($fileName -match "^v(\d+)-windows-amd64\.pwr$") {
-                            $v = [int]$Matches[1]
-                            if ($v -gt $localVer -and $v -gt $maxVer) {
-                                $maxVer = $v
-                                $bestUrl = "$mirror_api_legacy/$fileName" 
-                                $isDelta = $false
-                            }
-                        }
-                        # Type B: Delta Patch
-                        elseif ($fileName -match "^v(\d+)~(\d+)-windows-amd64\.pwr$") {
-                            $cntFrom = [int]$Matches[1]
-                            $cntTo = [int]$Matches[2]
-                            if ($cntFrom -eq $localVer -and $cntTo -gt $maxVer) {
-                                $maxVer = $cntTo
-                                $bestUrl = "$mirror_api_legacy/$fileName"
-                                $isDelta = $true
+                    # Iterate all candidate nodes
+                    foreach ($c in $candidates) {
+                        # Handle Dictionary/Object (Key=Value where Key is filename)
+                        if ($c -is [System.Collections.IDictionary] -or $c -is [PSCustomObject]) {
+                             foreach ($prop in $c.PSObject.Properties) {
+                                $fName = $prop.Name
+                                $fUrl = $prop.Value
+                                
+                                # Type A: Full Build
+                                if ($fName -match "^v(\d+)-windows-amd64\.pwr$") {
+                                    $v = [int]$Matches[1]
+                                     if ($v -gt $localVer -and $v -gt $maxVer) {
+                                        $maxVer = $v
+                                        $bestUrl = $fUrl
+                                        $isDelta = $false
+                                        # Write-Host "      [DEBUG] Found Upgrade Candidate: v$v ($fUrl)" -ForegroundColor DarkGray
+                                    }
+                                }
+                                # Type B: Delta Patch
+                                elseif ($fName -match "^v(\d+)~(\d+)-windows-amd64\.pwr$") {
+                                    $cntFrom = [int]$Matches[1]
+                                    $cntTo = [int]$Matches[2]
+                                    if ($cntFrom -eq $localVer -and $cntTo -gt $maxVer) {
+                                        $maxVer = $cntTo
+                                        $bestUrl = $fUrl
+                                        $isDelta = $true
+                                        # Write-Host "      [DEBUG] Found Delta Candidate: v$cntFrom->$cntTo ($fUrl)" -ForegroundColor DarkGray
+                                    }
+                                }
+                             }
+                        } 
+                        # Handle Array of Strings (Legacy: just filenames, imply URL)
+                        elseif ($c -is [string]) {
+                             $fName = $c
+                             $fUrl = "$mirror_api_legacy/$c"
+                             
+                             if ($fName -match "^v(\d+)-windows-amd64\.pwr$") {
+                                $v = [int]$Matches[1]
+                                 if ($v -gt $localVer -and $v -gt $maxVer) {
+                                    $maxVer = $v
+                                    $bestUrl = $fUrl
+                                    $isDelta = $false
+                                }
                             }
                         }
                     }
 
                     if ($bestUrl) {
-                         # CRITICAL FIX: Set the global URL to the MIRROR URL
                          $global:RemotePatchUrl = $bestUrl
                          $global:IsDeltaPatch = $isDelta
                          $maxVer | Out-File $cacheFile
-                         Write-Host "      [SUCCESS] Mirror Found v$maxVer (Source: ShipOfYarn-Legacy)" -ForegroundColor Green
+                         Write-Host "      [SUCCESS] Mirror Found v$maxVer (Source: FileHost-API)" -ForegroundColor Green
                          return $maxVer
+                    } else {
+                         Write-Host "      [DEBUG] No valid upgrade path found in mirror." -ForegroundColor DarkGray
                     }
                 }
             }
@@ -2656,35 +2812,33 @@ function Get-LatestPatchVersion {
 
     # Only run probe if we haven't found a URL yet
     if (-not $global:RemotePatchUrl) {
-        $client = New-Object System.Net.Http.HttpClient
         $currentStart = if (Test-Path $cacheFile) { [int](Get-Content $cacheFile) } else { 0 }
         $highestFound = $currentStart
-        $batchSize = 10 
+        $batchSize = 5  # Reduced batch size since we are checking sequentially now
 
         Write-Host "      [PROBE] Scanning CDN for $branch updates..." -ForegroundColor Gray
 
-        while ($true) {
-            $tasks = New-Object System.Collections.Generic.List[System.Threading.Tasks.Task[System.Net.Http.HttpResponseMessage]]
-            $range = $currentStart..($currentStart + $batchSize)
-            foreach ($i in $range) {
-                $url = "$OFFICIAL_BASE/windows/amd64/$branch/0/$i.pwr"
-                $tasks.Add($client.SendAsync((New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Head, $url))))
+        # Scan next 10 candidates
+        for ($i = $currentStart + 1; $i -le ($currentStart + 10); $i++) {
+            $url = "$OFFICIAL_BASE/windows/amd64/$branch/0/$i.pwr"
+            
+            # Use Download-WithProgress for Check Only
+            if (Download-WithProgress $url $null $true $false $true) {
+                $highestFound = $i
+                $global:RemotePatchUrl = $url
+                $global:IsDeltaPatch = $false
+                Write-Host "      [PROBE] Found valid version: v$i" -ForegroundColor Green
+            } else {
+                # Stop if we hit a wall? Or check a few ahead?
+                # Usually versions are sequential. If N fails, N+1 likely fails.
+                # But let's check a small range.
             }
-            try { [System.Threading.Tasks.Task]::WaitAll($tasks.ToArray()) } catch {}
-            $found = $false
-            for ($j = $batchSize; $j -ge 0; $j--) {
-                if ($tasks[$j].Status -eq 'RanToCompletion' -and $tasks[$j].Result.IsSuccessStatusCode) {
-                    $highestFound = $range[$j]
-                    $global:RemotePatchUrl = "$OFFICIAL_BASE/windows/amd64/$branch/0/$highestFound.pwr"
-                    $global:IsDeltaPatch = $false
-                    $found = $true; break
-                }
-            }
-            if (-not $found) { break } else { $currentStart += ($batchSize + 1) }
         }
-        $client.Dispose()
-        $highestFound | Out-File $cacheFile
-        return $highestFound
+        
+        if ($highestFound -gt $currentStart) {
+            $highestFound | Out-File $cacheFile
+            return $highestFound
+        }
     }
     
     return 0
@@ -3747,6 +3901,21 @@ while ($true) {
             Start-Sleep -Seconds 2 
         } catch {}
     }
+    $cfgFile = Join-Path $PublicConfig "config_data.json"
+    if (Test-Path $cfgFile) {
+        try {
+            $json = Get-Content $cfgFile -Raw | ConvertFrom-Json
+            if ($null -ne $json.username) { $global:pName = $json.username }
+            if ($null -ne $json.authUrl) { $global:AUTH_URL_CURRENT = $json.authUrl }
+            if ($null -ne $json.autoUpdate) { $global:autoUpdate = $json.autoUpdate }
+            if ($null -ne $json.pwrVersion) { $global:pwrVersion = $json.pwrVersion }
+            if ($null -ne $json.pwrHash) { $global:pwrHash = $json.pwrHash }
+            if ($null -ne $json.autoFixedVersions) { $global:autoFixedVersions = $json.autoFixedVersions } else { $global:autoFixedVersions = @() }
+            if (-not [string]::IsNullOrWhiteSpace($json.preferredBranch)) { $global:preferredBranch = $json.preferredBranch } else { $global:preferredBranch = "release" }
+        } catch {}
+    } else {
+        $global:preferredBranch = "release"
+    }
 
     # REFRESH GAME PATH (Critical: After updates, the path may have changed)
     $gameExe = Resolve-GamePath -NoPrompt
@@ -3797,7 +3966,7 @@ while ($true) {
             $global:lastVerifiedTime = Get-Date
             Write-Host "[OK] F2P Smart-Patch detected and verified." -ForegroundColor Green
         } else {
-            Write-Host "[INFO] Official PWR version detected (Hash mismatch)." -ForegroundColor Cyan
+            Write-Host "[INFO] Local version hash mismatch (Checking for updates)." -ForegroundColor Cyan
         }
     } catch {
         Write-Host "[WARN] Update server unreachable." -ForegroundColor Yellow
@@ -3810,6 +3979,10 @@ while ($true) {
         if ($f2pMatch) {
             Write-Host "[2/2] Auto-Launching Hytale F2P..." -ForegroundColor Cyan
         } else {
+            if ([string]::IsNullOrWhiteSpace($global:preferredBranch)) {
+                $global:preferredBranch = "release"
+            }
+
             $latestVer = Get-LatestPatchVersion -branch $global:preferredBranch
             
             # 1. Smart Applied Check (Hash or Version based)
@@ -3827,7 +4000,7 @@ while ($true) {
                 # Ensure hash is synced if version matched
                 if ($localHash -ne $global:pwrHash) { $global:pwrHash = $localHash; Save-Config }
             } else {
-                Write-Host "[INFO] Official PWR version detected. Checking for updates..." -ForegroundColor Magenta
+                Write-Host "[INFO] Version mismatch detected. Checking for updates..." -ForegroundColor Magenta
                 $patchPath = Find-OfficialPatch $latestVer
                 $hasValidPatch = $false
                 if ($patchPath -and (Test-Path $patchPath)) {
@@ -3993,21 +4166,6 @@ while ($true) {
     $storedPlayerId = Get-OrCreate-PlayerId $localAppData
     if ($storedPlayerId) { $global:pUuid = $storedPlayerId }
 
-    $cfgFile = Join-Path $PublicConfig "config_data.json"
-    if (Test-Path $cfgFile) {
-        try {
-            $json = Get-Content $cfgFile -Raw | ConvertFrom-Json
-            if ($null -ne $json.username) { $global:pName = $json.username }
-            if ($null -ne $json.authUrl) { $global:AUTH_URL_CURRENT = $json.authUrl }
-            if ($null -ne $json.autoUpdate) { $global:autoUpdate = $json.autoUpdate }
-            if ($null -ne $json.pwrVersion) { $global:pwrVersion = $json.pwrVersion }
-            if ($null -ne $json.pwrHash) { $global:pwrHash = $json.pwrHash }
-            if ($null -ne $json.autoFixedVersions) { $global:autoFixedVersions = $json.autoFixedVersions } else { $global:autoFixedVersions = @() }
-            if ($null -ne $json.preferredBranch) { $global:preferredBranch = $json.preferredBranch } else { $global:preferredBranch = "release" }
-        } catch {}
-    } else {
-        $global:preferredBranch = "release"
-    }
 
     # Define appDir early
     $launcherRoot = try { Split-Path (Split-Path (Split-Path (Split-Path (Split-Path (Split-Path $gameExe))))) } catch { $localAppData }
@@ -4194,6 +4352,9 @@ while ($true) {
             }
             $menuOptions += $gpuLabel
             
+            # Option 9: Check for Updates
+            $menuOptions += "Check for Updates (Launcher & Game)"
+            
             # Smart default: if offline, default to option 5 (index 4), else 1 (index 0)
             $defaultIdx = if ($global:offlineMode) { 4 } else { 0 }
             
@@ -4337,6 +4498,7 @@ while ($true) {
                 # Discover latest version
                 # AUTO-DETECT BRANCH
                 $detectedBranch = $global:preferredBranch
+                if ([string]::IsNullOrWhiteSpace($detectedBranch)) { $detectedBranch = "release" }
                 
                 # Try to read installed server info
                 $serverJarRec = Join-Path $appDir "Server\HytaleServer.jar"
@@ -4508,6 +4670,74 @@ while ($true) {
                         }
                     }
                 }
+            }
+            "9" {
+                 # --- UPDATE CHECK SUBMENU ---
+                 Clear-Host
+                 Write-Host "==========================================" -ForegroundColor Green
+                 Write-Host "         CHECK FOR UPDATE" -ForegroundColor Green
+                 Write-Host "==========================================" -ForegroundColor Green
+
+                 # 1. Launcher Script Update Check
+                 Write-Host "`n[1/2] Checking for Launcher updates..." -ForegroundColor Cyan
+                 
+                 # Use the helper function provided
+                 $launcherInfo = Get-LatestLauncherInfo
+
+                 if ($launcherInfo) {
+                     # specific logic to get local version (mirrors Ensure-LauncherExe)
+                     $localVersion = "Not Installed"
+                     if (Test-Path $global:LAUNCHER_PATH) {
+                         $localVersion = (Get-Item $global:LAUNCHER_PATH).VersionInfo.ProductVersion
+                     }
+
+                     Write-Host "      Latest Version: $($launcherInfo.Version)" -ForegroundColor Gray
+                     Write-Host "      Local Version:  $localVersion" -ForegroundColor Gray
+
+                     # Basic string comparison. 
+                     # (You can use [System.Version] parsing here if strict semantic versioning is required)
+                     if ($localVersion -ne "Not Installed" -and $launcherInfo.Version -ne $localVersion) {
+                         Write-Host "      [UPDATE] New Launcher Version Available: $($launcherInfo.Version)" -ForegroundColor Yellow
+                         #Write-Host "      Download at: $($launcherInfo.Url)" -ForegroundColor Gray
+                         
+                         #Optional: Ask to install immediately
+                         Ensure-LauncherExe -Force
+                     } elseif ($localVersion -eq "Not Installed") {
+                         Write-Host "      [WARN] Launcher executable not found at configured path." -ForegroundColor Yellow
+                     } else {
+                         Write-Host "      [OK] Launcher is up to date." -ForegroundColor Green
+                     }
+                 } else {
+                     Write-Host "      [WARN] Could not retrieve launcher update info." -ForegroundColor Yellow
+                 }
+
+                 # 2. Game Client Update Check
+                 Write-Host "`n[2/2] Checking for Game Client updates..." -ForegroundColor Cyan
+                 $checkBranch = $global:preferredBranch
+                 if ([string]::IsNullOrWhiteSpace($checkBranch)) { $checkBranch = "release" }
+                 
+                 Write-Host "      Checking branch: $checkBranch" -ForegroundColor Gray
+                 $latestGameVer = Get-LatestPatchVersion -branch $checkBranch
+                 
+                 # Compare versions
+                 $localGameVer = $global:pwrVersion # This tracks local patch level
+                 if (-not $localGameVer) { $localGameVer = 0 }
+
+                 if ($latestGameVer -gt $localGameVer) {
+                     Write-Host "      [UPDATE] New Game Version Available: v$latestGameVer (Local: v$localGameVer)" -ForegroundColor Yellow
+                     $upOpt = @("Update Now", "Later")
+                     $upIdx = Show-InteractiveMenu -Options $upOpt -Title "Update Game?" -Default 0
+                     if ($upIdx -eq 0) {
+                         if (Invoke-OfficialUpdate $latestGameVer) { 
+                              Write-Host "      [SUCCESS] Game updated." -ForegroundColor Green
+                         }
+                     }
+                 } else {
+                     Write-Host "      [OK] Game Client is up to date (v$localGameVer)." -ForegroundColor Green
+                 }
+                 
+                 Write-Host "`nPress any key to return..."
+                 [void][System.Console]::ReadKey($true)
             }
         }
     }
@@ -5013,7 +5243,7 @@ if (Test-Path $gameExe) {
                     $errorCategories.IpBlock += $err
                 }
                 # TokenMismatch - but exclude session termination failures (those are IP blocks)
-                elseif (($err -match "username mismatch" -or $err -match "Token validation failed.*expired.*tampered" -or $err -match "UUID mismatch") -and $err -notmatch "terminate session") {
+                elseif (($err -match "username mismatch" -or $err -match "Token validation failed.*expired.*tampered" -or $err -match "UUID mismatch" -or $err -match "Session Service returned invalid response") -and $err -notmatch "terminate session") {
                     $errorCategories.TokenMismatch += $err
                 }
                 elseif ($err -match "Error opening zip file" -or $err -match "agent library failed Agent_OnLoad" -or $err -match "Invalid or corrupt jarfile") {
@@ -5664,7 +5894,7 @@ if (Test-Path $gameExe) {
                     }
                 }
             }
-            if ($global:forceRestart) { pause; break }
+            if ($global:forceRestart) { break }
         }
         if ($global:forceRestart) { pause; break }
 
