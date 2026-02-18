@@ -2299,8 +2299,9 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
                             $contentStr = [System.Text.Encoding]::UTF8.GetString($checkBytes)
                             
                             # Normalize whitespace for check
-                            if ($contentStr -match "(?i)^\s*<!DOCTYPE" -or $contentStr -match "(?i)^\s*<html" -or $contentStr -match "(?i)^\s*<body" -or $contentStr -match "(?i)^\s*<script") {
-                                Write-Host "      [WARN] Link returned a webpage instead of a file." -ForegroundColor Yellow
+                            # Normalize whitespace for check - strictly match START of file
+                            if ($contentStr -match "(?i)^\s*<!DOCTYPE" -or $contentStr -match "(?i)^\s*<html") {
+                                Write-Host "      [WARN] Link returned a webpage instead of a file ($([math]::Round($fLen/1KB,1)) KB)." -ForegroundColor Yellow
                                 Remove-Item $destination -Force
                                 
                                 # --- MANUAL FALLBACK MENU ---
@@ -2327,10 +2328,26 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
                                     Add-Type -AssemblyName System.Windows.Forms
                                     $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
                                     $openFileDialog.Title = "Select the downloaded file ($((Split-Path $destination -Leaf)))"
-                                    $openFileDialog.Filter = "All Files (*.*)|*.*"
+                                    
+                                    # Set filter based on target extension
+                                    $ext = [System.IO.Path]::GetExtension($destination)
+                                    if ($ext) {
+                                        $extName = $ext.Replace(".", "").ToUpper()
+                                        $openFileDialog.Filter = "$extName Files (*$ext)|*$ext"
+                                    } else {
+                                        $openFileDialog.Filter = "All Files (*.*)|*.*"
+                                    }
                                     
                                     if ($openFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
                                         $selectedFile = $openFileDialog.FileName
+                                        $selExt = [System.IO.Path]::GetExtension($selectedFile)
+                                        
+                                        # Strict Extension Check
+                                        if ($ext -and $selExt -ne $ext) {
+                                            Write-Host "      [ERROR] Invalid file type selected ($selExt). Expected: $ext" -ForegroundColor Red
+                                            return $false
+                                        }
+
                                         Write-Host "      [SELECTED] $selectedFile" -ForegroundColor Green
                                         Copy-Item $selectedFile -Destination $destination -Force
                                     } else {
@@ -2341,7 +2358,7 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
                                     return $false
                                 }
 
-                                # Re-validate Manual File
+                                # Re-validate Manual File (Webpage Check)
                                 if (Test-Path $destination) {
                                     $nBytes = Get-Content $destination -TotalCount 512 -Encoding Byte -ErrorAction SilentlyContinue
                                     $nStr = [System.Text.Encoding]::UTF8.GetString($nBytes)
@@ -2407,8 +2424,16 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
             $isOk = $response.IsSuccessStatusCode
             # STRICT VALIDATION: Reject 0-byte or tiny files (broken mirrors often send 200 OK + 0 bytes)
             if ($isOk) {
-                 if ($response.Content.Headers.ContentLength -ne $null -and $response.Content.Headers.ContentLength -lt 100) {
+                 $len = $response.Content.Headers.ContentLength
+                 $type = $response.Content.Headers.ContentType.ToString()
+                 
+                 if ($len -ne $null -and $len -lt 100) {
                       # [DEBUG] Content too small (< 100 bytes)
+                      $isOk = $false
+                 }
+                 
+                 if ($type -match "text/html" -or $type -match "application/xhtml") {
+                      # [DEBUG] Content is HTML (Redirect or Login Page)
                       $isOk = $false
                  }
             }
@@ -2445,8 +2470,8 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
                     $checkBytes = Get-Content $destination -TotalCount 512 -Encoding Byte -ErrorAction SilentlyContinue
                     $contentStr = [System.Text.Encoding]::UTF8.GetString($checkBytes)
                     
-                    if ($contentStr -match "(?i)^\s*<!DOCTYPE" -or $contentStr -match "(?i)^\s*<html" -or $contentStr -match "(?i)^\s*<body" -or $contentStr -match "(?i)^\s*<script") {
-                        Write-Host "      [WARN] Link returned a webpage instead of a file." -ForegroundColor Yellow
+                    if ($contentStr -match "(?i)^\s*<!DOCTYPE" -or $contentStr -match "(?i)^\s*<html") {
+                        Write-Host "      [WARN] Link returned a webpage instead of a file ($([math]::Round($fLen/1KB,1)) KB)." -ForegroundColor Yellow
                         Remove-Item $destination -Force
                         
                         # --- MANUAL FALLBACK MENU ---
@@ -2473,10 +2498,26 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
                             Add-Type -AssemblyName System.Windows.Forms
                             $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
                             $openFileDialog.Title = "Select the downloaded file ($((Split-Path $destination -Leaf)))"
-                            $openFileDialog.Filter = "All Files (*.*)|*.*"
+                            
+                            # Set filter based on target extension
+                            $ext = [System.IO.Path]::GetExtension($destination)
+                            if ($ext) {
+                                $extName = $ext.Replace(".", "").ToUpper()
+                                $openFileDialog.Filter = "$extName Files (*$ext)|*$ext"
+                            } else {
+                                $openFileDialog.Filter = "All Files (*.*)|*.*"
+                            }
                             
                             if ($openFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
                                 $selectedFile = $openFileDialog.FileName
+                                $selExt = [System.IO.Path]::GetExtension($selectedFile)
+                                
+                                # Strict Extension Check
+                                if ($ext -and $selExt -ne $ext) {
+                                    Write-Host "      [ERROR] Invalid file type selected ($selExt). Expected: $ext" -ForegroundColor Red
+                                    return $false
+                                }
+
                                 Write-Host "      [SELECTED] $selectedFile" -ForegroundColor Green
                                 Copy-Item $selectedFile -Destination $destination -Force
                             } else {
@@ -2487,7 +2528,7 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
                             return $false
                         }
 
-                        # Re-validate Manual File
+                        # Re-validate Manual File (Webpage Check)
                         if (Test-Path $destination) {
                             $nBytes = Get-Content $destination -TotalCount 512 -Encoding Byte -ErrorAction SilentlyContinue
                             $nStr = [System.Text.Encoding]::UTF8.GetString($nBytes)
@@ -2836,16 +2877,22 @@ function Get-LatestPatchVersion {
         if ($candidates.Count -gt 0) {
             $winner = $null
             
-            # --- FILTER: Exclude Outdated Sources ---
-            $maxV = ($candidates | Measure-Object -Property Version -Maximum).Maximum
-            $testingPool = @()
+            # --- SELECTION: Identify Top Versions ---
+            # Get unique versions sorted descending
+            $uniqueVersions = $candidates.Version | Select-Object -Unique | Sort-Object -Descending
+            $maxV = $uniqueVersions[0]
             
-            foreach ($c in $candidates) {
-                if ($c.Version -lt $maxV) {
-                     Write-Host "      [SKIP] $($c.Source): Has v$($c.Version) (Latest: v$maxV)" -ForegroundColor DarkGray
-                } else {
-                     $testingPool += $c
-                }
+            $testingPool = @()
+            $vCount = 0
+            foreach ($v in $uniqueVersions) {
+                if ($vCount -ge 2) { break } # Only test top 2 major version candidates
+                $testingPool += $candidates | Where-Object { $_.Version -eq $v }
+                $vCount++
+            }
+            
+            # Inform user about versions found
+            if ($uniqueVersions.Count -gt 1) {
+                Write-Host "      [INFO] Multiple unique versions found: $([string]::Join(', ', ($uniqueVersions | ForEach-Object { 'v' + $_ })))" -ForegroundColor Gray
             }
             
             # --- PARALLEL SPEED TEST (Only Latest Versions) ---
@@ -2932,7 +2979,86 @@ function Get-LatestPatchVersion {
                 $valid = $testingPool | Where-Object { $_.Speed -ne -1 }
                 
                 if ($valid.Count -gt 0) {
-                    $winner = $valid | Sort-Object Speed -Descending | Select-Object -First 1
+                    # Group valid candidates by version
+                    $vGroups = $valid | Group-Object Version | Sort-Object Name -Descending
+                    
+                    # Winner by default is the fastest of the latest version
+                    $latestGroup = $vGroups[0]
+                    $winner = $latestGroup.Group | Sort-Object Speed -Descending | Select-Object -First 1
+                    
+                    # Loop for Choice Selection (Handles Cancel/Loop-back)
+                    $menuChoiceLoop = $true
+                    while ($menuChoiceLoop) {
+                        if ($vGroups.Count -gt 1 -and ($winner.Speed -lt 0.1 -or $global:forceVersionChoice)) {
+                            Write-Host "`n      [ACTION] Multiple versions available and latest (v$($winner.Version)) is slow." -ForegroundColor Yellow
+                            Write-Host "      Please choose which version to download:" -ForegroundColor Cyan
+                            
+                            $options = @()
+                            $lookup = @{}
+                            $i = 1
+                            foreach ($grp in $vGroups) {
+                                $bestInGrp = $grp.Group | Sort-Object Speed -Descending | Select-Object -First 1
+                                $speedStr = if ($bestInGrp.Speed -ge 1) { "$([math]::Round($bestInGrp.Speed, 2)) MB/s" } else { "$([math]::Round($bestInGrp.Speed * 1024, 0)) KB/s" }
+                                $label = "v$($grp.Name) - $speedStr ($($bestInGrp.Source))"
+                                $options += $label
+                                $lookup[$i] = $bestInGrp
+                                $i++
+                            }
+                            $options += "Select existing file from computer (if already downloaded)"
+                            $options += "Skip Update (Launch v$localVer)"
+                            
+                            $idx = Show-InteractiveMenu -Options $options -Title "Select version to install:" -Default 0
+                            
+                            if ($idx -ge 0 -and $idx -lt ($options.Count - 2)) {
+                                $winner = $lookup[$idx + 1]
+                                Write-Host "      [USER] Selected: v$($winner.Version)" -ForegroundColor Green
+                                $menuChoiceLoop = $false
+                            } elseif ($idx -eq ($options.Count - 2)) {
+                                # --- MANUAL FILE SELECTION ---
+                                Write-Host "`n      [INPUT] Opening File Picker..." -ForegroundColor Cyan
+                                Add-Type -AssemblyName System.Windows.Forms
+                                $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
+                                $openFileDialog.Title = "Select the Hytale Patch file (.pwr)"
+                                $openFileDialog.Filter = "PWR Files (*.pwr)|*.pwr"
+                                
+                                if ($openFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                                    $selectedFile = $openFileDialog.FileName
+                                    $destPwr = Join-Path $localAppData "cache\$($winner.Version).pwr"
+                                    if (-not (Test-Path (Split-Path $destPwr))) { New-Item -ItemType Directory (Split-Path $destPwr) -Force | Out-Null }
+                                    
+                                    Write-Host "      [SELECTED] $selectedFile" -ForegroundColor Green
+                                    Copy-Item $selectedFile -Destination $destPwr -Force
+                                    
+                                    # Generate shim hash to satisfy verification
+                                    $h = (Get-FileHash $destPwr -Algorithm SHA1).Hash
+                                    $h | Out-File "$destPwr.sha1" -Encoding UTF8 -Force
+                                    
+                                    Write-Host "      [SUCCESS] Manual patch file imported." -ForegroundColor Green
+                                    return $winner.Version
+                                } else {
+                                    Write-Host "      [CANCELLED] No file selected. Choose another option..." -ForegroundColor Yellow
+                                    # Stay in loop - menu will reappear
+                                }
+                            } elseif ($idx -eq ($options.Count - 1)) {
+                                Write-Host "      [USER] Skipping update. Launching current version..." -ForegroundColor Yellow
+                                return $localVer
+                            }
+                        } else {
+                            # Exit loop if no choice is needed/possible
+                            $menuChoiceLoop = $false
+                            
+                            # Single version slow protection
+                            if ($winner.Speed -lt 0.1 -and $localVer -gt 0) {
+                                Write-Host "`n      [WARNING] Highest download speed is very slow ($([math]::Round($winner.Speed, 3)) MB/s)." -ForegroundColor Yellow
+                                Write-Host "      Would you like to SKIP this update and play offline/local (v$localVer)?" -ForegroundColor Cyan
+                                $skipChoice = Read-Host "      Skip Update? (y/n)"
+                                if ($skipChoice -eq "y") {
+                                    Write-Host "      [USER] Skipping update. Launching current version..." -ForegroundColor Yellow
+                                    return $localVer
+                                }
+                            }
+                        }
+                    }
                 } else {
                     $winner = $testingPool[0] # Fallback to first testable
                 }
