@@ -2175,7 +2175,9 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
         return $false
     }
     
-    if (-not $forceOverwrite -and $destination -and (Test-Path $destination) -and -not $checkOnly) {
+    # [RESUME SUPPORT] Only delete if forceOverwrite is specified. 
+    # Otherwise, we keep the file so wget/HttpClient can append to it.
+    if ($forceOverwrite -and $destination -and (Test-Path $destination) -and -not $checkOnly) {
         Remove-Item $destination -Force -ErrorAction SilentlyContinue
     }
 
@@ -2255,8 +2257,10 @@ function Download-WithProgress($url, $destination, $useHeaders=$true, $forceOver
         $wgetArgs = @(
             "--quiet",
             "--no-check-certificate",
-            "--tries=3",
-            "--timeout=20",
+            "--tries=5",
+            "--timeout=60",
+            "--read-timeout=60",
+            "--connect-timeout=30",
             "--user-agent=`"$userAgent`""
         )
         
@@ -2655,7 +2659,7 @@ function Install-HyFixes {
 
 
 function Get-LatestPatchVersion {
-    param([string]$branch = "release")  # Support "release" or "pre-release"
+    param([string]$branch = "release", [switch]$Silent)  # Support "release" or "pre-release"
     if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "release" }
     $cacheFile = Join-Path $cacheDir "highest_version_$branch.txt"
     $versionFile = Join-Path $localAppData "current_version.txt"
@@ -2882,14 +2886,15 @@ function Get-LatestPatchVersion {
             $uniqueVersions = $candidates.Version | Select-Object -Unique | Sort-Object -Descending
             $maxV = $uniqueVersions[0]
             
-            $testingPool = @()
-            $vCount = 0
-            foreach ($v in $uniqueVersions) {
-                if ($vCount -ge 2) { break } # Only test top 2 major version candidates
-                $testingPool += $candidates | Where-Object { $_.Version -eq $v }
-                $vCount++
-            }
+            $highestCandidate = $candidates | Sort-Object Version -Descending | Select-Object -First 1
+            $testingPool = $candidates | Where-Object { $_.Version -ge ($highestCandidate.Version - 1) } # Test latest and current-1
             
+            # --- SILENT MODE: Skip Speed Tests and Menus ---
+            if ($Silent) {
+                 $global:RemotePatchUrl = $highestCandidate.Url
+                 return $highestCandidate.Version
+            }
+
             # Inform user about versions found
             if ($uniqueVersions.Count -gt 1) {
                 Write-Host "      [INFO] Multiple unique versions found: $([string]::Join(', ', ($uniqueVersions | ForEach-Object { 'v' + $_ })))" -ForegroundColor Gray
@@ -3023,18 +3028,25 @@ function Get-LatestPatchVersion {
                                 
                                 if ($openFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
                                     $selectedFile = $openFileDialog.FileName
-                                    $destPwr = Join-Path $localAppData "cache\$($winner.Version).pwr"
+                                    $fileBase = [System.IO.Path]::GetFileNameWithoutExtension($selectedFile)
+                                    
+                                    # Attempt to extract version number from filename
+                                    $vNum = if ($fileBase -match "(\d+)") { $matches[1] } else { $winner.Version }
+                                    
+                                    $destPwr = Join-Path $localAppData "cache\$vNum.pwr"
                                     if (-not (Test-Path (Split-Path $destPwr))) { New-Item -ItemType Directory (Split-Path $destPwr) -Force | Out-Null }
                                     
-                                    Write-Host "      [SELECTED] $selectedFile" -ForegroundColor Green
+                                    Write-Host "      [SELECTED] $selectedFile (Detected version: $vNum)" -ForegroundColor Green
                                     Copy-Item $selectedFile -Destination $destPwr -Force
                                     
                                     # Generate shim hash to satisfy verification
-                                    $h = (Get-FileHash $destPwr -Algorithm SHA1).Hash
-                                    $h | Out-File "$destPwr.sha1" -Encoding UTF8 -Force
+                                    try {
+                                        $h = (Get-FileHash $destPwr -Algorithm SHA1).Hash
+                                        $h | Out-File "$destPwr.sha1" -Encoding UTF8 -Force
+                                    } catch {}
                                     
                                     Write-Host "      [SUCCESS] Manual patch file imported." -ForegroundColor Green
-                                    return $winner.Version
+                                    return $vNum
                                 } else {
                                     Write-Host "      [CANCELLED] No file selected. Choose another option..." -ForegroundColor Yellow
                                     # Stay in loop - menu will reappear
@@ -3855,8 +3867,8 @@ function Invoke-OfficialUpdate($latestVer, $skipServerSync=$false) {
         
         # Size check: PWR files should be at least 1500 MB
         if ($sizeMB -lt 1500) {
-            Write-Host "      [WARN] Cached patch appears incomplete ($sizeMB MB < 1500 MB). Redownloading..." -ForegroundColor Yellow
-            Remove-Item $pwrPath -Force
+            Write-Host "      [INFO] Cached patch is incomplete ($sizeMB MB < 1500 MB). Resuming download..." -ForegroundColor Cyan
+            # Do NOT remove - allowing Download-WithProgress to resume
         } else {
             # Hash validation: check if cached PWR matches a known good hash
             $pwrHashFile = "$pwrPath.sha1"
@@ -4270,7 +4282,7 @@ while ($true) {
                 $global:preferredBranch = "release"
             }
 
-            $latestVer = Get-LatestPatchVersion -branch $global:preferredBranch
+            $latestVer = Get-LatestPatchVersion -branch $global:preferredBranch -Silent
             
             # 1. Smart Applied Check (Hash or Version based)
             $isApplied = ($localHash -eq $global:pwrHash) -or ($global:pwrVersion -ge $latestVer)
@@ -4288,6 +4300,12 @@ while ($true) {
                 if ($localHash -ne $global:pwrHash) { $global:pwrHash = $localHash; Save-Config }
             } else {
                 Write-Host "[INFO] Version mismatch detected. Checking for updates..." -ForegroundColor Magenta
+                
+                # Re-query WITH interaction if not up-to-date and not auto-updating
+                if (-not $global:autoUpdate) {
+                    $latestVer = Get-LatestPatchVersion -branch $global:preferredBranch
+                }
+
                 $patchPath = Find-OfficialPatch $latestVer
                 $hasValidPatch = $false
                 if ($patchPath -and (Test-Path $patchPath)) {
@@ -4350,7 +4368,7 @@ while ($true) {
             $global:autoRepairTriggered = $false  # Reset flag
             Start-Sleep -Seconds 2
         } else {
-            $actionOptions = @("Download Official Hytale Patches (PWR)", "Attempt Force Launch anyway")
+            $actionOptions = @("Download Official Hytale Patches (PWR)", "Attempt Force Launch anyway", "Select existing file from computer (Manual Browse)")
             $actionIdx = Show-InteractiveMenu -Options $actionOptions -Title "Select action:" -Default 0
             $choice = ($actionIdx + 1).ToString()
         }
@@ -4383,6 +4401,41 @@ while ($true) {
             $latestVer = Get-LatestPatchVersion -branch $selBranch
             if (Invoke-OfficialUpdate $latestVer) { continue }
         } 
+        elseif ($choice -eq "3") {
+            Write-Host "`n      [INPUT] Opening File Picker..." -ForegroundColor Cyan
+            Add-Type -AssemblyName System.Windows.Forms
+            $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
+            $openFileDialog.Title = "Select the Hytale Patch file (.pwr)"
+            $openFileDialog.Filter = "PWR Files (*.pwr)|*.pwr"
+            
+            if ($openFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                $selectedFile = $openFileDialog.FileName
+                $fileBase = [System.IO.Path]::GetFileNameWithoutExtension($selectedFile)
+                
+                # Attempt to extract version number from filename
+                $vNum = if ($fileBase -match "(\d+)") { $matches[1] } else { "manual_import" }
+                
+                $destPwr = Join-Path $localAppData "cache\$vNum.pwr"
+                if (-not (Test-Path (Split-Path $destPwr))) { New-Item -ItemType Directory (Split-Path $destPwr) -Force | Out-Null }
+                
+                Write-Host "      [SELECTED] $selectedFile (Detected version: $vNum)" -ForegroundColor Green
+                Copy-Item $selectedFile -Destination $destPwr -Force
+                
+                # Generate shim hash to satisfy verification
+                try {
+                    $h = (Get-FileHash $destPwr -Algorithm SHA1).Hash
+                    $h | Out-File "$destPwr.sha1" -Encoding UTF8 -Force
+                } catch {
+                    Write-Host "      [WARN] Could not generate hash for manual import." -ForegroundColor Yellow
+                }
+                
+                Write-Host "      [SUCCESS] Manual patch file imported." -ForegroundColor Green
+                if (Invoke-OfficialUpdate $vNum) { continue }
+            } else {
+                Write-Host "      [CANCELLED] No file selected." -ForegroundColor Yellow
+                continue
+            }
+        }
         elseif ($choice -ne "2") { exit }
     }
 
@@ -5517,6 +5570,7 @@ if (Test-Path $gameExe) {
                 JavaBoot = @()           # JRE issues
                 WorldCorruption = @()    # Save issues
                 AssetMismatch = @()      # Asset decode issues
+                UnsupportedMap = @()     # Map created with different version branch
                 ServerCodecError = @()   # Server JSON decode failure (corrupt world/config)
                 ServerBoot = @()         # Generic server boot (symptom, not cause)
                 GpuCrash = @()           # GPU/DirectX/rendering issues
@@ -5561,7 +5615,11 @@ if (Test-Path $gameExe) {
                     $errorCategories.WorldCorruption += $err
                 }
                 elseif ($err -match "Failed to decode asset" -or $err -match "ALPN mismatch" -or $err -match "client outdated" -or $err -match "CodecException" -or $err -match "Asset validation FAILED") {
-                    $errorCategories.AssetMismatch += $err
+                    if ($err -match "SFX_Sleep_|MemoriesCatchEntityParticle|Failed to find parent 'Default'|Default Asset Validation Failed") {
+                        $errorCategories.UnsupportedMap += $err
+                    } else {
+                        $errorCategories.AssetMismatch += $err
+                    }
                 }
                 elseif ($err -match "Disconnected during loading" -and $err -match "network") {
                     # Only flag as ServerCodecError if the full log ALSO has codec evidence
@@ -5637,12 +5695,23 @@ if (Test-Path $gameExe) {
                 $rootCause = "SaveVersionMismatch"
                 $rootCauseErrors = $errorCategories.SaveVersionMismatch
             }
-            # Priority 8: Asset Mismatch
-            elseif ($errorCategories.AssetMismatch.Count -gt 0) {
-                $rootCause = "AssetMismatch"
-                $rootCauseErrors = $errorCategories.AssetMismatch
+            # Priority 8: Unsupported Map (Asset validation fail on SFX_Sleep_Success)
+            elseif ($errorCategories.UnsupportedMap.Count -gt 0) {
+                $rootCause = "UnsupportedMap"
+                $rootCauseErrors = $errorCategories.UnsupportedMap
             }
-            # Priority 7: World Corruption
+            # Priority 9: Asset Mismatch
+            elseif ($errorCategories.AssetMismatch.Count -gt 0) {
+                # Skip asset mismatch action if map error was already detected recently
+                if ($global:unsupportedMapSuppression -and (Get-Date) -lt $global:unsupportedMapSuppression) {
+                    Write-Host "      [SUPPRESSED] AssetMismatch action skipped due to recent UnsupportedMap error." -ForegroundColor Gray
+                    foreach ($err in $errorCategories.AssetMismatch) { $reportedErrors += $err }
+                } else {
+                    $rootCause = "AssetMismatch"
+                    $rootCauseErrors = $errorCategories.AssetMismatch
+                }
+            }
+            # Priority 10: World Corruption
             elseif ($errorCategories.WorldCorruption.Count -gt 0) {
                 $rootCause = "WorldCorruption"
                 $rootCauseErrors = $errorCategories.WorldCorruption
@@ -6017,6 +6086,47 @@ if (Test-Path $gameExe) {
                             if (Test-Path $serverJarPath) { Remove-Item $serverJarPath -Force -ErrorAction SilentlyContinue }
                             $global:forceRestart = $true; $global:autoRepairTriggered = $true; $stable = $false; break
                         }
+                    }
+                    "UnsupportedMap" {
+                        $branch = if ($global:preferredBranch) { $global:preferredBranch.ToUpper() } else { "UNKNOWN" }
+                        Write-Host "`n      [WARN] Unsupported Map Detected!" -ForegroundColor Yellow
+                        Write-Host "      [INFO] This map is not compatible with the '$branch' version." -ForegroundColor Cyan
+                        
+                        # Set suppression flag for 30 seconds to prevent AssetMismatch trigger
+                        $global:unsupportedMapSuppression = (Get-Date).AddSeconds(30)
+                        
+                        # Show non-intrusive topmost dialog (don't stop the game)
+                        try {
+                            Add-Type -AssemblyName System.Windows.Forms
+                            $msg = "This map is unsupported on the current version branch ($branch).`n`nThe map might have assets or features that don't exist in your current game build."
+                            $title = "Hytale - Unsupported Map"
+                            
+                            # Robust Focus Fix: Use a hidden TopMost dummy form as owner
+                            $dummy = New-Object System.Windows.Forms.Form
+                            $dummy.TopMost = $true
+                            $dummy.WindowState = "Minimized"
+                            $dummy.Opacity = 0
+                            $dummy.Show()
+                            [User32]::SetForegroundWindow($dummy.Handle) | Out-Null
+                            
+                            # Show(owner, text, caption, buttons, icon)
+                            [System.Windows.Forms.MessageBox]::Show(
+                                $dummy,
+                                $msg, 
+                                $title, 
+                                [System.Windows.Forms.MessageBoxButtons]::OK, 
+                                [System.Windows.Forms.MessageBoxIcon]::Warning
+                            ) | Out-Null
+                            
+                            $dummy.Close()
+                            $dummy.Dispose()
+                        } catch {
+                            Write-Host "      [ERROR] Could not display MessageBox: $($_.Exception.Message)" -ForegroundColor Red
+                            Write-Host "      [WARN] Please check your game branch: $branch" -ForegroundColor Yellow
+                        }
+                        
+                        # Mark as reported so we don't spam the dialog if the error persists in logs
+                        foreach ($ue in $rootCauseErrors) { $reportedErrors += $ue }
                     }
                     "WorldCorruption" {
                         if (-not $global:fixAttempts) { $global:fixAttempts = @{} }
