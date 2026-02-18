@@ -2715,7 +2715,48 @@ function Get-LatestPatchVersion {
                 Write-Host "      [WARN] HytaleF2P Proxy: No branch info." -ForegroundColor Yellow
             }
         } catch { 
-             Write-Host "      [WARN] HytaleF2P Proxy: API Request failed ($proxyBase) -> ($($_.Exception.Message))" -ForegroundColor Yellow
+             # Write-Host "      [WARN] HytaleF2P Proxy: API Request failed ($proxyBase) -> ($($_.Exception.Message))" -ForegroundColor Yellow
+             
+             # --- FALLBACK: Use Direct URL if API fails ---
+             # Requires knowing the target version. We can use:
+             # 1. Version found by other sources (CobyLobby)
+             # 2. Local version + 1 (Blind guess)
+             
+             $fallbackVer = 0
+             
+             # Check if we already found a candidate from CobyLobby
+             if ($candidates.Count -gt 0) {
+                 $maxFound = ($candidates | Measure-Object -Property Version -Maximum).Maximum
+                 if ($maxFound -gt 0) { $fallbackVer = $maxFound }
+             } elseif ($localVer -gt 0) {
+                 # Last resort: Try Local + 1
+                 $fallbackVer = $localVer + 1
+             }
+             
+             if ($fallbackVer -gt 0) {
+                 # Construct Direct URL (Based on user report: https://game.authbp.xyz/dl/windows/amd64/9.pwr)
+                 # Only valid for 'release' branch on Windows/AMD64
+                 if ($branch -eq "release") {
+                     $fbUrl = "$proxyBase/dl/windows/amd64/$fallbackVer.pwr"
+                     # Write-Host "      [INFO] HytaleF2P Proxy: Trying fallback URL..." -ForegroundColor Gray
+                     
+                     if (Download-WithProgress $fbUrl $null $true $false $true) {
+                        $candidates += [PSCustomObject]@{
+                            Source = "HytaleF2P-Proxy"
+                            Version = $fallbackVer
+                            Url = $fbUrl
+                            IsDelta = $false
+                        }
+                        Write-Host "      [FOUND] HytaleF2P Proxy (Fallback): v$fallbackVer" -ForegroundColor DarkGray
+                     } else {
+                        Write-Host "      [WARN] HytaleF2P Proxy: Fallback failed for v$fallbackVer." -ForegroundColor Yellow
+                     }
+                 } else {
+                     Write-Host "      [WARN] HytaleF2P Proxy: API failed ($($_.Exception.Message))" -ForegroundColor Yellow
+                 }
+             } else {
+                 Write-Host "      [WARN] HytaleF2P Proxy: API failed ($($_.Exception.Message))" -ForegroundColor Yellow
+             }
         }
 
         # ==============================================================================
