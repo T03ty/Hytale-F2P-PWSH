@@ -155,9 +155,14 @@ $API_HOST = "https://file.hytaleapi.online"
 $AUTH_URL_SESSIONS = "https://auth.sanasol.ws"
 $global:AUTH_URL_CURRENT = $AUTH_URL_SESSIONS
 
-# GitHub Release Info
-$GITHUB_REPO = "amiayweb/Hytale-F2P"
+# Gitea Release Info (Alternative: git.sanhost.net)
+$GITEA_API_BASE = "https://git.sanhost.net/api/v1/repos/sanasol/hytale-f2p"
+$GITHUB_REPO = "sanasol/hytale-f2p"  # For display only
 $LAUNCHER_EXE_NAME = "Hytale F2P Launcher.exe"
+
+# DualAuth ByteBuddy Agent (runtime class transformation, no JAR modification)
+$DUALAUTH_AGENT_URL = 'https://github.com/sanasol/hytale-auth-server/releases/latest/download/dualauth-agent.jar'
+$DUALAUTH_AGENT_FILENAME = 'dualauth-agent.jar'
 
 # Patching Defaults
 $OFFICIAL_BASE = "https://game-patches.hytale.com/patches"
@@ -632,28 +637,25 @@ if (-not $global:LAUNCHER_PATH) {
 
 function Get-LatestLauncherInfo {
     try {
-        Write-Host "      [CHECK] Querying GitHub for latest Launcher release..." -ForegroundColor Gray
-        $uri = "https://api.github.com/repos/$GITHUB_REPO/releases/latest"
+        Write-Host "      [CHECK] Querying Gitea (sanhost.net) for latest Launcher release..." -ForegroundColor Gray
+        $uri = "$GITEA_API_BASE/releases/latest"
         $release = Invoke-RestMethod -Uri $uri -TimeoutSec 10
         
-        # Look for the .exe installer
-        $asset = $release.assets | Where-Object { $_.name -match "\.exe$" } | Select-Object -First 1
+        # Look for the .exe installer (exclude .blockmap files)
+        $asset = $release.assets | Where-Object { $_.name -match '\.exe$' -and $_.name -notmatch '\.blockmap$' } | Select-Object -First 1
         
         if ($asset) {
-            # Extract the SHA256 from the 'digest' field (format is usually "sha256:hexhash")
-            $rawHash = if ($asset.digest) { $asset.digest -replace 'sha256:', '' } else { "" }
-            
             return @{ 
                 Version = $release.tag_name; 
                 Url     = $asset.browser_download_url;
                 Name    = $asset.name;
-                Hash    = $rawHash.Trim()
+                Hash    = ""  # Gitea doesn't provide digest, rely on version check
             }
         } else {
             Write-Host "      [WARN] No .exe asset found in latest release." -ForegroundColor Yellow
         }
     } catch {
-        Write-Host "      [WARN] Could not reach GitHub API." -ForegroundColor Yellow
+        Write-Host "      [WARN] Could not reach Gitea API: $($_.Exception.Message)" -ForegroundColor Yellow
     }
     return $null
 }
@@ -1811,10 +1813,33 @@ function Patch-HytaleServer($serverJarPath, $branch="release", $force=$false, $s
     $patchFlag = "$serverJarPath.dualauth_patched"
     $targetDomain = "auth.sanasol.ws"
     
-    # Define Download URLs
+    # Define Download URLs (DualAuth Agent from sanasol's GitHub)
+    $agentUrl = $DUALAUTH_AGENT_URL
+    $agentDest = Join-Path $serverDir $DUALAUTH_AGENT_FILENAME
+    
+    # Server JAR download from Gitea (sanhost.net) releases
     $releaseUrl = 'https://patcher.authbp.xyz/download/patched_release'
     $preReleaseUrl = 'https://patcher.authbp.xyz/download/patched_prerelease'
     $url = if ($branch -eq 'pre-release') { $preReleaseUrl } else { $releaseUrl }
+    
+    # Also ensure DualAuth agent is present
+    if (-not (Test-Path $agentDest) -or $force) {
+        Write-Host "      [AGENT] Downloading DualAuth Agent..." -ForegroundColor Cyan
+        try {
+            if (Get-Command "Download-WithProgress" -ErrorAction SilentlyContinue) {
+                Download-WithProgress $agentUrl $agentDest $false $true | Out-Null
+            } else {
+                Invoke-WebRequest -Uri $agentUrl -OutFile $agentDest -UseBasicParsing
+            }
+            if (Test-Path $agentDest) {
+                Write-Host "      [SUCCESS] DualAuth Agent installed." -ForegroundColor Green
+            }
+        } catch {
+            Write-Host "      [WARN] DualAuth Agent download failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "      [SKIP] DualAuth Agent already present." -ForegroundColor Green
+    }
 
     # --- PHASE 1: REMOTE FINGERPRINT FETCH ---
     $remoteFingerprint = $null
