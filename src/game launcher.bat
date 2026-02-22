@@ -2830,7 +2830,96 @@ function Get-LatestPatchVersion {
         }
 
         # ==============================================================================
-        # 3. CHECK MIRRORS (Ship of Yarn + Legacy)
+        # 3. CHECK AUTHBP MANIFEST API (home.authbp.xyz)
+        # ==============================================================================
+        try {
+            Write-Host "      [API] Querying AuthBP Manifest ($branch)..." -ForegroundColor Gray
+            $authbpApi = "https://home.authbp.xyz/api/manifest"
+            $manifestRes = Invoke-RestMethod -Uri $authbpApi -TimeoutSec 5
+            
+            if ($manifestRes -and $manifestRes.patchesUrl -and $manifestRes.manifest -and $manifestRes.manifest.files) {
+                $patchesUrl = $manifestRes.patchesUrl
+                $files = $manifestRes.manifest.files
+                
+                # We need to find the highest base (0_to_X) and the highest delta (Local_to_X)
+                $bestBaseV = 0
+                $bestBaseKey = $null
+                $bestDeltaV = 0
+                $bestDeltaKey = $null
+                
+                # The keys are like: windows/amd64/pre-release/0_to_23.pwr
+                $targetPrefix = "windows/amd64/$branch/"
+                
+                foreach ($prop in $files.PSObject.Properties) {
+                    $key = $prop.Name
+                    
+                    if ($key.StartsWith($targetPrefix) -and $key.EndsWith(".pwr")) {
+                        # Extract the filename part (e.g., 0_to_23.pwr)
+                        $filename = $key.Substring($targetPrefix.Length)
+                        
+                        if ($filename -match "^0_to_(\d+)\.pwr$") {
+                            $v = [int]$Matches[1]
+                            if ($v -gt $bestBaseV) {
+                                $bestBaseV = $v
+                                $bestBaseKey = $key
+                            }
+                        } elseif ($filename -match "^(\d+)_to_(\d+)\.pwr$") {
+                            $f = [int]$Matches[1]
+                            $t = [int]$Matches[2]
+                            
+                            # Only interested in deltas starting from our exact local version
+                            if ($f -eq $localVer -and $t -gt $bestDeltaV) {
+                                $bestDeltaV = $t
+                                $bestDeltaKey = $key
+                            }
+                        }
+                    }
+                }
+                
+                # Check Base Patch
+                if ($bestBaseV -gt 0 -and $bestBaseKey) {
+                    $newUrl = "$patchesUrl/$bestBaseKey"
+                    if (Download-WithProgress $newUrl $null $true $false $true) {
+                        $candidates += [PSCustomObject]@{
+                            Source = "AuthBP-Manifest"
+                            Version = $bestBaseV
+                            Url = $newUrl
+                            IsDelta = $false
+                        }
+                        Write-Host "      [FOUND] AuthBP Manifest: v$bestBaseV" -ForegroundColor DarkGray
+                    } else {
+                        Write-Host "      [WARN] AuthBP Manifest: HEAD check failed for Base v$bestBaseV." -ForegroundColor Yellow
+                    }
+                }
+                
+                # Check Delta Patch
+                if ($bestDeltaV -gt 0 -and $bestDeltaKey) {
+                    $newUrl = "$patchesUrl/$bestDeltaKey"
+                    if (Download-WithProgress $newUrl $null $true $false $true) {
+                        $candidates += [PSCustomObject]@{
+                            Source = "AuthBP-Manifest"
+                            Version = $bestDeltaV
+                            Url = $newUrl
+                            IsDelta = $true
+                        }
+                        Write-Host "      [FOUND] AuthBP Manifest: v$bestDeltaV (Delta from v$localVer)" -ForegroundColor DarkGray
+                    } else {
+                        Write-Host "      [WARN] AuthBP Manifest: HEAD check failed for Delta v$bestDeltaV." -ForegroundColor Yellow
+                    }
+                }
+                
+                if ($bestBaseV -eq 0 -and $bestDeltaV -eq 0) {
+                     Write-Host "      [WARN] AuthBP Manifest: No matching patches found for branch '$branch'." -ForegroundColor Yellow
+                }
+            } else {
+                 Write-Host "      [WARN] AuthBP Manifest: Invalid response structure." -ForegroundColor Yellow
+            }
+        } catch {
+             Write-Host "      [WARN] AuthBP Manifest: API Request failed ($($_.Exception.Message))" -ForegroundColor Yellow
+        }
+
+        # ==============================================================================
+        # 4. CHECK MIRRORS (Ship of Yarn + Legacy)
         # ==============================================================================
         # Helper inner function to parse mirror JSON
         function Parse-Mirror($jsonObj, $sourceName) {
